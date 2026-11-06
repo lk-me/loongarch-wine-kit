@@ -1,0 +1,609 @@
+From 2d678043a356466448f70a32d9f458c0d8be034e Mon Sep 17 00:00:00 2001
+From: ChenghaoLiu <linkmecry@gmail.com>
+Date: Mon, 2 Nov 2026 16:41:06 +0800
+Subject: [PATCH 01/13] [LoongArch] Add MC layer COFF object writer support
+
+Add minimal WinCOFF object writer and streamer to enable
+`clang --target=loongarch64-windows-gnu -c` to emit COFF objects:
+- Add IMAGE_FILE_MACHINE_LOONGARCH64 (0x6264) and COFF relocation types
+- Map abstract fixups and raw R_LARCH_* relocations to COFF relocation types
+- Dispatch COFF in AsmBackend/TargetMachine/MCAsmInfo/Streamer/Triple
+- Skip ELF-only linker-relaxation (R_LARCH_RELAX) path for COFF targets
+---
+ llvm/include/llvm/BinaryFormat/COFF.h         |  23 ++
+ llvm/lib/CodeGen/AsmPrinter/CodeViewDebug.cpp |   4 +
+ .../LoongArch/LoongArchTargetMachine.cpp      |   8 +-
+ .../LoongArch/LoongArchTargetObjectFile.h     |   3 +
+ .../LoongArch/MCTargetDesc/CMakeLists.txt     |   2 +
+ .../MCTargetDesc/LoongArchAsmBackend.cpp      |   9 +-
+ .../MCTargetDesc/LoongArchMCAsmInfo.cpp       |  14 ++
+ .../MCTargetDesc/LoongArchMCAsmInfo.h         |   6 +
+ .../MCTargetDesc/LoongArchMCTargetDesc.cpp    |  16 +-
+ .../MCTargetDesc/LoongArchMCTargetDesc.h      |   4 +
+ .../LoongArchWinCOFFObjectWriter.cpp          | 205 ++++++++++++++++++
+ .../MCTargetDesc/LoongArchWinCOFFStreamer.cpp |  36 +++
+ .../MCTargetDesc/LoongArchWinCOFFStreamer.h   |  35 +++
+ llvm/lib/TargetParser/Triple.cpp              |   8 +-
+ 14 files changed, 364 insertions(+), 9 deletions(-)
+ create mode 100644 llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchWinCOFFObjectWriter.cpp
+ create mode 100644 llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchWinCOFFStreamer.cpp
+ create mode 100644 llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchWinCOFFStreamer.h
+
+diff --git a/llvm/include/llvm/BinaryFormat/COFF.h b/llvm/include/llvm/BinaryFormat/COFF.h
+index 64fe2160f..1b927caec 100644
+--- a/llvm/include/llvm/BinaryFormat/COFF.h
++++ b/llvm/include/llvm/BinaryFormat/COFF.h
+@@ -101,6 +101,7 @@ enum MachineTypes : unsigned {
+   IMAGE_FILE_MACHINE_ARM64 = 0xAA64,
+   IMAGE_FILE_MACHINE_ARM64EC = 0xA641,
+   IMAGE_FILE_MACHINE_ARM64X = 0xA64E,
++  IMAGE_FILE_MACHINE_LOONGARCH64 = 0x6264,
+   IMAGE_FILE_MACHINE_EBC = 0xEBC,
+   IMAGE_FILE_MACHINE_I386 = 0x14C,
+   IMAGE_FILE_MACHINE_IA64 = 0x200,
+@@ -418,6 +419,28 @@ enum RelocationTypesARM64 : unsigned {
+   IMAGE_REL_ARM64_REL32 = 0x0011,
+ };
+ 
++// LoongArch64 COFF 重定位类型。注意：LoongArch 目前没有官方的 Windows ABI /
++// PE 规范，以下取值是参照 ARM64（0x0000-0x0011）暂定的占位定义，后续需由
++// LoongArch Windows ABI 标准化确认，仅用于让 MC 层能输出 COFF 对象。
++enum RelocationTypesLoongArch64 : unsigned {
++  IMAGE_REL_LOONGARCH64_ABSOLUTE = 0x0000,
++  IMAGE_REL_LOONGARCH64_ADDR32 = 0x0001,
++  IMAGE_REL_LOONGARCH64_ADDR32NB = 0x0002,
++  IMAGE_REL_LOONGARCH64_BRANCH26 = 0x0003,
++  IMAGE_REL_LOONGARCH64_PAGEBASE_REL21 = 0x0004,
++  IMAGE_REL_LOONGARCH64_REL21 = 0x0005,
++  IMAGE_REL_LOONGARCH64_PAGEOFFSET_12A = 0x0006,
++  IMAGE_REL_LOONGARCH64_PAGEOFFSET_12L = 0x0007,
++  IMAGE_REL_LOONGARCH64_SECREL = 0x0008,
++  IMAGE_REL_LOONGARCH64_SECREL_LOW12A = 0x0009,
++  IMAGE_REL_LOONGARCH64_SECREL_HIGH12A = 0x000A,
++  IMAGE_REL_LOONGARCH64_SECREL_LOW12L = 0x000B,
++  IMAGE_REL_LOONGARCH64_TOKEN = 0x000C,
++  IMAGE_REL_LOONGARCH64_SECTION = 0x000D,
++  IMAGE_REL_LOONGARCH64_ADDR64 = 0x000E,
++  IMAGE_REL_LOONGARCH64_REL32 = 0x0011,
++};
++
+ enum RelocationTypesMips : unsigned {
+   IMAGE_REL_MIPS_ABSOLUTE = 0x0000,
+   IMAGE_REL_MIPS_REFHALF = 0x0001,
+diff --git a/llvm/lib/CodeGen/AsmPrinter/CodeViewDebug.cpp b/llvm/lib/CodeGen/AsmPrinter/CodeViewDebug.cpp
+index cfdcd96d3..ce14e6b8e 100644
+--- a/llvm/lib/CodeGen/AsmPrinter/CodeViewDebug.cpp
++++ b/llvm/lib/CodeGen/AsmPrinter/CodeViewDebug.cpp
+@@ -131,6 +131,10 @@ static CPUType mapArchToCVCPUType(Triple::ArchType Type) {
+     return CPUType::ARM64;
+   case Triple::ArchType::mipsel:
+     return CPUType::MIPS;
++  case Triple::ArchType::loongarch32:
++  case Triple::ArchType::loongarch64:
++    // CodeView has no LoongArch CPUType; map to Unknown to avoid aborting.
++    return CPUType::Unknown;
+   case Triple::ArchType::UnknownArch:
+     return CPUType::Unknown;
+   default:
+diff --git a/llvm/lib/Target/LoongArch/LoongArchTargetMachine.cpp b/llvm/lib/Target/LoongArch/LoongArchTargetMachine.cpp
+index 10457c763..4ffbab686 100644
+--- a/llvm/lib/Target/LoongArch/LoongArchTargetMachine.cpp
++++ b/llvm/lib/Target/LoongArch/LoongArchTargetMachine.cpp
+@@ -98,6 +98,12 @@ getEffectiveLoongArchCodeModel(const Triple &TT,
+   }
+ }
+ 
++static std::unique_ptr<TargetLoweringObjectFile> createTLOF(const Triple &TT) {
++  if (TT.isOSBinFormatCOFF())
++    return std::make_unique<LoongArchCOFFTargetObjectFile>();
++  return std::make_unique<LoongArchELFTargetObjectFile>();
++}
++
+ LoongArchTargetMachine::LoongArchTargetMachine(
+     const Target &T, const Triple &TT, StringRef CPU, StringRef FS,
+     const TargetOptions &Options, std::optional<Reloc::Model> RM,
+@@ -105,7 +111,7 @@ LoongArchTargetMachine::LoongArchTargetMachine(
+     : CodeGenTargetMachineImpl(T, TT, CPU, FS, Options,
+                                getEffectiveRelocModel(RM),
+                                getEffectiveLoongArchCodeModel(TT, CM), OL),
+-      TLOF(std::make_unique<LoongArchELFTargetObjectFile>()) {
++      TLOF(createTLOF(TT)) {
+   initAsmInfo();
+ }
+ 
+diff --git a/llvm/lib/Target/LoongArch/LoongArchTargetObjectFile.h b/llvm/lib/Target/LoongArch/LoongArchTargetObjectFile.h
+index 6a3fa76a6..6c16a1f08 100644
+--- a/llvm/lib/Target/LoongArch/LoongArchTargetObjectFile.h
++++ b/llvm/lib/Target/LoongArch/LoongArchTargetObjectFile.h
+@@ -20,6 +20,9 @@ public:
+   const MCExpr *getDebugThreadLocalSymbol(const MCSymbol *Sym) const override;
+ };
+ 
++/// This implementation is used for LoongArch COFF targets.
++class LoongArchCOFFTargetObjectFile : public TargetLoweringObjectFileCOFF {};
++
+ } // end namespace llvm
+ 
+ #endif
+diff --git a/llvm/lib/Target/LoongArch/MCTargetDesc/CMakeLists.txt b/llvm/lib/Target/LoongArch/MCTargetDesc/CMakeLists.txt
+index 39b4423a6..ae9077a79 100644
+--- a/llvm/lib/Target/LoongArch/MCTargetDesc/CMakeLists.txt
++++ b/llvm/lib/Target/LoongArch/MCTargetDesc/CMakeLists.txt
+@@ -9,6 +9,8 @@ add_llvm_component_library(LLVMLoongArchDesc
+   LoongArchMCTargetDesc.cpp
+   LoongArchMatInt.cpp
+   LoongArchTargetStreamer.cpp
++  LoongArchWinCOFFObjectWriter.cpp
++  LoongArchWinCOFFStreamer.cpp
+ 
+   LINK_COMPONENTS
+   MC
+diff --git a/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchAsmBackend.cpp b/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchAsmBackend.cpp
+index 4581da3c7..c2935f4f4 100644
+--- a/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchAsmBackend.cpp
++++ b/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchAsmBackend.cpp
+@@ -460,8 +460,11 @@ void LoongArchAsmBackend::addReloc(const MCFragment &F, const MCFixup &Fixup,
+   }
+ 
+   // If linker relaxation is enabled and supported by the current relocation,
+-  // generate a relocation and then append a RELAX.
+-  if (Fixup.isLinkerRelaxable()) {
++  // generate a relocation and then append a RELAX.  Linker relaxation and the
++  // R_LARCH_RELAX marker are ELF-specific; COFF has no such concept, so skip
++  // this path entirely for COFF targets.
++  if (Fixup.isLinkerRelaxable() &&
++      !STI.getTargetTriple().isOSBinFormatCOFF()) {
+     Asm->getWriter().recordRelocation(F, Fixup, Target, FixedValue);
+     auto FA = MCFixup::create(Fixup.getOffset(), nullptr, ELF::R_LARCH_RELAX);
+     Asm->getWriter().recordRelocation(F, FA, MCValue::get(nullptr),
+@@ -480,6 +483,8 @@ void LoongArchAsmBackend::addReloc(const MCFragment &F, const MCFixup &Fixup,
+ 
+ std::unique_ptr<MCObjectTargetWriter>
+ LoongArchAsmBackend::createObjectTargetWriter() const {
++  if (STI.getTargetTriple().isOSBinFormatCOFF())
++    return createLoongArchWinCOFFObjectWriter(STI.getTargetTriple());
+   return createLoongArchELFObjectWriter(OSABI, Is64Bit);
+ }
+ 
+diff --git a/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchMCAsmInfo.cpp b/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchMCAsmInfo.cpp
+index f3c4cd262..ce5c5abd4 100644
+--- a/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchMCAsmInfo.cpp
++++ b/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchMCAsmInfo.cpp
+@@ -251,6 +251,20 @@ LoongArchMCAsmInfo::LoongArchMCAsmInfo(const Triple &TT,
+   DwarfRegNumForCFI = true;
+ }
+ 
++LoongArchMCAsmInfoGNUCOFF::LoongArchMCAsmInfoGNUCOFF(
++    const MCTargetOptions &Options)
++    : MCAsmInfoGNUCOFF(Options) {
++  CodePointerSize = CalleeSaveStackSlotSize = 8;
++  AlignmentIsInBytes = false;
++  Data8bitsDirective = "\t.byte\t";
++  Data16bitsDirective = "\t.half\t";
++  Data32bitsDirective = "\t.word\t";
++  Data64bitsDirective = "\t.dword\t";
++  ZeroDirective = "\t.space\t";
++  CommentString = "#";
++  SupportsDebugInformation = true;
++}
++
+ void LoongArchMCAsmInfo::printSpecifierExpr(raw_ostream &OS,
+                                             const MCSpecifierExpr &Expr) const {
+   auto S = Expr.getSpecifier();
+diff --git a/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchMCAsmInfo.h b/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchMCAsmInfo.h
+index 4367de72b..8f8d9c496 100644
+--- a/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchMCAsmInfo.h
++++ b/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchMCAsmInfo.h
+@@ -13,6 +13,7 @@
+ #ifndef LLVM_LIB_TARGET_LOONGARCH_MCTARGETDESC_LOONGARCHMCASMINFO_H
+ #define LLVM_LIB_TARGET_LOONGARCH_MCTARGETDESC_LOONGARCHMCASMINFO_H
+ 
++#include "llvm/MC/MCAsmInfoCOFF.h"
+ #include "llvm/MC/MCAsmInfoELF.h"
+ #include "llvm/MC/MCExpr.h"
+ 
+@@ -48,6 +49,11 @@ public:
+                           const MCSpecifierExpr &Expr) const override;
+ };
+ 
++// LoongArch 的 GNU COFF（mingw 风格）汇编信息，用于 --target=loongarch64-windows-gnu。
++struct LoongArchMCAsmInfoGNUCOFF : public MCAsmInfoGNUCOFF {
++  explicit LoongArchMCAsmInfoGNUCOFF(const MCTargetOptions &Options);
++};
++
+ namespace LoongArch {
+ uint16_t parseSpecifier(StringRef name);
+ } // namespace LoongArch
+diff --git a/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchMCTargetDesc.cpp b/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchMCTargetDesc.cpp
+index 10b3ddafc..28397060c 100644
+--- a/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchMCTargetDesc.cpp
++++ b/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchMCTargetDesc.cpp
+@@ -14,6 +14,7 @@
+ #include "LoongArchELFStreamer.h"
+ #include "LoongArchInstPrinter.h"
+ #include "LoongArchMCAsmInfo.h"
++#include "LoongArchWinCOFFStreamer.h"
+ #include "TargetInfo/LoongArchTargetInfo.h"
+ #include "llvm/MC/MCAsmBackend.h"
+ #include "llvm/MC/MCAsmInfo.h"
+@@ -62,7 +63,11 @@ createLoongArchMCSubtargetInfo(const Triple &TT, StringRef CPU, StringRef FS) {
+ static MCAsmInfo *createLoongArchMCAsmInfo(const MCRegisterInfo &MRI,
+                                            const Triple &TT,
+                                            const MCTargetOptions &Options) {
+-  MCAsmInfo *MAI = new LoongArchMCAsmInfo(TT, Options);
++  MCAsmInfo *MAI;
++  if (TT.isOSBinFormatCOFF())
++    MAI = new LoongArchMCAsmInfoGNUCOFF(Options);
++  else
++    MAI = new LoongArchMCAsmInfo(TT, Options);
+ 
+   // Initial state of the frame pointer is sp(r3).
+   unsigned SP = MRI.getDwarfRegNum(LoongArch::R3, true);
+@@ -82,9 +87,11 @@ static MCInstPrinter *createLoongArchMCInstPrinter(const Triple &T,
+ 
+ static MCTargetStreamer *
+ createLoongArchObjectTargetStreamer(MCStreamer &S, const MCSubtargetInfo &STI) {
+-  return STI.getTargetTriple().isOSBinFormatELF()
+-             ? new LoongArchTargetELFStreamer(S, STI)
+-             : nullptr;
++  if (STI.getTargetTriple().isOSBinFormatELF())
++    return new LoongArchTargetELFStreamer(S, STI);
++  if (STI.getTargetTriple().isOSBinFormatCOFF())
++    return new LoongArchTargetStreamer(S);
++  return nullptr;
+ }
+ 
+ static MCTargetStreamer *
+@@ -301,6 +308,7 @@ LLVMInitializeLoongArchTargetMC() {
+     TargetRegistry::RegisterMCInstPrinter(*T, createLoongArchMCInstPrinter);
+     TargetRegistry::RegisterMCInstrAnalysis(*T, createLoongArchInstrAnalysis);
+     TargetRegistry::RegisterELFStreamer(*T, createLoongArchELFStreamer);
++    TargetRegistry::RegisterCOFFStreamer(*T, createLoongArchWinCOFFStreamer);
+     TargetRegistry::RegisterObjectTargetStreamer(
+         *T, createLoongArchObjectTargetStreamer);
+     TargetRegistry::RegisterAsmTargetStreamer(*T,
+diff --git a/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchMCTargetDesc.h b/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchMCTargetDesc.h
+index ab35a0096..cfa5ad6d4 100644
+--- a/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchMCTargetDesc.h
++++ b/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchMCTargetDesc.h
+@@ -26,6 +26,7 @@ class MCObjectTargetWriter;
+ class MCRegisterInfo;
+ class MCSubtargetInfo;
+ class Target;
++class Triple;
+ 
+ MCCodeEmitter *createLoongArchMCCodeEmitter(const MCInstrInfo &MCII,
+                                             MCContext &Ctx);
+@@ -38,6 +39,9 @@ MCAsmBackend *createLoongArchAsmBackend(const Target &T,
+ std::unique_ptr<MCObjectTargetWriter>
+ createLoongArchELFObjectWriter(uint8_t OSABI, bool Is64Bit);
+ 
++std::unique_ptr<MCObjectTargetWriter>
++createLoongArchWinCOFFObjectWriter(const Triple &TheTriple);
++
+ } // end namespace llvm
+ 
+ // Defines symbolic names for LoongArch registers.
+diff --git a/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchWinCOFFObjectWriter.cpp b/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchWinCOFFObjectWriter.cpp
+new file mode 100644
+index 000000000..80acc0b31
+--- /dev/null
++++ b/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchWinCOFFObjectWriter.cpp
+@@ -0,0 +1,205 @@
++//===-- LoongArchWinCOFFObjectWriter.cpp - LoongArch Win COFF Writer ------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// LoongArch 的 Windows COFF 对象写出器。参照 AArch64WinCOFFObjectWriter.cpp
++// 实现。由于 LoongArch 目前没有官方 Windows ABI / PE 规范，重定位类型取值
++// 为暂定占位（见 COFF.h 中的 RelocationTypesLoongArch64），仅用于打通
++// MC 层输出 COFF 对象的最小路径。
++//
++//===----------------------------------------------------------------------===//
++
++#include "LoongArchMCTargetDesc.h"
++#include "MCTargetDesc/LoongArchFixupKinds.h"
++#include "llvm/ADT/Twine.h"
++#include "llvm/BinaryFormat/COFF.h"
++#include "llvm/BinaryFormat/ELF.h"
++#include "llvm/MC/MCAsmBackend.h"
++#include "llvm/MC/MCContext.h"
++#include "llvm/MC/MCExpr.h"
++#include "llvm/MC/MCFixup.h"
++#include "llvm/MC/MCObjectWriter.h"
++#include "llvm/MC/MCValue.h"
++#include "llvm/MC/MCWinCOFFObjectWriter.h"
++
++using namespace llvm;
++
++namespace {
++
++class LoongArchWinCOFFObjectWriter : public MCWinCOFFObjectTargetWriter {
++public:
++  LoongArchWinCOFFObjectWriter(const Triple &TheTriple)
++      : MCWinCOFFObjectTargetWriter(COFF::IMAGE_FILE_MACHINE_LOONGARCH64) {}
++
++  ~LoongArchWinCOFFObjectWriter() override = default;
++
++  unsigned getRelocType(MCContext &Ctx, const MCValue &Target,
++                        const MCFixup &Fixup, bool IsCrossSection,
++                        const MCAsmBackend &MAB) const override;
++
++  bool recordRelocation(const MCFixup &) const override;
++};
++
++} // end anonymous namespace
++
++unsigned LoongArchWinCOFFObjectWriter::getRelocType(
++    MCContext &Ctx, const MCValue &Target, const MCFixup &Fixup,
++    bool IsCrossSection, const MCAsmBackend &MAB) const {
++  unsigned FixupKind = Fixup.getKind();
++  bool PCRel = Fixup.isPCRel();
++
++  if (IsCrossSection) {
++    // IMAGE_REL_LOONGARCH64_REL64 不存在，跨节时把 FK_Data_8 当作 FK_PCRel_4
++    // 处理，使 `.dword a-b` 能降到 REL32，规避 COFF 的局限。
++    if (PCRel || (FixupKind != FK_Data_4 && FixupKind != FK_Data_8)) {
++      Ctx.reportError(Fixup.getLoc(), "Cannot represent this expression");
++      return COFF::IMAGE_REL_LOONGARCH64_ADDR32;
++    }
++    FixupKind = FK_Data_4;
++    PCRel = true;
++  }
++
++  unsigned Spec = Target.getSpecifier();
++
++  switch (FixupKind) {
++  default: {
++    MCFixupKindInfo Info = MAB.getFixupKindInfo(Fixup.getKind());
++    const char *Name = Info.Name ? Info.Name : "<unknown>";
++    Ctx.reportError(Fixup.getLoc(),
++                    Twine("relocation type ") + Name + " (kind " +
++                        Twine(FixupKind) + ") unsupported on COFF targets");
++    return COFF::IMAGE_REL_LOONGARCH64_ABSOLUTE;
++  }
++
++  case FK_Data_4:
++    if (PCRel)
++      return COFF::IMAGE_REL_LOONGARCH64_REL32;
++    switch (Spec) {
++    default:
++      return COFF::IMAGE_REL_LOONGARCH64_ADDR32;
++    case MCSymbolRefExpr::VK_COFF_IMGREL32:
++      return COFF::IMAGE_REL_LOONGARCH64_ADDR32NB;
++    }
++
++  case FK_Data_8:
++    return COFF::IMAGE_REL_LOONGARCH64_ADDR64;
++
++  case FK_SecRel_2:
++    return COFF::IMAGE_REL_LOONGARCH64_SECTION;
++
++  case FK_SecRel_4:
++    return COFF::IMAGE_REL_LOONGARCH64_SECREL;
++
++  // 抽象 fixup：分支与绝对寻址。
++  case LoongArch::fixup_loongarch_b16:
++  case LoongArch::fixup_loongarch_b21:
++  case LoongArch::fixup_loongarch_b26:
++    return COFF::IMAGE_REL_LOONGARCH64_BRANCH26;
++
++  case LoongArch::fixup_loongarch_abs_hi20:
++  case LoongArch::fixup_loongarch_abs_lo12:
++    return COFF::IMAGE_REL_LOONGARCH64_ADDR32;
++
++  case LoongArch::fixup_loongarch_abs64_lo20:
++  case LoongArch::fixup_loongarch_abs64_hi12:
++  case LoongArch::fixup_loongarch_dtprel64:
++    return COFF::IMAGE_REL_LOONGARCH64_ADDR64;
++
++  case LoongArch::fixup_loongarch_dtprel32:
++    return COFF::IMAGE_REL_LOONGARCH64_ADDR32;
++
++  // 原始 ELF 重定位类型：LoongArch 后端对 pcalau12i / addi.d 等寻址指令直接
++  // 用 R_LARCH_* 作为 fixup kind（见 LoongArchMCInstLower / MCCodeEmitter）。
++  // 这里按 ARM64 PE 的 PAGEBASE_REL21 / PAGEOFFSET_12L 类比映射。
++  case ELF::R_LARCH_NONE:
++    return COFF::IMAGE_REL_LOONGARCH64_ABSOLUTE;
++
++  case ELF::R_LARCH_32:
++    return COFF::IMAGE_REL_LOONGARCH64_ADDR32;
++  case ELF::R_LARCH_64:
++    return COFF::IMAGE_REL_LOONGARCH64_ADDR64;
++  case ELF::R_LARCH_32_PCREL:
++    return COFF::IMAGE_REL_LOONGARCH64_REL32;
++  case ELF::R_LARCH_64_PCREL:
++    return COFF::IMAGE_REL_LOONGARCH64_REL32;
++
++  case ELF::R_LARCH_PCALA_HI20:
++    return COFF::IMAGE_REL_LOONGARCH64_PAGEBASE_REL21;
++  case ELF::R_LARCH_PCALA_LO12:
++    return COFF::IMAGE_REL_LOONGARCH64_PAGEOFFSET_12L;
++  case ELF::R_LARCH_PCALA64_LO20:
++  case ELF::R_LARCH_PCALA64_HI12:
++    return COFF::IMAGE_REL_LOONGARCH64_ADDR64;
++
++  case ELF::R_LARCH_PCADD_HI20:
++    return COFF::IMAGE_REL_LOONGARCH64_PAGEBASE_REL21;
++  case ELF::R_LARCH_PCADD_LO12:
++    return COFF::IMAGE_REL_LOONGARCH64_PAGEOFFSET_12L;
++
++  case ELF::R_LARCH_CALL30:
++  case ELF::R_LARCH_CALL36:
++    return COFF::IMAGE_REL_LOONGARCH64_BRANCH26;
++
++  // GOT / TLS 类重定位需要真正的 PE 链接器与运行时支持，暂报错占位。
++  case ELF::R_LARCH_GOT_PC_HI20:
++  case ELF::R_LARCH_GOT_PC_LO12:
++  case ELF::R_LARCH_GOT64_PC_LO20:
++  case ELF::R_LARCH_GOT64_PC_HI12:
++  case ELF::R_LARCH_GOT_HI20:
++  case ELF::R_LARCH_GOT_LO12:
++  case ELF::R_LARCH_GOT64_LO20:
++  case ELF::R_LARCH_GOT64_HI12:
++  case ELF::R_LARCH_TLS_LE_HI20:
++  case ELF::R_LARCH_TLS_LE_LO12:
++  case ELF::R_LARCH_TLS_LE64_LO20:
++  case ELF::R_LARCH_TLS_LE64_HI12:
++  case ELF::R_LARCH_TLS_IE_PC_HI20:
++  case ELF::R_LARCH_TLS_IE_PC_LO12:
++  case ELF::R_LARCH_TLS_IE64_PC_LO20:
++  case ELF::R_LARCH_TLS_IE64_PC_HI12:
++  case ELF::R_LARCH_TLS_IE_HI20:
++  case ELF::R_LARCH_TLS_IE_LO12:
++  case ELF::R_LARCH_TLS_IE64_LO20:
++  case ELF::R_LARCH_TLS_IE64_HI12:
++  case ELF::R_LARCH_TLS_LD_PC_HI20:
++  case ELF::R_LARCH_TLS_LD_HI20:
++  case ELF::R_LARCH_TLS_GD_PC_HI20:
++  case ELF::R_LARCH_TLS_GD_HI20:
++  case ELF::R_LARCH_TLS_DESC_PC_HI20:
++  case ELF::R_LARCH_TLS_DESC_PC_LO12:
++  case ELF::R_LARCH_TLS_DESC64_PC_LO20:
++  case ELF::R_LARCH_TLS_DESC64_PC_HI12:
++  case ELF::R_LARCH_TLS_DESC_HI20:
++  case ELF::R_LARCH_TLS_DESC_LO12:
++  case ELF::R_LARCH_TLS_DESC64_LO20:
++  case ELF::R_LARCH_TLS_DESC64_HI12:
++  case ELF::R_LARCH_TLS_DESC_LD:
++  case ELF::R_LARCH_TLS_DESC_CALL:
++  case ELF::R_LARCH_TLS_LE_HI20_R:
++  case ELF::R_LARCH_TLS_LE_ADD_R:
++  case ELF::R_LARCH_TLS_LE_LO12_R:
++  case ELF::R_LARCH_TLS_LD_PCREL20_S2:
++  case ELF::R_LARCH_TLS_GD_PCREL20_S2:
++  case ELF::R_LARCH_TLS_DESC_PCREL20_S2: {
++    MCFixupKindInfo Info = MAB.getFixupKindInfo(Fixup.getKind());
++    const char *Name = Info.Name ? Info.Name : "<unknown>";
++    Ctx.reportError(Fixup.getLoc(), Twine("relocation type ") + Name +
++                                        " not yet supported on COFF targets");
++    return COFF::IMAGE_REL_LOONGARCH64_ABSOLUTE;
++  }
++  }
++}
++
++bool LoongArchWinCOFFObjectWriter::recordRelocation(
++    const MCFixup &Fixup) const {
++  return true;
++}
++
++std::unique_ptr<MCObjectTargetWriter>
++llvm::createLoongArchWinCOFFObjectWriter(const Triple &TheTriple) {
++  return std::make_unique<LoongArchWinCOFFObjectWriter>(TheTriple);
++}
+diff --git a/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchWinCOFFStreamer.cpp b/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchWinCOFFStreamer.cpp
+new file mode 100644
+index 000000000..ce73caa64
+--- /dev/null
++++ b/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchWinCOFFStreamer.cpp
+@@ -0,0 +1,36 @@
++//===-- LoongArchWinCOFFStreamer.cpp - WinCOFF Streamer for LoongArch -*- C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "LoongArchWinCOFFStreamer.h"
++#include "llvm/MC/MCAsmBackend.h"
++#include "llvm/MC/MCAssembler.h"
++#include "llvm/MC/MCCodeEmitter.h"
++#include "llvm/MC/MCContext.h"
++#include "llvm/MC/MCObjectWriter.h"
++
++using namespace llvm;
++
++namespace {
++
++class LoongArchWinCOFFStreamer : public MCWinCOFFStreamer {
++public:
++  LoongArchWinCOFFStreamer(MCContext &C, std::unique_ptr<MCAsmBackend> AB,
++                           std::unique_ptr<MCCodeEmitter> CE,
++                           std::unique_ptr<MCObjectWriter> OW)
++      : MCWinCOFFStreamer(C, std::move(AB), std::move(CE), std::move(OW)) {}
++};
++
++} // end anonymous namespace
++
++MCStreamer *llvm::createLoongArchWinCOFFStreamer(
++    MCContext &Context, std::unique_ptr<MCAsmBackend> &&MAB,
++    std::unique_ptr<MCObjectWriter> &&OW,
++    std::unique_ptr<MCCodeEmitter> &&Emitter) {
++  return new LoongArchWinCOFFStreamer(Context, std::move(MAB),
++                                      std::move(Emitter), std::move(OW));
++}
+diff --git a/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchWinCOFFStreamer.h b/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchWinCOFFStreamer.h
+new file mode 100644
+index 000000000..546a4f088
+--- /dev/null
++++ b/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchWinCOFFStreamer.h
+@@ -0,0 +1,35 @@
++//===-- LoongArchWinCOFFStreamer.h - WinCOFF Streamer for LoongArch -* C++ -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// LoongArch 的 WinCOFF Streamer。LoongArch 暂无 Windows SEH 展开表定义，
++// 因此这里直接复用 MCWinCOFFStreamer，不做 ARM64 那样的 unwind 发射逻辑。
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef LLVM_LIB_TARGET_LOONGARCH_MCTARGETDESC_LOONGARCHWINCOFFSTREAMER_H
++#define LLVM_LIB_TARGET_LOONGARCH_MCTARGETDESC_LOONGARCHWINCOFFSTREAMER_H
++
++#include "llvm/MC/MCWinCOFFStreamer.h"
++#include <memory>
++
++namespace llvm {
++
++class MCAsmBackend;
++class MCCodeEmitter;
++class MCContext;
++class MCObjectWriter;
++class MCStreamer;
++
++MCStreamer *createLoongArchWinCOFFStreamer(
++    MCContext &Context, std::unique_ptr<MCAsmBackend> &&TAB,
++    std::unique_ptr<MCObjectWriter> &&OW,
++    std::unique_ptr<MCCodeEmitter> &&Emitter);
++
++} // end namespace llvm
++
++#endif // LLVM_LIB_TARGET_LOONGARCH_MCTARGETDESC_LOONGARCHWINCOFFSTREAMER_H
+diff --git a/llvm/lib/TargetParser/Triple.cpp b/llvm/lib/TargetParser/Triple.cpp
+index b51105fc4..1b46c27f3 100644
+--- a/llvm/lib/TargetParser/Triple.cpp
++++ b/llvm/lib/TargetParser/Triple.cpp
+@@ -979,8 +979,6 @@ static Triple::ObjectFormatType getDefaultFormat(const Triple &T) {
+   case Triple::hsail:
+   case Triple::kalimba:
+   case Triple::lanai:
+-  case Triple::loongarch32:
+-  case Triple::loongarch64:
+   case Triple::m68k:
+   case Triple::mips64:
+   case Triple::mips64el:
+@@ -1012,6 +1010,12 @@ static Triple::ObjectFormatType getDefaultFormat(const Triple &T) {
+   case Triple::xtensa:
+     return Triple::ELF;
+ 
++  case Triple::loongarch32:
++  case Triple::loongarch64:
++    if (T.isOSWindows())
++      return Triple::COFF;
++    return Triple::ELF;
++
+   case Triple::mipsel:
+     if (T.isOSWindows())
+       return Triple::COFF;
+-- 
+2.47.3
+

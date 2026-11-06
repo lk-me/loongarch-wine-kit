@@ -1,0 +1,34 @@
+From 7318e4347216c5b1c4cccb3b87eff1562e6d5a51 Mon Sep 17 00:00:00 2001
+From: k <k@l>
+Date: Fri, 6 Nov 2026 19:56:21 +0800
+Subject: [PATCH 20/20] [LoongArch] Fix builtin path buffer sizing
+
+---
+ dlls/ntdll/unix/loader.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index 99b759a..6380492 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -1153,7 +1153,7 @@ static NTSTATUS find_builtin_dll( UNICODE_STRING *nt_name, ANSI_STRING *exp_name
+             pe_build_dir = alt_build_dir;
+         maxlen = max( strlen(build_dir), strlen(pe_build_dir) ) + sizeof("/programs/") + len;
+     }
+-    maxlen = max( maxlen, dll_path_maxlen + 1 ) + len + sizeof("/aarch64-windows") + sizeof(".so");
++    maxlen = max( maxlen, dll_path_maxlen + 1 ) + len + sizeof("/loongarch64-windows") + sizeof(".so");
+ 
+     if (!(file = malloc( maxlen ))) return STATUS_NO_MEMORY;
+ 
+@@ -1324,7 +1324,7 @@ NTSTATUS load_unixlib_by_name( const UNICODE_STRING *nt_name, void **handle_ret
+     }
+ 
+     if (build_dir) maxlen = strlen(build_dir) + sizeof("/dlls/") + len;
+-    maxlen = max( maxlen, dll_path_maxlen + 1 ) + len + sizeof("/aarch64-unix") + sizeof(".so");
++    maxlen = max( maxlen, dll_path_maxlen + 1 ) + len + sizeof("/loongarch64-unix") + sizeof(".so");
+ 
+     if (!(file = malloc( maxlen ))) return STATUS_NO_MEMORY;
+ 
+-- 
+2.47.3
+

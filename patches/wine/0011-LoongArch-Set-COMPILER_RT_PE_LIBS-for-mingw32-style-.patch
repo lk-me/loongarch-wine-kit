@@ -1,0 +1,46 @@
+From 9bb3fdc3f19da4ffb336050797f63a2c405d6416 Mon Sep 17 00:00:00 2001
+From: ChenghaoLiu <linkmecry@gmail.com>
+Date: Fri, 6 Nov 2026 09:32:45 +0800
+Subject: [PATCH 11/11] [LoongArch] Set COMPILER_RT_PE_LIBS for mingw32-style
+ PE targets
+
+llvm-mingw style compilers are named <triple>-clang, so configure derives a
+*-mingw32 triple and never sets wine_compiler_rt_libs; the bundled
+compiler-rt was then not linked into PE programs (xcopy failed with
+"unable to find library -lcompiler-rt").
+---
+ configure    | 3 +++
+ configure.ac | 3 +++
+ 2 files changed, 6 insertions(+)
+
+diff --git a/configure b/configure
+index dc33f47..879df80 100755
+--- a/configure
++++ b/configure
+@@ -7901,6 +7901,9 @@ fi
+ 
+     case "$target" in
+       *-windows) wine_compiler_rt_libs="compiler-rt" ;;
++      # llvm-mingw style cross compilers are named <triple>-clang, which makes
++      # $target a *-mingw32 triple; the compiler-rt library name is the same.
++      *-mingw32) wine_compiler_rt_libs="compiler-rt" ;;
+     esac
+ 
+     { as_ac_var=`printf "%s\n" "ac_cv_${wine_arch}_cflags_-fno-strict-aliasing" | $as_tr_sh`
+diff --git a/configure.ac b/configure.ac
+index a0e16cd..46c0a00 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -544,6 +544,9 @@ This is an error since --enable-archs=$wine_arch was requested.])])
+ 
+     case "$target" in
+       *-windows) wine_compiler_rt_libs="compiler-rt" ;;
++      dnl llvm-mingw style cross compilers are named <triple>-clang, which makes
++      dnl $target a *-mingw32 triple; the compiler-rt library name is the same.
++      *-mingw32) wine_compiler_rt_libs="compiler-rt" ;;
+     esac
+ 
+     WINE_TRY_PE_CFLAGS([-fno-strict-aliasing])
+-- 
+2.47.3
+

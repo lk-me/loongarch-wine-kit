@@ -1,0 +1,343 @@
+From 5e81cfae83fd1fd5329e7887ba50cb07991b5cdf Mon Sep 17 00:00:00 2001
+From: ChenghaoLiu <linkmecry@gmail.com>
+Date: Mon, 2 Nov 2026 19:09:45 +0800
+Subject: [PATCH 02/11] [LoongArch] Add arch context types and PE thunk
+ generation
+
+Add LoongArch64 support to Wine's architecture-dependent pieces:
+
+- include/winnt.h: add CONTEXT_LOONGARCH64 layout (_LOONGARCH64_NT_CONTEXT
+  with Gpr/Pc/Fpr/Fcc/Fcsr), runtime function and scope table types,
+  DISPATCHER_CONTEXT_LOONGARCH64, and NtCurrentTeb() using $r21 as the
+  Wine TEB register.
+- tools/winebuild/import.c: emit LoongArch64 unimplemented stubs,
+  delay-load thunks (save/restore $ra and $a0-$a7) and import thunks
+  (pcalau12i/addi.d/ld.d/jr), plus the "loongarch64" machine name.
+- tools/winebuild/spec32.c: emit LoongArch64 relay entry points and
+  existing import thunks.
+- tools/winebuild/utils.c: skip .seh_* directives, not supported by the
+  LLVM LoongArch COFF assembler yet.
+- tools/winegcc/winegcc.c: apply the ms_abi stdcall defines to
+  LoongArch64 like x86_64/arm64.
+---
+ include/winnt.h          | 119 +++++++++++++++++++++++++++++++++++++++
+ tools/winebuild/import.c |  54 ++++++++++++++++++
+ tools/winebuild/spec32.c |  31 ++++++++++
+ tools/winebuild/utils.c  |   2 +
+ tools/winegcc/winegcc.c  |   1 +
+ 5 files changed, 207 insertions(+)
+
+diff --git a/include/winnt.h b/include/winnt.h
+index bf74e3a..889a0ce 100644
+--- a/include/winnt.h
++++ b/include/winnt.h
+@@ -1966,6 +1966,76 @@ typedef struct DECLSPEC_ALIGN(16) _ARM64EC_NT_CONTEXT
+     } DUMMYUNIONNAME;
+ } ARM64EC_NT_CONTEXT, *PARM64EC_NT_CONTEXT;
+ 
++/* LoongArch64 context. There is no official Windows LoongArch ABI, the layout
++ * below is Wine's own definition: the 32 general registers $r0-$r31, the program
++ * counter, the 32 floating-point registers $f0-$f31 and the FCC/FCSR registers. */
++#define CONTEXT_LOONGARCH64           0x800000
++#define CONTEXT_LOONGARCH64_CONTROL         (CONTEXT_LOONGARCH64 | 0x00000001)
++#define CONTEXT_LOONGARCH64_INTEGER         (CONTEXT_LOONGARCH64 | 0x00000002)
++#define CONTEXT_LOONGARCH64_FLOATING_POINT  (CONTEXT_LOONGARCH64 | 0x00000004)
++#define CONTEXT_LOONGARCH64_DEBUG_REGISTERS (CONTEXT_LOONGARCH64 | 0x00000008)
++#define CONTEXT_LOONGARCH64_FULL (CONTEXT_LOONGARCH64_CONTROL | CONTEXT_LOONGARCH64_INTEGER | CONTEXT_LOONGARCH64_FLOATING_POINT)
++#define CONTEXT_LOONGARCH64_ALL  (CONTEXT_LOONGARCH64_FULL | CONTEXT_LOONGARCH64_DEBUG_REGISTERS)
++
++#define CONTEXT_LOONGARCH64_UNWOUND_TO_CALL 0x20000000
++
++typedef struct _IMAGE_LOONGARCH64_RUNTIME_FUNCTION_ENTRY
++{
++    DWORD BeginAddress;
++    DWORD EndAddress;
++    DWORD UnwindInfoAddress;
++} IMAGE_LOONGARCH64_RUNTIME_FUNCTION_ENTRY, *PIMAGE_LOONGARCH64_RUNTIME_FUNCTION_ENTRY;
++
++typedef IMAGE_LOONGARCH64_RUNTIME_FUNCTION_ENTRY LOONGARCH64_RUNTIME_FUNCTION, *PLOONGARCH64_RUNTIME_FUNCTION;
++
++typedef struct _SCOPE_TABLE_LOONGARCH64
++{
++    DWORD Count;
++    struct
++    {
++        DWORD BeginAddress;
++        DWORD EndAddress;
++        DWORD HandlerAddress;
++        DWORD JumpTarget;
++    } ScopeRecord[1];
++} SCOPE_TABLE_LOONGARCH64, *PSCOPE_TABLE_LOONGARCH64;
++
++typedef struct _KNONVOLATILE_CONTEXT_POINTERS_LOONGARCH64
++{
++    PDWORD64 R22;
++    PDWORD64 R23;
++    PDWORD64 R24;
++    PDWORD64 R25;
++    PDWORD64 R26;
++    PDWORD64 R27;
++    PDWORD64 R28;
++    PDWORD64 R29;
++    PDWORD64 R30;
++    PDWORD64 R31;
++    PDWORD64 F24;
++    PDWORD64 F25;
++    PDWORD64 F26;
++    PDWORD64 F27;
++    PDWORD64 F28;
++    PDWORD64 F29;
++    PDWORD64 F30;
++    PDWORD64 F31;
++} KNONVOLATILE_CONTEXT_POINTERS_LOONGARCH64, *PKNONVOLATILE_CONTEXT_POINTERS_LOONGARCH64;
++
++typedef struct DECLSPEC_ALIGN(16) _LOONGARCH64_NT_CONTEXT
++{
++    ULONG ContextFlags;                 /* 000 */
++    ULONG Reserved;                     /* 004 */
++    /* CONTEXT_INTEGER */
++    DWORD64 Gpr[32];                    /* 008: $r0-$r31 */
++    /* CONTEXT_CONTROL */
++    DWORD64 Pc;                         /* 108 */
++    /* CONTEXT_FLOATING_POINT */
++    DWORD64 Fpr[32];                    /* 110: $f0-$f31 */
++    DWORD Fcc[8];                       /* 210: $fcc0-$fcc7 */
++    DWORD Fcsr;                         /* 230 */
++} LOONGARCH64_NT_CONTEXT, *PLOONGARCH64_NT_CONTEXT;
++
+ #ifdef __aarch64__
+ 
+ #define CONTEXT_CONTROL CONTEXT_ARM64_CONTROL
+@@ -1984,6 +2054,20 @@ typedef ARM64_NT_CONTEXT CONTEXT, *PCONTEXT;
+ 
+ #define _DISPATCHER_CONTEXT_ARM64 _DISPATCHER_CONTEXT
+ 
++#elif defined(__loongarch__) || defined(__loongarch64__) || defined(__loongarch64)
++
++#define CONTEXT_CONTROL CONTEXT_LOONGARCH64_CONTROL
++#define CONTEXT_INTEGER CONTEXT_LOONGARCH64_INTEGER
++#define CONTEXT_FLOATING_POINT CONTEXT_LOONGARCH64_FLOATING_POINT
++#define CONTEXT_DEBUG_REGISTERS CONTEXT_LOONGARCH64_DEBUG_REGISTERS
++#define CONTEXT_FULL CONTEXT_LOONGARCH64_FULL
++#define CONTEXT_ALL CONTEXT_LOONGARCH64_ALL
++
++typedef IMAGE_LOONGARCH64_RUNTIME_FUNCTION_ENTRY RUNTIME_FUNCTION, *PRUNTIME_FUNCTION;
++typedef SCOPE_TABLE_LOONGARCH64 SCOPE_TABLE, *PSCOPE_TABLE;
++typedef KNONVOLATILE_CONTEXT_POINTERS_LOONGARCH64 KNONVOLATILE_CONTEXT_POINTERS, *PKNONVOLATILE_CONTEXT_POINTERS;
++typedef LOONGARCH64_NT_CONTEXT CONTEXT, *PCONTEXT;
++
+ #endif /* __aarch64__ */
+ 
+ #if !defined(CONTEXT_FULL) && !defined(RC_INVOKED)
+@@ -2143,6 +2227,33 @@ typedef void (CALLBACK *PTERMINATION_HANDLER)(BOOLEAN,DWORD64);
+ #define UNW_FLAG_EHANDLER  1
+ #define UNW_FLAG_UHANDLER  2
+ 
++#elif defined(__loongarch__) || defined(__loongarch64__) || defined(__loongarch64)
++
++typedef struct _DISPATCHER_CONTEXT_LOONGARCH64
++{
++    ULONG64                         ControlPc;
++    ULONG64                         ImageBase;
++    PLOONGARCH64_RUNTIME_FUNCTION   FunctionEntry;
++    ULONG64                         EstablisherFrame;
++    ULONG64                         TargetPc;
++    PLOONGARCH64_NT_CONTEXT         ContextRecord;
++    PEXCEPTION_ROUTINE              LanguageHandler;
++    PVOID                           HandlerData;
++    struct _UNWIND_HISTORY_TABLE   *HistoryTable;
++    DWORD                           ScopeIndex;
++    BOOLEAN                         ControlPcIsUnwound;
++    PBYTE                           NonVolatileRegisters;
++} DISPATCHER_CONTEXT_LOONGARCH64, *PDISPATCHER_CONTEXT_LOONGARCH64;
++
++typedef DISPATCHER_CONTEXT_LOONGARCH64 DISPATCHER_CONTEXT, *PDISPATCHER_CONTEXT;
++
++typedef LONG (CALLBACK *PEXCEPTION_FILTER)(struct _EXCEPTION_POINTERS*,DWORD64);
++typedef void (CALLBACK *PTERMINATION_HANDLER)(BOOLEAN,DWORD64);
++
++#define UNW_FLAG_NHANDLER  0
++#define UNW_FLAG_EHANDLER  1
++#define UNW_FLAG_UHANDLER  2
++
+ #endif /* __aarch64__ */
+ 
+ /*
+@@ -2502,6 +2613,14 @@ static FORCEINLINE struct _TEB * WINAPI NtCurrentTeb(void)
+ {
+     return (struct _TEB *)(ULONG_PTR)_MoveFromCoprocessor(15, 0, 13, 0, 2);
+ }
++#elif (defined(__loongarch__) || defined(__loongarch64__) || defined(__loongarch64)) && defined(__GNUC__)
++/* LoongArch has no reserved TEB register in the Linux ABI, use $r21 (reserved
++ * for the kernel, never used by PE code) as the Wine TEB register. */
++register struct _TEB *__wine_current_teb __asm__("$r21");
++static FORCEINLINE struct _TEB * WINAPI NtCurrentTeb(void)
++{
++    return __wine_current_teb;
++}
+ #elif !defined(RC_INVOKED)
+ # error You must define NtCurrentTeb() for your architecture
+ #endif
+diff --git a/tools/winebuild/import.c b/tools/winebuild/import.c
+index 827d88e..7265944 100644
+--- a/tools/winebuild/import.c
++++ b/tools/winebuild/import.c
+@@ -1167,6 +1167,17 @@ void output_stubs( DLLSPEC *spec )
+             output( "\tb %s\n", arm64_name("__wine_spec_unimplemented_stub") );
+             output( "\t.seh_endproc\n" );
+             break;
++        case CPU_LOONGARCH64:
++            output( "\tpcalau12i $a0, %%pc_hi20(.L__wine_spec_file_name)\n" );
++            output( "\taddi.d $a0, $a0, %%pc_lo12(.L__wine_spec_file_name)\n" );
++            if (exp_name)
++            {
++                output( "\tpcalau12i $a1, %%pc_hi20(.L%s_string)\n", name );
++                output( "\taddi.d $a1, $a1, %%pc_lo12(.L%s_string)\n", name );
++            }
++            else output( "\tli.d $a1, %u\n", odp->ordinal );
++            output( "\tb %s\n", asm_name("__wine_spec_unimplemented_stub") );
++            break;
+         }
+         output_function_size( name );
+     }
+@@ -1235,6 +1246,7 @@ static const char *get_target_machine(void)
+         [CPU_ARM]     = "arm",
+         [CPU_ARM64]   = "arm64",
+         [CPU_ARM64EC] = "arm64ec",
++        [CPU_LOONGARCH64] = "loongarch64",
+     };
+ 
+     return machine_names[target.cpu];
+@@ -1448,6 +1460,34 @@ static void build_windows_import_lib( const char *lib_name, DLLSPEC *spec, struc
+         case CPU_ARM64EC:
+             assert( 0 );
+             break;
++        case CPU_LOONGARCH64:
++            output( "\taddi.d $sp, $sp, -80\n" );
++            output( "\tst.d $ra, $sp, 0\n" );
++            output( "\tst.d $a0, $sp, 16\n" );
++            output( "\tst.d $a1, $sp, 24\n" );
++            output( "\tst.d $a2, $sp, 32\n" );
++            output( "\tst.d $a3, $sp, 40\n" );
++            output( "\tst.d $a4, $sp, 48\n" );
++            output( "\tst.d $a5, $sp, 56\n" );
++            output( "\tst.d $a6, $sp, 64\n" );
++            output( "\tst.d $a7, $sp, 72\n" );
++            output( "\tmove $a1, $t8\n" );
++            output( "\tpcalau12i $a0, %%pc_hi20(%s)\n", asm_name( import_desc ) );
++            output( "\taddi.d $a0, $a0, %%pc_lo12(%s)\n", asm_name( import_desc ) );
++            output( "\tbl %s\n", asm_name( "__delayLoadHelper2" ) );
++            output( "\tmove $t8, $a0\n" );
++            output( "\tld.d $a0, $sp, 16\n" );
++            output( "\tld.d $a1, $sp, 24\n" );
++            output( "\tld.d $a2, $sp, 32\n" );
++            output( "\tld.d $a3, $sp, 40\n" );
++            output( "\tld.d $a4, $sp, 48\n" );
++            output( "\tld.d $a5, $sp, 56\n" );
++            output( "\tld.d $a6, $sp, 64\n" );
++            output( "\tld.d $a7, $sp, 72\n" );
++            output( "\tld.d $ra, $sp, 0\n" );
++            output( "\taddi.d $sp, $sp, 80\n" );
++            output( "\tjr $t8\n" );
++            break;
+         }
+         output_function_size( delay_load );
+         output_gnu_stack_note();
+@@ -1594,6 +1634,20 @@ static void build_windows_import_lib( const char *lib_name, DLLSPEC *spec, struc
+             case CPU_ARM64EC:
+                 assert( 0 );
+                 break;
++            case CPU_LOONGARCH64:
++                output( "\tpcalau12i $t8, %%pc_hi20(%s)\n", asm_name( imp_name ) );
++                output( "\taddi.d $t8, $t8, %%pc_lo12(%s)\n", asm_name( imp_name ) );
++                output( "\tld.d $t8, $t8, 0\n" );
++                output( "\tjr $t8\n" );
++                if (is_delay)
++                {
++                    output( "\n\t.section .text$1\n" );
++                    output( ".L__wine_delay_import:\n" );
++                    output( "\tpcalau12i $t8, %%pc_hi20(%s)\n", asm_name( imp_name ) );
++                    output( "\taddi.d $t8, $t8, %%pc_lo12(%s)\n", asm_name( imp_name ) );
++                    output( "\tb %s\n", asm_name( delay_load ) );
++                }
++                break;
+             }
+ 
+             output_import_section( 4, is_delay );
+diff --git a/tools/winebuild/spec32.c b/tools/winebuild/spec32.c
+index bdab284..2ac0658 100644
+--- a/tools/winebuild/spec32.c
++++ b/tools/winebuild/spec32.c
+@@ -389,6 +389,31 @@ static void output_relay_debug( struct exports *exports )
+             output_seh( ".seh_endproc" );
+             break;
+ 
++        case CPU_LOONGARCH64:
++            output( "\t.balign 4\n" );
++            output( "__wine_spec_relay_entry_point_%d:\n", i );
++            /* make room for $a0-$a7 right below the stack arguments */
++            output( "\taddi.d $sp, $sp, -80\n" );
++            output( "\tst.d $ra, $sp, 0\n" );
++            output( "\tst.d $a0, $sp, 16\n" );
++            output( "\tst.d $a1, $sp, 24\n" );
++            output( "\tst.d $a2, $sp, 32\n" );
++            output( "\tst.d $a3, $sp, 40\n" );
++            output( "\tst.d $a4, $sp, 48\n" );
++            output( "\tst.d $a5, $sp, 56\n" );
++            output( "\tst.d $a6, $sp, 64\n" );
++            output( "\tst.d $a7, $sp, 72\n" );
++            output( "\taddi.d $a2, $sp, 16\n" );
++            output( "\tli.d $a1, %u\n", (odp->u.func.args_str_offset << 16) | (i - exports->base) );
++            output( "\tpcalau12i $a0, %%pc_hi20(.L__wine_spec_relay_descr)\n" );
++            output( "\taddi.d $a0, $a0, %%pc_lo12(.L__wine_spec_relay_descr)\n" );
++            output( "\tld.d $a3, $a0, 8\n" );
++            output( "\tjirl $ra, $a3, 0\n" );
++            output( "\tld.d $ra, $sp, 0\n" );
++            output( "\taddi.d $sp, $sp, 80\n" );
++            output( "\tjr $ra\n" );
++            break;
++
+         default:
+             assert(0);
+         }
+@@ -614,6 +639,12 @@ void output_exports( DLLSPEC *spec )
+             output( "\t.byte 0x48,0x8d,0xa4,0x24,0x00,0x00,0x00,0x00\n" );  /* hotpatch prolog */
+             output( "\tjmp *__imp_%s(%%rip)\n", asm_name( get_link_name( odp )));
+             break;
++        case CPU_LOONGARCH64:
++            output( "\tpcalau12i $t8, %%pc_hi20(__imp_%s)\n", asm_name( get_link_name( odp )));
++            output( "\taddi.d $t8, $t8, %%pc_lo12(__imp_%s)\n", asm_name( get_link_name( odp )));
++            output( "\tld.d $t8, $t8, 0\n" );
++            output( "\tjr $t8\n" );
++            break;
+         default:
+             assert(0);
+         }
+diff --git a/tools/winebuild/utils.c b/tools/winebuild/utils.c
+index d5e05a6..dc208fa 100644
+--- a/tools/winebuild/utils.c
++++ b/tools/winebuild/utils.c
+@@ -896,6 +896,8 @@ void output_seh( const char *format, ... )
+     va_list valist;
+ 
+     if (!is_pe()) return;
++    /* LLVM's LoongArch COFF assembler does not support .seh_* directives yet */
++    if (target.cpu == CPU_LOONGARCH64) return;
+     va_start( valist, format );
+     fputc( '\t', output_file );
+     vfprintf( output_file, format, valist );
+diff --git a/tools/winegcc/winegcc.c b/tools/winegcc/winegcc.c
+index 943e25c..ed6b288 100644
+--- a/tools/winegcc/winegcc.c
++++ b/tools/winegcc/winegcc.c
+@@ -818,6 +818,7 @@ static struct strarray get_compat_defines( int gcc_defs )
+         {
+         case CPU_x86_64:
+         case CPU_ARM64:
++        case CPU_LOONGARCH64:
+             strarray_add(&args, "-D__stdcall=__attribute__((ms_abi))");
+             strarray_add(&args, "-D__cdecl=__stdcall");
+             strarray_add(&args, "-D__fastcall=__stdcall");
+-- 
+2.47.3
+

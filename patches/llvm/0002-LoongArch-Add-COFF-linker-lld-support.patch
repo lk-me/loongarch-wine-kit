@@ -1,0 +1,220 @@
+From e7322ee9ba8c22edff45033fb0cce247c03e767e Mon Sep 17 00:00:00 2001
+From: ChenghaoLiu <linkmecry@gmail.com>
+Date: Mon, 2 Nov 2026 17:05:43 +0800
+Subject: [PATCH 02/13] [LoongArch] Add COFF linker (lld) support
+
+Add IMAGE_FILE_MACHINE_LOONGARCH64 machine handling to the lld COFF
+backend so it can link LoongArch64 COFF objects into PE32+ executables.
+Recognize the LoongArch64 COFF magic and mark the machine as 64-bit, and
+implement the LoongArch64 relocation types (ADDR32/ADDR64, PAGEBASE_REL21,
+PAGEOFFSET_12A/12L, BRANCH26, REL32, SECTION, SECREL).
+---
+ lld/COFF/Chunks.cpp                           | 89 +++++++++++++++++++
+ lld/COFF/Chunks.h                             |  2 +
+ llvm/include/llvm/BinaryFormat/COFF.h         |  3 +-
+ llvm/include/llvm/Object/WindowsMachineFlag.h |  2 +
+ llvm/lib/BinaryFormat/Magic.cpp               |  5 +-
+ llvm/lib/Object/WindowsMachineFlag.cpp        |  3 +
+ 6 files changed, 101 insertions(+), 3 deletions(-)
+
+diff --git a/lld/COFF/Chunks.cpp b/lld/COFF/Chunks.cpp
+index 2f2b6094f..76c66a4c3 100644
+--- a/lld/COFF/Chunks.cpp
++++ b/lld/COFF/Chunks.cpp
+@@ -408,6 +408,77 @@ void SectionChunk::applyRelMIPS(uint8_t *off, uint16_t type, OutputSection *os,
+   }
+ }
+ 
++// Interpret the existing immediate in a pcalau12i as a page-granularity
++// addend, then update it with the page offset from the current instruction
++// to the target (PAGEBASE_REL21). The 20-bit immediate lives in bits [24:5].
++static void applyLoongArchAddr(uint8_t *off, uint64_t s, uint64_t p, int shift) {
++  uint32_t orig = read32le(off);
++  int64_t imm = SignExtend64<20>((orig >> 5) & 0xFFFFF);
++  s += imm << shift;
++  imm = (s >> shift) - (p >> shift);
++  uint32_t mask = 0xFFFFF << 5;
++  write32le(off, (orig & ~mask) | ((imm & 0xFFFFF) << 5));
++}
++
++// Update the 12-bit immediate field in addi.w / addi.d (bits [21:10]).
++static void applyLoongArchImm(uint8_t *off, uint64_t imm) {
++  uint32_t orig = read32le(off);
++  orig &= ~(0xFFF << 10);
++  write32le(off, orig | ((imm & 0xFFF) << 10));
++}
++
++// Update the 26-bit immediate in a bl instruction (BRANCH26). The immediate
++// is split: bits [15:0] live in instruction bits [25:10], and bits [25:16]
++// live in instruction bits [9:0].
++static void applyLoongArchBranch26(uint8_t *off, int64_t v) {
++  if (!isInt<28>(v))
++    error("relocation out of range");
++  uint32_t orig = read32le(off);
++  uint32_t imm = (v >> 2) & 0x3FFFFFF;
++  uint32_t encoded = ((imm & 0xFFFF) << 10) | ((imm >> 16) & 0x3FF);
++  write32le(off, (orig & ~0x3FFFFFF) | encoded);
++}
++
++void SectionChunk::applyRelLoongArch64(uint8_t *off, uint16_t type,
++                                       OutputSection *os, uint64_t s,
++                                       uint64_t p, uint64_t imageBase) const {
++  switch (type) {
++  case IMAGE_REL_LOONGARCH64_ABSOLUTE:
++    break;
++  case IMAGE_REL_LOONGARCH64_ADDR32:
++    add32(off, s + imageBase);
++    break;
++  case IMAGE_REL_LOONGARCH64_ADDR32NB:
++    add32(off, s);
++    break;
++  case IMAGE_REL_LOONGARCH64_ADDR64:
++    add64(off, s + imageBase);
++    break;
++  case IMAGE_REL_LOONGARCH64_REL32:
++    add32(off, s - p - 4);
++    break;
++  case IMAGE_REL_LOONGARCH64_PAGEBASE_REL21:
++    applyLoongArchAddr(off, s, p, 12);
++    break;
++  case IMAGE_REL_LOONGARCH64_PAGEOFFSET_12A:
++  case IMAGE_REL_LOONGARCH64_PAGEOFFSET_12L:
++    applyLoongArchImm(off, s & 0xfff);
++    break;
++  case IMAGE_REL_LOONGARCH64_BRANCH26:
++    applyLoongArchBranch26(off, s - p);
++    break;
++  case IMAGE_REL_LOONGARCH64_SECTION:
++    applySecIdx(off, os, file->symtab.ctx.outputSections.size());
++    break;
++  case IMAGE_REL_LOONGARCH64_SECREL:
++    applySecRel(this, off, os, s);
++    break;
++  default:
++    error("unsupported relocation type 0x" + Twine::utohexstr(type) + " in " +
++          toString(file));
++  }
++}
++
+ static void maybeReportRelocationToDiscarded(const SectionChunk *fromChunk,
+                                              Defined *sym,
+                                              const coff_relocation &rel,
+@@ -509,6 +580,9 @@ void SectionChunk::applyRelocation(uint8_t *off,
+   case Triple::mipsel:
+     applyRelMIPS(off, rel.Type, os, s, p, imageBase);
+     break;
++  case Triple::loongarch64:
++    applyRelLoongArch64(off, rel.Type, os, s, p, imageBase);
++    break;
+   default:
+     llvm_unreachable("unknown machine type");
+   }
+@@ -597,6 +671,12 @@ static uint8_t getBaserelType(const coff_relocation &rel,
+     return IMAGE_REL_BASED_ABSOLUTE;
+   case Triple::mipsel:
+     return IMAGE_REL_BASED_ABSOLUTE;
++  case Triple::loongarch64:
++    if (rel.Type == IMAGE_REL_LOONGARCH64_ADDR64)
++      return IMAGE_REL_BASED_DIR64;
++    if (rel.Type == IMAGE_REL_LOONGARCH64_ADDR32)
++      return IMAGE_REL_BASED_HIGHLOW;
++    return IMAGE_REL_BASED_ABSOLUTE;
+   default:
+     llvm_unreachable("unknown machine type");
+   }
+@@ -707,6 +787,15 @@ static int getRuntimePseudoRelocSize(uint16_t type, Triple::ArchType arch) {
+     default:
+       return 0;
+     }
++  case Triple::loongarch64:
++    switch (type) {
++    case IMAGE_REL_LOONGARCH64_ADDR64:
++      return 64;
++    case IMAGE_REL_LOONGARCH64_ADDR32:
++      return 32;
++    default:
++      return 0;
++    }
+   default:
+     llvm_unreachable("unknown machine type");
+   }
+diff --git a/lld/COFF/Chunks.h b/lld/COFF/Chunks.h
+index 93fdf03c9..32010e256 100644
+--- a/lld/COFF/Chunks.h
++++ b/lld/COFF/Chunks.h
+@@ -285,6 +285,8 @@ public:
+                      uint64_t p, uint64_t imageBase) const;
+   void applyRelMIPS(uint8_t *off, uint16_t type, OutputSection *os, uint64_t s,
+                     uint64_t p, uint64_t imageBase) const;
++  void applyRelLoongArch64(uint8_t *off, uint16_t type, OutputSection *os,
++                           uint64_t s, uint64_t p, uint64_t imageBase) const;
+ 
+   void getRuntimePseudoRelocs(std::vector<RuntimePseudoReloc> &res);
+ 
+diff --git a/llvm/include/llvm/BinaryFormat/COFF.h b/llvm/include/llvm/BinaryFormat/COFF.h
+index 1b927caec..ad30ad684 100644
+--- a/llvm/include/llvm/BinaryFormat/COFF.h
++++ b/llvm/include/llvm/BinaryFormat/COFF.h
+@@ -133,7 +133,8 @@ template <typename T> bool isAnyArm64(T Machine) {
+ }
+ 
+ template <typename T> bool is64Bit(T Machine) {
+-  return Machine == IMAGE_FILE_MACHINE_AMD64 || isAnyArm64(Machine);
++  return Machine == IMAGE_FILE_MACHINE_AMD64 || isAnyArm64(Machine) ||
++         Machine == IMAGE_FILE_MACHINE_LOONGARCH64;
+ }
+ 
+ enum Characteristics : unsigned {
+diff --git a/llvm/include/llvm/Object/WindowsMachineFlag.h b/llvm/include/llvm/Object/WindowsMachineFlag.h
+index 7655819ef..222afb25e 100644
+--- a/llvm/include/llvm/Object/WindowsMachineFlag.h
++++ b/llvm/include/llvm/Object/WindowsMachineFlag.h
+@@ -46,6 +46,8 @@ template <typename T> Triple::ArchType getMachineArchType(T machine) {
+     return llvm::Triple::ArchType::aarch64;
+   case COFF::IMAGE_FILE_MACHINE_R4000:
+     return llvm::Triple::ArchType::mipsel;
++  case COFF::IMAGE_FILE_MACHINE_LOONGARCH64:
++    return llvm::Triple::ArchType::loongarch64;
+   default:
+     return llvm::Triple::ArchType::UnknownArch;
+   }
+diff --git a/llvm/lib/BinaryFormat/Magic.cpp b/llvm/lib/BinaryFormat/Magic.cpp
+index 0786c4b98..9f9208d37 100644
+--- a/llvm/lib/BinaryFormat/Magic.cpp
++++ b/llvm/lib/BinaryFormat/Magic.cpp
+@@ -242,8 +242,9 @@ file_magic llvm::identify_magic(StringRef Magic) {
+       return file_magic::minidump;
+     break;
+ 
+-  case 0x64: // x86-64 or ARM64 Windows.
+-    if (Magic[1] == char(0x86) || Magic[1] == char(0xaa))
++  case 0x64: // x86-64, ARM64, or LoongArch64 Windows.
++    if (Magic[1] == char(0x86) || Magic[1] == char(0x62) ||
++        Magic[1] == char(0xaa))
+       return file_magic::coff_object;
+     break;
+ 
+diff --git a/llvm/lib/Object/WindowsMachineFlag.cpp b/llvm/lib/Object/WindowsMachineFlag.cpp
+index 14c14f693..b892ab9a3 100644
+--- a/llvm/lib/Object/WindowsMachineFlag.cpp
++++ b/llvm/lib/Object/WindowsMachineFlag.cpp
+@@ -30,6 +30,7 @@ COFF::MachineTypes llvm::getMachineType(StringRef S) {
+       .Case("arm64ec", COFF::IMAGE_FILE_MACHINE_ARM64EC)
+       .Case("arm64x", COFF::IMAGE_FILE_MACHINE_ARM64X)
+       .Case("mips", COFF::IMAGE_FILE_MACHINE_R4000)
++      .Case("loongarch64", COFF::IMAGE_FILE_MACHINE_LOONGARCH64)
+       .Default(COFF::IMAGE_FILE_MACHINE_UNKNOWN);
+ }
+ 
+@@ -47,6 +48,8 @@ StringRef llvm::machineToStr(COFF::MachineTypes MT) {
+     return "x64";
+   case COFF::IMAGE_FILE_MACHINE_I386:
+     return "x86";
++  case COFF::IMAGE_FILE_MACHINE_LOONGARCH64:
++    return "loongarch64";
+   default:
+     llvm_unreachable("unknown machine type");
+   }
+-- 
+2.47.3
+

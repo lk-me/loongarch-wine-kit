@@ -1,0 +1,573 @@
+From 7ef1bd1edb2f09e74e6c49d49d4cf8a86b1d5e45 Mon Sep 17 00:00:00 2001
+From: ChenghaoLiu <linkmecry@gmail.com>
+Date: Fri, 6 Nov 2026 17:24:08 +0800
+Subject: [PATCH 05/20] [LoongArch] Add winecrt0 thread and exception support
+
+---
+ dlls/kernelbase/debug.c          |   2 +
+ dlls/kernelbase/thread.c         |  31 ++++++++
+ dlls/msvcrt/Makefile.in          |   1 +
+ dlls/msvcrt/except_loongarch64.c | 128 +++++++++++++++++++++++++++++++
+ dlls/msvcrt/math.c               |   6 ++
+ dlls/ntdll/actctx.c              |   2 +
+ dlls/ntdll/loader.c              |  29 ++++++-
+ dlls/ntdll/ntdll_misc.h          |  11 +++
+ dlls/ntdll/unix/system.c         |  26 +++++++
+ dlls/ucrtbase/Makefile.in        |   1 +
+ dlls/win32u/syscall.c            |   2 +-
+ include/winnt.h                  |  33 +++++++-
+ libs/winecrt0/setjmp.c           |  61 +++++++++++++++
+ 13 files changed, 330 insertions(+), 3 deletions(-)
+ create mode 100644 dlls/msvcrt/except_loongarch64.c
+
+diff --git a/dlls/kernelbase/debug.c b/dlls/kernelbase/debug.c
+index 8dbb677..0a653be 100644
+--- a/dlls/kernelbase/debug.c
++++ b/dlls/kernelbase/debug.c
+@@ -127,6 +127,8 @@ void __attribute__((naked)) WINAPI DebugBreak(void) { asm( "brk #0xf000; ret" );
+ __ASM_GLOBAL_FUNC( DebugBreak, "jmp " __ASM_NAME("DbgBreakPoint") )
+ #elif defined(__arm__)
+ __ASM_GLOBAL_FUNC( DebugBreak, "udf #0xfe; bx lr" )
++#elif defined(__loongarch__)
++__ASM_GLOBAL_FUNC( DebugBreak, "break 0x7000; jr $ra" )
+ #endif
+ 
+ 
+diff --git a/dlls/kernelbase/thread.c b/dlls/kernelbase/thread.c
+index 9a8ce88..59162f5 100644
+--- a/dlls/kernelbase/thread.c
++++ b/dlls/kernelbase/thread.c
+@@ -1021,6 +1021,34 @@ __ASM_GLOBAL_FUNC( switch_fiber,
+                    "ldr x30, [x1, #0x108]\n\t"      /* new->Pc */
+                    "mov sp, x2\n\t"
+                    "ret" )
++#elif defined(__loongarch__)
++extern void WINAPI switch_fiber( CONTEXT *old, CONTEXT *new );
++__ASM_GLOBAL_FUNC( switch_fiber,
++                   "st.d $s0, $a0, 0xc0\n\t"   /* old->Gpr[23] */
++                   "st.d $s1, $a0, 0xc8\n\t"   /* old->Gpr[24] */
++                   "st.d $s2, $a0, 0xd0\n\t"   /* old->Gpr[25] */
++                   "st.d $s3, $a0, 0xd8\n\t"   /* old->Gpr[26] */
++                   "st.d $s4, $a0, 0xe0\n\t"   /* old->Gpr[27] */
++                   "st.d $s5, $a0, 0xe8\n\t"   /* old->Gpr[28] */
++                   "st.d $s6, $a0, 0xf0\n\t"   /* old->Gpr[29] */
++                   "st.d $s7, $a0, 0xf8\n\t"   /* old->Gpr[30] */
++                   "st.d $s8, $a0, 0x100\n\t"  /* old->Gpr[31] */
++                   "st.d $fp, $a0, 0xb8\n\t"   /* old->Gpr[22] */
++                   "st.d $sp, $a0, 0x20\n\t"   /* old->Gpr[3] */
++                   "st.d $ra, $a0, 0x108\n\t"  /* old->Pc */
++                   "ld.d $s0, $a1, 0xc0\n\t"   /* new->Gpr[23] */
++                   "ld.d $s1, $a1, 0xc8\n\t"   /* new->Gpr[24] */
++                   "ld.d $s2, $a1, 0xd0\n\t"   /* new->Gpr[25] */
++                   "ld.d $s3, $a1, 0xd8\n\t"   /* new->Gpr[26] */
++                   "ld.d $s4, $a1, 0xe0\n\t"   /* new->Gpr[27] */
++                   "ld.d $s5, $a1, 0xe8\n\t"   /* new->Gpr[28] */
++                   "ld.d $s6, $a1, 0xf0\n\t"   /* new->Gpr[29] */
++                   "ld.d $s7, $a1, 0xf8\n\t"   /* new->Gpr[30] */
++                   "ld.d $s8, $a1, 0x100\n\t"  /* new->Gpr[31] */
++                   "ld.d $fp, $a1, 0xb8\n\t"   /* new->Gpr[22] */
++                   "ld.d $sp, $a1, 0x20\n\t"   /* new->Gpr[3] */
++                   "ld.d $t0, $a1, 0x108\n\t"  /* new->Pc */
++                   "jirl $zero, $t0, 0" )
+ #else
+ static void WINAPI switch_fiber( CONTEXT *old, CONTEXT *new )
+ {
+@@ -1064,6 +1092,9 @@ static void init_fiber_context( struct fiber_data *fiber )
+ #elif defined(__aarch64__)
+     fiber->context.Sp = (ULONG_PTR)fiber->stack_base;
+     fiber->context.Pc = (ULONG_PTR)start_fiber;
++#elif defined(__loongarch__)
++    fiber->context.Gpr[3] = (ULONG_PTR)fiber->stack_base;
++    fiber->context.Pc = (ULONG_PTR)start_fiber;
+ #endif
+ }
+ 
+diff --git a/dlls/msvcrt/Makefile.in b/dlls/msvcrt/Makefile.in
+index 2cae604..9994c51 100644
+--- a/dlls/msvcrt/Makefile.in
++++ b/dlls/msvcrt/Makefile.in
+@@ -26,6 +26,7 @@ SOURCES = \
+ 	except_arm64.c \
+ 	except_arm64ec.c \
+ 	except_i386.c \
++	except_loongarch64.c \
+ 	except_x86_64.c \
+ 	exception_ptr.c \
+ 	exit.c \
+diff --git a/dlls/msvcrt/except_loongarch64.c b/dlls/msvcrt/except_loongarch64.c
+new file mode 100644
+index 0000000..93aa23e
+--- /dev/null
++++ b/dlls/msvcrt/except_loongarch64.c
+@@ -0,0 +1,128 @@
++/*
++ * Exception handling for LoongArch64.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#if defined(__loongarch__)
++
++#include <stdarg.h>
++
++#include "windef.h"
++#include "winbase.h"
++#include "winternl.h"
++#include "msvcrt.h"
++#include "excpt.h"
++#include "wine/debug.h"
++
++#include "cppexcept.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(seh);
++
++/* Non-volatile registers as saved by the unwinder:
++ * R22 (fp) at 0x00, R23-R31 (s0-s8) at 0x08..0x48, F24-F31 at 0x50
++ * (see DISPATCHER_CONTEXT_NONVOLREG_LOONGARCH64). */
++extern void *call_exc_handler( void *handler, ULONG_PTR frame, UINT flags, BYTE *nonvol_regs );
++__ASM_GLOBAL_FUNC( call_exc_handler,
++                   "addi.d $sp, $sp, -0x60\n\t"
++                   "st.d $fp, $sp, 0\n\t"
++                   "st.d $ra, $sp, 8\n\t"
++                   "st.d $s0, $sp, 0x10\n\t"
++                   "st.d $s1, $sp, 0x18\n\t"
++                   "st.d $s2, $sp, 0x20\n\t"
++                   "st.d $s3, $sp, 0x28\n\t"
++                   "st.d $s4, $sp, 0x30\n\t"
++                   "st.d $s5, $sp, 0x38\n\t"
++                   "st.d $s6, $sp, 0x40\n\t"
++                   "st.d $s7, $sp, 0x48\n\t"
++                   "st.d $s8, $sp, 0x50\n\t"
++                   "ld.d $fp, $a3, 0\n\t"        /* nonvolatile regs: R22-R31 */
++                   "ld.d $s0, $a3, 8\n\t"
++                   "ld.d $s1, $a3, 0x10\n\t"
++                   "ld.d $s2, $a3, 0x18\n\t"
++                   "ld.d $s3, $a3, 0x20\n\t"
++                   "ld.d $s4, $a3, 0x28\n\t"
++                   "ld.d $s5, $a3, 0x30\n\t"
++                   "ld.d $s6, $a3, 0x38\n\t"
++                   "ld.d $s7, $a3, 0x40\n\t"
++                   "ld.d $s8, $a3, 0x48\n\t"
++                   "jirl $ra, $a0, 0\n\t"
++                   "ld.d $s0, $sp, 0x10\n\t"
++                   "ld.d $s1, $sp, 0x18\n\t"
++                   "ld.d $s2, $sp, 0x20\n\t"
++                   "ld.d $s3, $sp, 0x28\n\t"
++                   "ld.d $s4, $sp, 0x30\n\t"
++                   "ld.d $s5, $sp, 0x38\n\t"
++                   "ld.d $s6, $sp, 0x40\n\t"
++                   "ld.d $s7, $sp, 0x48\n\t"
++                   "ld.d $s8, $sp, 0x50\n\t"
++                   "ld.d $fp, $sp, 0\n\t"
++                   "ld.d $ra, $sp, 8\n\t"
++                   "addi.d $sp, $sp, 0x60\n\t"
++                   "jr $ra" )
++
++
++/*******************************************************************
++ *		call_catch_handler
++ */
++void *call_catch_handler( EXCEPTION_RECORD *rec )
++{
++    ULONG_PTR frame = rec->ExceptionInformation[1];
++    void *handler = (void *)rec->ExceptionInformation[5];
++    BYTE *nonvol_regs = (BYTE *)rec->ExceptionInformation[10];
++
++    TRACE( "calling %p frame %Ix\n", handler, frame );
++    return call_exc_handler( handler, frame, 0x100, nonvol_regs );
++}
++
++
++/*******************************************************************
++ *		call_unwind_handler
++ */
++void *call_unwind_handler( void *handler, ULONG_PTR frame, DISPATCHER_CONTEXT *dispatch )
++{
++    TRACE( "calling %p frame %Ix\n", handler, frame );
++    return call_exc_handler( handler, frame, 0x100, dispatch->NonVolatileRegisters );
++}
++
++
++/*******************************************************************
++ *		get_exception_pc
++ */
++ULONG_PTR get_exception_pc( DISPATCHER_CONTEXT *dispatch )
++{
++    ULONG_PTR pc = dispatch->ControlPc;
++    if (dispatch->ControlPcIsUnwound) pc -= 4;
++    return pc;
++}
++
++
++/*******************************************************************
++ *		_setjmp (MSVCRT.@)
++ */
++__ASM_GLOBAL_FUNC( _setjmp, "b _setjmpex" );
++
++
++/*********************************************************************
++ *              handle_fpieee_flt
++ */
++int handle_fpieee_flt( __msvcrt_ulong exception_code, EXCEPTION_POINTERS *ep,
++                       int (__cdecl *handler)(_FPIEEE_RECORD*) )
++{
++    FIXME("(%lx %p %p)\n", exception_code, ep, handler);
++    return EXCEPTION_CONTINUE_SEARCH;
++}
++
++#endif  /* __loongarch__ */
+diff --git a/dlls/msvcrt/math.c b/dlls/msvcrt/math.c
+index 98d3a35..2da2617 100644
+--- a/dlls/msvcrt/math.c
++++ b/dlls/msvcrt/math.c
+@@ -288,6 +288,9 @@ __ASM_GLOBAL_FUNC( asm_sqrtf, "fsqrt s0,s0; ret" )
+ #elif defined __arm__
+ float CDECL asm_sqrtf(float);
+ __ASM_GLOBAL_FUNC( asm_sqrtf, "vsqrt s0,s0; bx lr" )
++#elif defined __loongarch__
++float CDECL asm_sqrtf(float);
++__ASM_GLOBAL_FUNC( asm_sqrtf, "fsqrt.s $fa0, $fa0; jr $ra" )
+ #elif defined __x86_64__
+ float CDECL asm_sqrtf(float);
+ __ASM_GLOBAL_FUNC( asm_sqrtf, "sqrtss %xmm0, %xmm0; ret" )
+@@ -436,6 +439,9 @@ __ASM_GLOBAL_FUNC( asm_sqrt, "fsqrt d0,d0; ret" )
+ #elif defined __arm__
+ double CDECL asm_sqrt(double);
+ __ASM_GLOBAL_FUNC( asm_sqrt, "vsqrt d0,d0; bx lr" )
++#elif defined __loongarch__
++double CDECL asm_sqrt(double);
++__ASM_GLOBAL_FUNC( asm_sqrt, "fsqrt.d $fa0, $fa0; jr $ra" )
+ #elif defined __x86_64__
+ double CDECL asm_sqrt(double);
+ __ASM_GLOBAL_FUNC( asm_sqrt, "sqrtsd %xmm0, %xmm0; ret" )
+diff --git a/dlls/ntdll/actctx.c b/dlls/ntdll/actctx.c
+index 03a4dfc..3e4f96c 100644
+--- a/dlls/ntdll/actctx.c
++++ b/dlls/ntdll/actctx.c
+@@ -601,6 +601,8 @@ static const WCHAR current_archW[] = L"arm64";
+ static const WCHAR current_archW[] = L"amd64";
+ #elif defined __arm__
+ static const WCHAR current_archW[] = L"arm";
++#elif defined __loongarch__
++static const WCHAR current_archW[] = L"loongarch64";
+ #else
+ static const WCHAR current_archW[] = L"none";
+ #endif
+diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
+index b507325..20df545 100644
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -374,7 +374,7 @@ static inline BOOL call_dll_entry_point( DLLENTRYPROC proc, void *module,
+ #endif
+ 
+ 
+-#if defined(__i386__) || defined(__x86_64__) || defined(__arm__) || defined(__aarch64__)
++#if defined(__i386__) || defined(__x86_64__) || defined(__arm__) || defined(__aarch64__) || defined(__loongarch__)
+ /*************************************************************************
+  *		stub_entry_point
+  *
+@@ -429,6 +429,22 @@ struct stub
+     const char *name;
+     const void *entry;
+ };
++#elif defined(__loongarch__)
++/* $a2 = original $ra (ret_addr), $t0 = address of the inline pointers below;
++ * the data area must stay right after the code (see allocate_stub). */
++struct stub
++{
++    DWORD mov_a2_ra;     /* move $a2, $ra */
++    DWORD bl_next;       /* bl .+4 (ra = address of next insn) */
++    DWORD addi_t0_ra;    /* addi.d $t0, $ra, 20 */
++    DWORD ld_a0_t0;      /* ld.d $a0, $t0, 0 */
++    DWORD ld_a1_t0;      /* ld.d $a1, $t0, 8 */
++    DWORD ld_t0_t0;      /* ld.d $t0, $t0, 16 */
++    DWORD jirl_zero_t0;  /* jirl $zero, $t0, 0 */
++    const char *dll;
++    const char *name;
++    const void *entry;
++};
+ #else
+ struct stub
+ {
+@@ -490,6 +506,17 @@ static ULONG_PTR allocate_stub( const char *dll, const char *name )
+     stub->dll       = dll;
+     stub->name      = name;
+     stub->entry     = stub_entry_point;
++#elif defined(__loongarch__)
++    stub->mov_a2_ra  = 0x00150026; /* move $a2, $ra */
++    stub->bl_next    = 0x54000400; /* bl .+4 */
++    stub->addi_t0_ra = 0x02c0502c; /* addi.d $t0, $ra, 20 */
++    stub->ld_a0_t0   = 0x28c00184; /* ld.d $a0, $t0, 0 */
++    stub->ld_a1_t0   = 0x28c02185; /* ld.d $a1, $t0, 8 */
++    stub->ld_t0_t0   = 0x28c0418c; /* ld.d $t0, $t0, 16 */
++    stub->jirl_zero_t0 = 0x4c000180; /* jirl $zero, $t0, 0 */
++    stub->dll        = dll;
++    stub->name       = name;
++    stub->entry      = stub_entry_point;
+ #else
+     stub->movq_rdi[0]     = 0x48;  /* movq $dll,%rcx */
+     stub->movq_rdi[1]     = 0xb9;
+diff --git a/dlls/ntdll/ntdll_misc.h b/dlls/ntdll/ntdll_misc.h
+index cf110f8..a2f6c83 100644
+--- a/dlls/ntdll/ntdll_misc.h
++++ b/dlls/ntdll/ntdll_misc.h
+@@ -45,6 +45,8 @@ static const USHORT current_machine = IMAGE_FILE_MACHINE_AMD64;
+ static const USHORT current_machine = IMAGE_FILE_MACHINE_ARMNT;
+ #elif defined(__aarch64__)
+ static const USHORT current_machine = IMAGE_FILE_MACHINE_ARM64;
++#elif defined(__loongarch__)
++static const USHORT current_machine = IMAGE_FILE_MACHINE_LOONGARCH64;
+ #else
+ static const USHORT current_machine = IMAGE_FILE_MACHINE_UNKNOWN;
+ #endif
+@@ -157,6 +159,15 @@ extern void heap_thread_detach(void);
+     TRACE( "x24=%016I64x x25=%016I64x x26=%016I64x x27=%016I64x\n", (c)->X24, (c)->X25, (c)->X26, (c)->X27 ); \
+     TRACE( "x28=%016I64x cpsr=%08lx fpcr=%08lx fpsr=%08lx\n", (c)->X28, (c)->Cpsr, (c)->Fpcr, (c)->Fpsr ); \
+     } while(0)
++#elif defined(__loongarch__)
++# define TRACE_CONTEXT(c) do { \
++    TRACE( " pc=%016I64x  sp=%016I64x  ra=%016I64x  fp=%016I64x\n", (c)->Pc, (c)->Gpr[3], (c)->Gpr[1], (c)->Gpr[22] ); \
++    TRACE( " a0=%016I64x  a1=%016I64x  a2=%016I64x  a3=%016I64x\n", (c)->Gpr[4], (c)->Gpr[5], (c)->Gpr[6], (c)->Gpr[7] ); \
++    TRACE( " a4=%016I64x  a5=%016I64x  a6=%016I64x  a7=%016I64x\n", (c)->Gpr[8], (c)->Gpr[9], (c)->Gpr[10], (c)->Gpr[11] ); \
++    TRACE( " t0=%016I64x  t1=%016I64x  t2=%016I64x  t3=%016I64x\n", (c)->Gpr[12], (c)->Gpr[13], (c)->Gpr[14], (c)->Gpr[15] ); \
++    TRACE( " t4=%016I64x  t5=%016I64x  t6=%016I64x  t7=%016I64x\n", (c)->Gpr[16], (c)->Gpr[17], (c)->Gpr[18], (c)->Gpr[19] ); \
++    TRACE( " t8=%016I64x r21=%016I64x\n", (c)->Gpr[20], (c)->Gpr[21] ); \
++    } while(0)
+ #endif
+ 
+ #ifdef __arm64ec__
+diff --git a/dlls/ntdll/unix/system.c b/dlls/ntdll/unix/system.c
+index e017905..622e61c 100644
+--- a/dlls/ntdll/unix/system.c
++++ b/dlls/ntdll/unix/system.c
+@@ -820,6 +820,30 @@ void init_shared_data_cpuinfo( KUSER_SHARED_DATA *data )
+ #endif
+ }
+ 
++#elif defined(__loongarch__)
++
++static void init_cpu_model(void)
++{
++    cpu_level = 0;
++    cpu_revision = 0;
++    cpu_id = 0;
++    strcpy( cpu_vendor, "Loongson" );
++}
++
++static ULONGLONG get_cpu_features(void)
++{
++    return 0;  /* FIXME */
++}
++
++void init_shared_data_cpuinfo( KUSER_SHARED_DATA *data )
++{
++    BOOLEAN *features = data->ProcessorFeatures;
++
++    features[PF_FASTFAIL_AVAILABLE]      = TRUE;
++    features[PF_COMPARE_EXCHANGE_DOUBLE] = TRUE;
++    features[PF_NX_ENABLED]              = TRUE;
++}
++
+ #endif /* End architecture specific feature detection for CPUs */
+ 
+ static BOOL grow_logical_proc_buf(void)
+@@ -1777,6 +1801,8 @@ static SYSTEM_CPU_INFORMATION get_cpuinfo(void)
+         .ProcessorArchitecture = PROCESSOR_ARCHITECTURE_ARM,
+ #elif defined __aarch64__
+         .ProcessorArchitecture = PROCESSOR_ARCHITECTURE_ARM64,
++#elif defined __loongarch__
++        .ProcessorArchitecture = PROCESSOR_ARCHITECTURE_UNKNOWN,  /* FIXME */
+ #elif defined(__i386__)
+         .ProcessorArchitecture = PROCESSOR_ARCHITECTURE_INTEL,
+ #elif defined(__x86_64__)
+diff --git a/dlls/ucrtbase/Makefile.in b/dlls/ucrtbase/Makefile.in
+index 768844f..d76236b 100644
+--- a/dlls/ucrtbase/Makefile.in
++++ b/dlls/ucrtbase/Makefile.in
+@@ -27,6 +27,7 @@ SOURCES = \
+ 	except_arm64.c \
+ 	except_arm64ec.c \
+ 	except_i386.c \
++	except_loongarch64.c \
+ 	except_x86_64.c \
+ 	exception_ptr.c \
+ 	exit.c \
+diff --git a/dlls/win32u/syscall.c b/dlls/win32u/syscall.c
+index ca1be72..1689391 100644
+--- a/dlls/win32u/syscall.c
++++ b/dlls/win32u/syscall.c
+@@ -131,7 +131,7 @@ static void stub_syscall( const char *name )
+     rec.ExceptionAddress = (void *)context.Eip;
+ #elif defined __x86_64__
+     rec.ExceptionAddress = (void *)context.Rip;
+-#elif defined __arm__ || defined __aarch64__
++#elif defined __arm__ || defined __aarch64__ || defined __loongarch__
+     rec.ExceptionAddress = (void *)context.Pc;
+ #endif
+     NtRaiseException( &rec, &context, TRUE );
+diff --git a/include/winnt.h b/include/winnt.h
+index c4a6dbe..c41713d 100644
+--- a/include/winnt.h
++++ b/include/winnt.h
+@@ -2292,6 +2292,22 @@ typedef struct _DISPATCHER_CONTEXT_LOONGARCH64
+ 
+ typedef DISPATCHER_CONTEXT_LOONGARCH64 DISPATCHER_CONTEXT, *PDISPATCHER_CONTEXT;
+ 
++#define NONVOL_INT_NUMREG_LOONGARCH64 10   /* R22-R31 */
++#define NONVOL_FP_NUMREG_LOONGARCH64  8    /* F24-F31 */
++
++#define NONVOL_INT_SIZE_LOONGARCH64 (NONVOL_INT_NUMREG_LOONGARCH64 * sizeof(DWORD64))
++#define NONVOL_FP_SIZE_LOONGARCH64  (NONVOL_FP_NUMREG_LOONGARCH64 * sizeof(double))
++
++typedef union _DISPATCHER_CONTEXT_NONVOLREG_LOONGARCH64
++{
++    BYTE  Buffer[NONVOL_INT_SIZE_LOONGARCH64 + NONVOL_FP_SIZE_LOONGARCH64];
++    struct
++    {
++        DWORD64 GpNvRegs[NONVOL_INT_NUMREG_LOONGARCH64];
++        double  FpNvRegs[NONVOL_FP_NUMREG_LOONGARCH64];
++    } DUMMYSTRUCTNAME;
++} DISPATCHER_CONTEXT_NONVOLREG_LOONGARCH64;
++
+ typedef LONG (CALLBACK *PEXCEPTION_FILTER)(struct _EXCEPTION_POINTERS*,DWORD64);
+ typedef void (CALLBACK *PTERMINATION_HANDLER)(BOOLEAN,DWORD64);
+ 
+@@ -7626,6 +7642,13 @@ static FORCEINLINE void MemoryBarrier(void)
+     __dmb(_ARM64_BARRIER_SY);
+ }
+ 
++#elif defined(__loongarch__)
++
++static FORCEINLINE void MemoryBarrier(void)
++{
++    __asm__ __volatile__( "dbar 0" : : : "memory" );
++}
++
+ #elif defined(__x86_64__)
+ 
+ void __faststorefence(void);
+@@ -7674,6 +7697,8 @@ static void __wine_memory_barrier_acq_rel(void)
+ {
+ #if defined(__aarch64__) || defined(__arm64ec__)
+     __dmb(_ARM64_BARRIER_ISH);
++#elif defined(__loongarch__)
++    __asm__ __volatile__( "dbar 0" : : : "memory" );
+ #elif defined(__i386__) || defined(__x86_64__)
+ #pragma warning(suppress:4996)
+     _ReadWriteBarrier();
+@@ -8177,6 +8202,9 @@ static FORCEINLINE DECLSPEC_NORETURN void __fastfail(unsigned int code)
+ #elif defined(__arm__)
+     register ULONG_PTR val __asm__("r0") = code;
+     for (;;) __asm__ __volatile__( "udf #0xfb" :: "r" (val) : "memory" );
++#elif defined(__loongarch__)
++    (void)code;
++    for (;;) __asm__ __volatile__( "break 0x7000" : : : "memory" );
+ #endif
+ }
+ 
+@@ -8281,6 +8309,8 @@ static FORCEINLINE void YieldProcessor(void)
+ #if defined(__GNUC__) || defined(__clang__)
+ #if defined(__arm__) || defined(__aarch64__) || defined(__arm64ec__)
+     __asm__ __volatile__( "dmb ishst\n\tyield" : : : "memory" );
++#elif defined(__loongarch__)
++    __asm__ __volatile__( "dbar 0" : : : "memory" );
+ #elif defined(__i386__) || defined(__x86_64__)
+     __asm__ __volatile__( "rep; nop" : : : "memory" );
+ #else
+@@ -8305,7 +8335,8 @@ DWORD64 _umul128(DWORD64,DWORD64,DWORD64*);
+ # endif
+ #endif
+ 
+-#if (defined(__x86_64__) && !defined(_MSC_VER)) || defined(__aarch64__) || defined(__arm64ec__)
++#if (defined(__x86_64__) && !defined(_MSC_VER)) || defined(__aarch64__) || defined(__arm64ec__) || \
++    defined(__loongarch__)
+ static FORCEINLINE DWORD64 ShiftRight128( DWORD64 lo, DWORD64 hi, BYTE shift )
+ {
+     return ((unsigned __int128)hi << 64 | lo) >> shift;
+diff --git a/libs/winecrt0/setjmp.c b/libs/winecrt0/setjmp.c
+index d534f08..a852e55 100644
+--- a/libs/winecrt0/setjmp.c
++++ b/libs/winecrt0/setjmp.c
+@@ -240,6 +240,67 @@ __ASM_GLOBAL_FUNC( __wine_longjmp,
+                    "mov x0, x1\n\t"                /* retval */
+                    "ret" )
+ 
++#elif defined(__loongarch__)
++
++/* jmp_buf layout must match _JUMP_BUFFER in include/msvcrt/setjmp.h:
++ * Frame@0, Reserved@8, S0-S8@0x10..0x50, Fp@0x58, Ra@0x60, Sp@0x68,
++ * Fcsr@0x70, Reserved2@0x74, D[8]@0x78..0xb0. */
++
++__ASM_GLOBAL_FUNC( __wine_setjmpex,
++                   "st.d $a1,   $a0, 0\n\t"        /* jmp_buf->Frame */
++                   "st.d $zero, $a0, 8\n\t"        /* jmp_buf->Reserved */
++                   "st.d $s0,   $a0, 0x10\n\t"     /* jmp_buf->S0 */
++                   "st.d $s1,   $a0, 0x18\n\t"     /* jmp_buf->S1 */
++                   "st.d $s2,   $a0, 0x20\n\t"     /* jmp_buf->S2 */
++                   "st.d $s3,   $a0, 0x28\n\t"     /* jmp_buf->S3 */
++                   "st.d $s4,   $a0, 0x30\n\t"     /* jmp_buf->S4 */
++                   "st.d $s5,   $a0, 0x38\n\t"     /* jmp_buf->S5 */
++                   "st.d $s6,   $a0, 0x40\n\t"     /* jmp_buf->S6 */
++                   "st.d $s7,   $a0, 0x48\n\t"     /* jmp_buf->S7 */
++                   "st.d $s8,   $a0, 0x50\n\t"     /* jmp_buf->S8 */
++                   "st.d $fp,   $a0, 0x58\n\t"     /* jmp_buf->Fp */
++                   "st.d $ra,   $a0, 0x60\n\t"     /* jmp_buf->Ra */
++                   "st.d $sp,   $a0, 0x68\n\t"     /* jmp_buf->Sp */
++                   "movfcsr2gr $t0, $fcsr0\n\t"
++                   "st.w $t0,   $a0, 0x70\n\t"     /* jmp_buf->Fcsr */
++                   "st.w $zero, $a0, 0x74\n\t"     /* jmp_buf->Reserved2 */
++                   "fst.d $f24, $a0, 0x78\n\t"     /* jmp_buf->D[0] */
++                   "fst.d $f25, $a0, 0x80\n\t"     /* jmp_buf->D[1] */
++                   "fst.d $f26, $a0, 0x88\n\t"     /* jmp_buf->D[2] */
++                   "fst.d $f27, $a0, 0x90\n\t"     /* jmp_buf->D[3] */
++                   "fst.d $f28, $a0, 0x98\n\t"     /* jmp_buf->D[4] */
++                   "fst.d $f29, $a0, 0xa0\n\t"     /* jmp_buf->D[5] */
++                   "fst.d $f30, $a0, 0xa8\n\t"     /* jmp_buf->D[6] */
++                   "fst.d $f31, $a0, 0xb0\n\t"     /* jmp_buf->D[7] */
++                   "move $a0, $zero\n\t"
++                   "jr $ra" )
++
++__ASM_GLOBAL_FUNC( __wine_longjmp,
++                   "ld.d $s0, $a0, 0x10\n\t"       /* jmp_buf->S0 */
++                   "ld.d $s1, $a0, 0x18\n\t"       /* jmp_buf->S1 */
++                   "ld.d $s2, $a0, 0x20\n\t"       /* jmp_buf->S2 */
++                   "ld.d $s3, $a0, 0x28\n\t"       /* jmp_buf->S3 */
++                   "ld.d $s4, $a0, 0x30\n\t"       /* jmp_buf->S4 */
++                   "ld.d $s5, $a0, 0x38\n\t"       /* jmp_buf->S5 */
++                   "ld.d $s6, $a0, 0x40\n\t"       /* jmp_buf->S6 */
++                   "ld.d $s7, $a0, 0x48\n\t"       /* jmp_buf->S7 */
++                   "ld.d $s8, $a0, 0x50\n\t"       /* jmp_buf->S8 */
++                   "ld.d $fp, $a0, 0x58\n\t"       /* jmp_buf->Fp */
++                   "ld.d $t0, $a0, 0x60\n\t"       /* jmp_buf->Ra */
++                   "ld.d $sp, $a0, 0x68\n\t"       /* jmp_buf->Sp */
++                   "ld.w $t1, $a0, 0x70\n\t"       /* jmp_buf->Fcsr */
++                   "movgr2fcsr $fcsr0, $t1\n\t"
++                   "fld.d $f24, $a0, 0x78\n\t"     /* jmp_buf->D[0] */
++                   "fld.d $f25, $a0, 0x80\n\t"     /* jmp_buf->D[1] */
++                   "fld.d $f26, $a0, 0x88\n\t"     /* jmp_buf->D[2] */
++                   "fld.d $f27, $a0, 0x90\n\t"     /* jmp_buf->D[3] */
++                   "fld.d $f28, $a0, 0x98\n\t"     /* jmp_buf->D[4] */
++                   "fld.d $f29, $a0, 0xa0\n\t"     /* jmp_buf->D[5] */
++                   "fld.d $f30, $a0, 0xa8\n\t"     /* jmp_buf->D[6] */
++                   "fld.d $f31, $a0, 0xb0\n\t"     /* jmp_buf->D[7] */
++                   "move $a0, $a1\n\t"             /* retval */
++                   "jirl $zero, $t0, 0" )
++
+ #else
+ 
+ int __cdecl __wine_setjmpex( __wine_jmp_buf *buf, EXCEPTION_REGISTRATION_RECORD *frame )
+-- 
+2.47.3
+

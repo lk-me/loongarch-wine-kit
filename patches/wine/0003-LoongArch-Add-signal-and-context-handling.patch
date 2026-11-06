@@ -1,0 +1,2967 @@
+From 9cc74ce7794809d123729237cae836cc3a573758 Mon Sep 17 00:00:00 2001
+From: ChenghaoLiu <linkmecry@gmail.com>
+Date: Tue, 3 Nov 2026 11:07:11 +0800
+Subject: [PATCH 03/11] [LoongArch] Add signal and context handling
+
+Implement ntdll signal/context layer for loongarch64:
+- unix/signal_loongarch64.c: syscall dispatcher, exception/APC/callback
+  dispatchers, segv/trap/usr1/usr2 handlers, context save/restore
+- signal_loongarch64.c: PE side entry points and __chkstk/setjmp helpers
+- dwarf.h: DWARF register mapping (GPR 0-31, FPR 32-63)
+- relay.c: fix stack argument byte count (shift by 3)
+- unwind.c: temporary RtlVirtualUnwind stubs until .pdata support
+- setjmp.h, exception.h: loongarch64 jump buffer layout
+- PE directory lookups: loongarch64-windows / loongarch64-unix
+---
+ dlls/dbghelp/path.c                  |    1 +
+ dlls/ntdll/Makefile.in               |    2 +
+ dlls/ntdll/loader.c                  |    2 +
+ dlls/ntdll/relay.c                   |  105 +-
+ dlls/ntdll/signal_loongarch64.c      |  901 ++++++++++++++++
+ dlls/ntdll/unix/dwarf.h              |   49 +-
+ dlls/ntdll/unix/loader.c             |    4 +-
+ dlls/ntdll/unix/signal_loongarch64.c | 1492 ++++++++++++++++++++++++++
+ dlls/ntdll/unix/unix_private.h       |    5 +-
+ dlls/ntdll/unwind.c                  |   61 ++
+ dlls/setupapi/fakedll.c              |    3 +
+ include/msvcrt/corecrt.h             |    2 +-
+ include/msvcrt/setjmp.h              |   26 +
+ include/wine/asm.h                   |   15 +-
+ include/wine/exception.h             |    2 +
+ programs/winecfg/libraries.c         |    2 +
+ 16 files changed, 2664 insertions(+), 8 deletions(-)
+ create mode 100644 dlls/ntdll/signal_loongarch64.c
+ create mode 100644 dlls/ntdll/unix/signal_loongarch64.c
+
+diff --git a/dlls/dbghelp/path.c b/dlls/dbghelp/path.c
+index c1fc6ad..01cebdf 100644
+--- a/dlls/dbghelp/path.c
++++ b/dlls/dbghelp/path.c
+@@ -43,6 +43,7 @@ static const struct machine_dir
+     {IMAGE_FILE_MACHINE_AMD64, L"\\x86_64-windows\\",  L"\\x86_64-unix\\"},
+     {IMAGE_FILE_MACHINE_ARMNT, L"\\arm-windows\\",     L"\\arm-unix\\"},
+     {IMAGE_FILE_MACHINE_ARM64, L"\\aarch64-windows\\", L"\\aarch64-unix\\"},
++    {IMAGE_FILE_MACHINE_LOONGARCH64, L"\\loongarch64-windows\\", L"\\loongarch64-unix\\"},
+ };
+ 
+ static inline BOOL is_sepA(char ch) {return ch == '/' || ch == '\\';}
+diff --git a/dlls/ntdll/Makefile.in b/dlls/ntdll/Makefile.in
+index f7558bb..873dfc8 100644
+--- a/dlls/ntdll/Makefile.in
++++ b/dlls/ntdll/Makefile.in
+@@ -40,6 +40,7 @@ SOURCES = \
+ 	signal_arm64.c \
+ 	signal_arm64ec.c \
+ 	signal_i386.c \
++	signal_loongarch64.c \
+ 	signal_x86_64.c \
+ 	string.c \
+ 	sync.c \
+@@ -60,6 +61,7 @@ SOURCES = \
+ 	unix/signal_arm.c \
+ 	unix/signal_arm64.c \
+ 	unix/signal_i386.c \
++	unix/signal_loongarch64.c \
+ 	unix/signal_x86_64.c \
+ 	unix/socket.c \
+ 	unix/sync.c \
+diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
+index de32521..ea3ce10 100644
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -58,6 +58,8 @@ static const WCHAR pe_dir[] = L"\\x86_64-windows";
+ static const WCHAR pe_dir[] = L"\\arm-windows";
+ #elif defined __aarch64__
+ static const WCHAR pe_dir[] = L"\\aarch64-windows";
++#elif defined __loongarch__
++static const WCHAR pe_dir[] = L"\\loongarch64-windows";
+ #else
+ static const WCHAR pe_dir[] = L"";
+ #endif
+diff --git a/dlls/ntdll/relay.c b/dlls/ntdll/relay.c
+index b24837e..85878fa 100644
+--- a/dlls/ntdll/relay.c
++++ b/dlls/ntdll/relay.c
+@@ -34,7 +34,7 @@
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(relay);
+ 
+-#if (defined(__i386__) || defined(__x86_64__) || defined(__arm__) || defined(__aarch64__)) && !defined(__arm64ec__)
++#if (defined(__i386__) || defined(__x86_64__) || defined(__arm__) || defined(__aarch64__) || defined(__loongarch__)) && !defined(__arm64ec__)
+ 
+ struct relay_descr  /* descriptor for a module */
+ {
+@@ -674,6 +674,105 @@ static LONGLONG WINAPI relay_call( struct relay_descr *descr, unsigned int idx,
+     return ret;
+ }
+ 
++#elif defined(__loongarch__)
++
++/***********************************************************************
++ *           relay_trace_entry
++ */
++void * WINAPI relay_trace_entry( struct relay_descr *descr, unsigned int idx,
++                                 const INT_PTR *stack, unsigned int *nb_args )
++{
++    WORD ordinal = LOWORD(idx);
++    const char *arg_types = descr->args_string + HIWORD(idx);
++    struct relay_private_data *data = descr->private;
++    struct relay_entry_point *entry_point = data->entry_points + ordinal;
++    unsigned int i;
++
++    TRACE( "\1Call %s(", func_name( data, ordinal ));
++
++    for (i = 0; !is_ret_val( arg_types[i] ); i++)
++    {
++        switch (arg_types[i])
++        {
++        case 's': /* str */
++            trace_string_a( stack[i] );
++            break;
++        case 'w': /* wstr */
++            trace_string_w( stack[i] );
++            break;
++        case 'i': /* long */
++        default:
++            TRACE( "%08Ix", stack[i] );
++            break;
++        }
++        if (!is_ret_val( arg_types[i + 1] )) TRACE( "," );
++    }
++    *nb_args = i;
++    TRACE( ") ret=%08Ix\n", stack[-2] );
++    return entry_point->orig_func;
++}
++
++/***********************************************************************
++ *           relay_trace_exit
++ */
++void WINAPI relay_trace_exit( struct relay_descr *descr, unsigned int idx,
++                              INT_PTR retaddr, INT_PTR retval )
++{
++    TRACE( "\1Ret  %s() retval=%08Ix ret=%08Ix\n",
++           func_name( descr->private, LOWORD(idx) ), retval, retaddr );
++}
++
++extern LONGLONG CDECL call_entry_point( void *func, int nb_args, const INT_PTR *args );
++__ASM_GLOBAL_FUNC( call_entry_point,
++                   "addi.d $sp, $sp, -32\n\t"
++                   "st.d $fp, $sp, 0\n\t"
++                   "st.d $ra, $sp, 8\n\t"
++                   "move $fp, $sp\n\t"
++                   "move $t0, $a0\n\t"       /* func */
++                   "move $t1, $a1\n\t"       /* nb_args */
++                   "move $t2, $a2\n\t"       /* args */
++                   "beqz $t1, 2f\n\t"
++                   "ld.d $a0, $t2, 0\n\t"
++                   "ld.d $a1, $t2, 8\n\t"
++                   "ld.d $a2, $t2, 16\n\t"
++                   "ld.d $a3, $t2, 24\n\t"
++                   "ld.d $a4, $t2, 32\n\t"
++                   "ld.d $a5, $t2, 40\n\t"
++                   "ld.d $a6, $t2, 48\n\t"
++                   "ld.d $a7, $t2, 56\n\t"
++                   "addi.d $t1, $t1, -8\n\t"  /* remaining stack args */
++                   "slli.d $t1, $t1, 3\n\t"   /* byte count */
++                   "bge $zero, $t1, 2f\n\t"
++                   "sub.d $sp, $sp, $t1\n\t"
++                   "andi $t3, $t1, 8\n\t"
++                   "beqz $t3, 1f\n\t"
++                   "addi.d $sp, $sp, -8\n\t"
++                   "1:\taddi.d $t2, $t2, 64\n\t"
++                   "add.d $t3, $t2, $t1\n\t"
++                   "add.d $t4, $sp, $t1\n\t"
++                   "3:\taddi.d $t3, $t3, -8\n\t"
++                   "addi.d $t4, $t4, -8\n\t"
++                   "ld.d $t5, $t3, 0\n\t"
++                   "st.d $t5, $t4, 0\n\t"
++                   "addi.d $t1, $t1, -8\n\t"
++                   "bnez $t1, 3b\n\t"
++                   "2:\tjirl $ra, $t0, 0\n\t"
++                   "move $sp, $fp\n\t"
++                   "ld.d $ra, $sp, 8\n\t"
++                   "ld.d $fp, $sp, 0\n\t"
++                   "addi.d $sp, $sp, 32\n\t"
++                   "jr $ra\n" )
++
++static LONGLONG WINAPI relay_call( struct relay_descr *descr, unsigned int idx, const INT_PTR *stack )
++{
++    unsigned int nb_args;
++    void *func = relay_trace_entry( descr, idx, stack, &nb_args );
++    LONGLONG ret = call_entry_point( func, nb_args, stack );
++    /* the relay thunk stores the return address below the argument array */
++    relay_trace_exit( descr, idx, stack[-2], ret );
++    return ret;
++}
++
+ #elif defined(__x86_64__)
+ 
+ /***********************************************************************
+@@ -910,7 +1009,7 @@ void RELAY_SetupDLL( HMODULE module )
+         NtProtectVirtualMemory( NtCurrentProcess(), &func_base, &func_size, old_prot, &old_prot );
+ }
+ 
+-#else  /* __i386__ || __x86_64__ || __arm__ || __aarch64__ */
++#else  /* __i386__ || __x86_64__ || __arm__ || __aarch64__ || __loongarch__ */
+ 
+ FARPROC RELAY_GetProcAddress( HMODULE module, const IMAGE_EXPORT_DIRECTORY *exports,
+                               DWORD exp_size, FARPROC proc, DWORD ordinal, const WCHAR *user )
+@@ -922,7 +1021,7 @@ void RELAY_SetupDLL( HMODULE module )
+ {
+ }
+ 
+-#endif  /* __i386__ || __x86_64__ || __arm__ || __aarch64__ */
++#endif  /* __i386__ || __x86_64__ || __arm__ || __aarch64__ || __loongarch__ */
+ 
+ 
+ /***********************************************************************/
+diff --git a/dlls/ntdll/signal_loongarch64.c b/dlls/ntdll/signal_loongarch64.c
+new file mode 100644
+index 0000000..265325f
+--- /dev/null
++++ b/dlls/ntdll/signal_loongarch64.c
+@@ -0,0 +1,901 @@
++/*
++ * LoongArch64 signal handling routines
++ *
++ * Copyright 2010-2013 André Hentschel
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifdef __loongarch__
++
++#include <assert.h>
++#include <signal.h>
++#include <stdlib.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <setjmp.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winternl.h"
++#include "ddk/wdm.h"
++#include "wine/exception.h"
++#include "ntdll_misc.h"
++#include "wine/debug.h"
++#include "ntsyscalls.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(seh);
++WINE_DECLARE_DEBUG_CHANNEL(relay);
++
++/* LoongArch64 没有 SEH 表，这里只保存展开时需要恢复的非易失寄存器 */
++struct loongarch_nonvol_regs
++{
++    DWORD64 Gpr[10];  /* R22-R31 ($fp, $s0-$s8) */
++    DWORD64 Fpr[8];   /* F24-F31 */
++};
++C_ASSERT( sizeof(struct loongarch_nonvol_regs) == 0x90 );
++
++/*******************************************************************
++ *         syscalls
++ */
++#define SYSCALL_ENTRY(id,name,args) __ASM_SYSCALL_FUNC( id, name )
++ALL_SYSCALLS
++#undef SYSCALL_ENTRY
++
++
++/**************************************************************************
++ *		__chkstk (NTDLL.@)
++ *
++ * Supposed to touch all the stack pages, but we shouldn't need that.
++ */
++__ASM_GLOBAL_FUNC( __chkstk, "jr $ra" )
++
++
++/***********************************************************************
++ *		RtlCaptureContext (NTDLL.@)
++ */
++__ASM_GLOBAL_FUNC( RtlCaptureContext,
++                    /* 先保存会被自己用到的 $a0/$t0，再逐个保存其它寄存器 */
++                    "addi.d $sp, $sp, -16\n\t"
++                    "st.d $a0, $sp, 0\n\t"
++                    "st.d $t0, $sp, 8\n\t"
++                    "move $t0, $a0\n\t"                   /* t0 = context */
++                    "st.d $zero, $t0, 0x08\n\t"           /* context->Gpr[0] */
++                    "st.d $ra,   $t0, 0x10\n\t"           /* context->Gpr[1] */
++                    "st.d $tp,   $t0, 0x18\n\t"           /* context->Gpr[2] */
++                    "st.d $a1,   $t0, 0x30\n\t"           /* context->Gpr[5] */
++                    "st.d $a2,   $t0, 0x38\n\t"           /* context->Gpr[6] */
++                    "st.d $a3,   $t0, 0x40\n\t"           /* context->Gpr[7] */
++                    "st.d $a4,   $t0, 0x48\n\t"           /* context->Gpr[8] */
++                    "st.d $a5,   $t0, 0x50\n\t"           /* context->Gpr[9] */
++                    "st.d $a6,   $t0, 0x58\n\t"           /* context->Gpr[10] */
++                    "st.d $a7,   $t0, 0x60\n\t"           /* context->Gpr[11] */
++                    "st.d $t1,   $t0, 0x70\n\t"           /* context->Gpr[13] */
++                    "st.d $t2,   $t0, 0x78\n\t"           /* context->Gpr[14] */
++                    "st.d $t3,   $t0, 0x80\n\t"           /* context->Gpr[15] */
++                    "st.d $t4,   $t0, 0x88\n\t"           /* context->Gpr[16] */
++                    "st.d $t5,   $t0, 0x90\n\t"           /* context->Gpr[17] */
++                    "st.d $t6,   $t0, 0x98\n\t"           /* context->Gpr[18] */
++                    "st.d $t7,   $t0, 0xa0\n\t"           /* context->Gpr[19] */
++                    "st.d $t8,   $t0, 0xa8\n\t"           /* context->Gpr[20] */
++                    "st.d $r21,  $t0, 0xb0\n\t"           /* context->Gpr[21] */
++                    "st.d $fp,   $t0, 0xb8\n\t"           /* context->Gpr[22] */
++                    "st.d $s0,   $t0, 0xc0\n\t"           /* context->Gpr[23] */
++                    "st.d $s1,   $t0, 0xc8\n\t"           /* context->Gpr[24] */
++                    "st.d $s2,   $t0, 0xd0\n\t"           /* context->Gpr[25] */
++                    "st.d $s3,   $t0, 0xd8\n\t"           /* context->Gpr[26] */
++                    "st.d $s4,   $t0, 0xe0\n\t"           /* context->Gpr[27] */
++                    "st.d $s5,   $t0, 0xe8\n\t"           /* context->Gpr[28] */
++                    "st.d $s6,   $t0, 0xf0\n\t"           /* context->Gpr[29] */
++                    "st.d $s7,   $t0, 0xf8\n\t"           /* context->Gpr[30] */
++                    "st.d $s8,   $t0, 0x100\n\t"          /* context->Gpr[31] */
++                    "ld.d $t1, $sp, 0\n\t"                /* 原始 $a0 */
++                    "st.d $t1, $t0, 0x28\n\t"              /* context->Gpr[4] */
++                    "ld.d $t1, $sp, 8\n\t"                /* 原始 $t0 */
++                    "st.d $t1, $t0, 0x68\n\t"             /* context->Gpr[12] */
++                    "addi.d $t1, $sp, 16\n\t"             /* 原始栈指针 */
++                    "st.d $t1, $t0, 0x20\n\t"             /* context->Gpr[3] */
++                    "st.d $ra, $t0, 0x108\n\t"            /* context->Pc */
++                    "fst.d $f0,  $t0, 0x110\n\t"
++                    "fst.d $f1,  $t0, 0x118\n\t"
++                    "fst.d $f2,  $t0, 0x120\n\t"
++                    "fst.d $f3,  $t0, 0x128\n\t"
++                    "fst.d $f4,  $t0, 0x130\n\t"
++                    "fst.d $f5,  $t0, 0x138\n\t"
++                    "fst.d $f6,  $t0, 0x140\n\t"
++                    "fst.d $f7,  $t0, 0x148\n\t"
++                    "fst.d $f8,  $t0, 0x150\n\t"
++                    "fst.d $f9,  $t0, 0x158\n\t"
++                    "fst.d $f10, $t0, 0x160\n\t"
++                    "fst.d $f11, $t0, 0x168\n\t"
++                    "fst.d $f12, $t0, 0x170\n\t"
++                    "fst.d $f13, $t0, 0x178\n\t"
++                    "fst.d $f14, $t0, 0x180\n\t"
++                    "fst.d $f15, $t0, 0x188\n\t"
++                    "fst.d $f16, $t0, 0x190\n\t"
++                    "fst.d $f17, $t0, 0x198\n\t"
++                    "fst.d $f18, $t0, 0x1a0\n\t"
++                    "fst.d $f19, $t0, 0x1a8\n\t"
++                    "fst.d $f20, $t0, 0x1b0\n\t"
++                    "fst.d $f21, $t0, 0x1b8\n\t"
++                    "fst.d $f22, $t0, 0x1c0\n\t"
++                    "fst.d $f23, $t0, 0x1c8\n\t"
++                    "fst.d $f24, $t0, 0x1d0\n\t"
++                    "fst.d $f25, $t0, 0x1d8\n\t"
++                    "fst.d $f26, $t0, 0x1e0\n\t"
++                    "fst.d $f27, $t0, 0x1e8\n\t"
++                    "fst.d $f28, $t0, 0x1f0\n\t"
++                    "fst.d $f29, $t0, 0x1f8\n\t"
++                    "fst.d $f30, $t0, 0x200\n\t"
++                    "fst.d $f31, $t0, 0x208\n\t"
++                    "movcf2gr $t1, $fcc0\n\t"
++                    "st.w $t1, $t0, 0x210\n\t"
++                    "movcf2gr $t1, $fcc1\n\t"
++                    "st.w $t1, $t0, 0x214\n\t"
++                    "movcf2gr $t1, $fcc2\n\t"
++                    "st.w $t1, $t0, 0x218\n\t"
++                    "movcf2gr $t1, $fcc3\n\t"
++                    "st.w $t1, $t0, 0x21c\n\t"
++                    "movcf2gr $t1, $fcc4\n\t"
++                    "st.w $t1, $t0, 0x220\n\t"
++                    "movcf2gr $t1, $fcc5\n\t"
++                    "st.w $t1, $t0, 0x224\n\t"
++                    "movcf2gr $t1, $fcc6\n\t"
++                    "st.w $t1, $t0, 0x228\n\t"
++                    "movcf2gr $t1, $fcc7\n\t"
++                    "st.w $t1, $t0, 0x22c\n\t"
++                    "movfcsr2gr $t1, $fcsr0\n\t"
++                    "st.w $t1, $t0, 0x230\n\t"            /* context->Fcsr */
++                    "lu12i.w $t1, 0x800\n\t"               /* CONTEXT_LOONGARCH64 */
++                    "ori $t1, $t1, 7\n\t"                  /* CONTEXT_FULL */
++                    "st.w $t1, $t0, 0\n\t"                 /* context->ContextFlags */
++                    "ld.d $a0, $sp, 0\n\t"
++                    "ld.d $t0, $sp, 8\n\t"
++                    "addi.d $sp, $sp, 16\n\t"
++                    "jr $ra" )
++
++
++/**********************************************************************
++ *           virtual_unwind
++ */
++static NTSTATUS virtual_unwind( ULONG type, DISPATCHER_CONTEXT *dispatch, CONTEXT *context )
++{
++    struct loongarch_nonvol_regs *nonvol_regs;
++    DWORD64 pc = context->Pc;
++    int i;
++
++    dispatch->ScopeIndex = 0;
++    dispatch->ControlPc  = pc;
++    dispatch->ControlPcIsUnwound = (context->ContextFlags & CONTEXT_LOONGARCH64_UNWOUND_TO_CALL) != 0;
++    if (dispatch->ControlPcIsUnwound) pc -= 4;
++
++    nonvol_regs = (struct loongarch_nonvol_regs *)dispatch->NonVolatileRegisters;
++    memcpy( nonvol_regs->Gpr, &context->Gpr[22], sizeof(nonvol_regs->Gpr) );
++    for (i = 0; i < 8; i++) nonvol_regs->Fpr[i] = context->Fpr[i + 24];
++
++    dispatch->FunctionEntry = RtlLookupFunctionEntry( pc, &dispatch->ImageBase, dispatch->HistoryTable );
++
++    if (RtlVirtualUnwind2( type, dispatch->ImageBase, pc, dispatch->FunctionEntry, context,
++                           NULL, &dispatch->HandlerData, &dispatch->EstablisherFrame,
++                           NULL, NULL, NULL, &dispatch->LanguageHandler, 0 ))
++    {
++        WARN( "exception data not found for pc %p, ra %p\n", (void *)pc, (void *)context->Gpr[1] );
++        return STATUS_INVALID_DISPOSITION;
++    }
++    return STATUS_SUCCESS;
++}
++
++
++/**********************************************************************
++ *           unwind_exception_handler
++ *
++ * Handler for exceptions happening while calling an unwind handler.
++ */
++EXCEPTION_DISPOSITION WINAPI unwind_exception_handler( EXCEPTION_RECORD *record, void *frame,
++                                                       CONTEXT *context, DISPATCHER_CONTEXT *dispatch )
++{
++    DISPATCHER_CONTEXT *orig_dispatch = ((DISPATCHER_CONTEXT **)frame)[-2];
++
++    /* copy the original dispatcher into the current one, except for the TargetPc */
++    dispatch->ControlPc          = orig_dispatch->ControlPc;
++    dispatch->ImageBase          = orig_dispatch->ImageBase;
++    dispatch->FunctionEntry      = orig_dispatch->FunctionEntry;
++    dispatch->EstablisherFrame   = orig_dispatch->EstablisherFrame;
++    dispatch->LanguageHandler    = orig_dispatch->LanguageHandler;
++    dispatch->HandlerData        = orig_dispatch->HandlerData;
++    dispatch->HistoryTable       = orig_dispatch->HistoryTable;
++    dispatch->ScopeIndex         = orig_dispatch->ScopeIndex;
++    dispatch->ControlPcIsUnwound = orig_dispatch->ControlPcIsUnwound;
++    *dispatch->ContextRecord     = *orig_dispatch->ContextRecord;
++    memcpy( dispatch->NonVolatileRegisters, orig_dispatch->NonVolatileRegisters,
++            sizeof(struct loongarch_nonvol_regs) );
++    TRACE( "detected collided unwind\n" );
++    return ExceptionCollidedUnwind;
++}
++
++
++/**********************************************************************
++ *           call_unwind_handler
++ */
++DWORD WINAPI call_unwind_handler( EXCEPTION_RECORD *rec, ULONG_PTR frame,
++                                  CONTEXT *context, void *dispatch, PEXCEPTION_ROUTINE handler );
++__ASM_GLOBAL_FUNC( call_unwind_handler,
++                   "addi.d $sp, $sp, -32\n\t"
++                   "st.d $fp, $sp, 0\n\t"
++                   "st.d $ra, $sp, 8\n\t"
++                   "st.d $a3, $sp, 16\n\t"    /* frame[-2] = dispatch */
++                   "jirl $ra, $a4, 0\n\t"
++                   "ld.d $fp, $sp, 0\n\t"
++                   "ld.d $ra, $sp, 8\n\t"
++                   "addi.d $sp, $sp, 32\n\t"
++                   "jr $ra" )
++
++
++/***********************************************************************
++ *		call_seh_handler
++ */
++DWORD WINAPI call_seh_handler( EXCEPTION_RECORD *rec, ULONG_PTR frame,
++                               CONTEXT *context, void *dispatch, PEXCEPTION_ROUTINE handler );
++__ASM_GLOBAL_FUNC( call_seh_handler,
++                   "addi.d $sp, $sp, -16\n\t"
++                   "st.d $fp, $sp, 0\n\t"
++                   "st.d $ra, $sp, 8\n\t"
++                   "jirl $ra, $a4, 0\n\t"
++                   "ld.d $fp, $sp, 0\n\t"
++                   "ld.d $ra, $sp, 8\n\t"
++                   "addi.d $sp, $sp, 16\n\t"
++                   "jr $ra" )
++
++
++/**********************************************************************
++ *           call_seh_handlers
++ *
++ * Call the SEH handlers.
++ */
++NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
++{
++    EXCEPTION_REGISTRATION_RECORD *teb_frame = NtCurrentTeb()->Tib.ExceptionList;
++    struct loongarch_nonvol_regs nonvol_regs;
++    UNWIND_HISTORY_TABLE table;
++    DISPATCHER_CONTEXT dispatch;
++    CONTEXT context;
++    NTSTATUS status;
++    ULONG_PTR frame;
++    DWORD res;
++
++    context = *orig_context;
++    dispatch.TargetPc      = 0;
++    dispatch.ContextRecord = &context;
++    dispatch.HistoryTable  = &table;
++    dispatch.NonVolatileRegisters = (PBYTE)&nonvol_regs;
++
++    for (;;)
++    {
++        status = virtual_unwind( UNW_FLAG_EHANDLER, &dispatch, &context );
++        if (status != STATUS_SUCCESS) return status;
++
++    unwind_done:
++        if (!dispatch.EstablisherFrame) break;
++
++        if (!is_valid_frame( dispatch.EstablisherFrame ))
++        {
++            ERR( "invalid frame %I64x (%p-%p)\n", dispatch.EstablisherFrame,
++                 NtCurrentTeb()->Tib.StackLimit, NtCurrentTeb()->Tib.StackBase );
++            rec->ExceptionFlags |= EXCEPTION_STACK_INVALID;
++            break;
++        }
++
++        if (dispatch.LanguageHandler)
++        {
++            TRACE( "calling handler %p (rec=%p, frame=%I64x context=%p, dispatch=%p)\n",
++                   dispatch.LanguageHandler, rec, dispatch.EstablisherFrame, orig_context, &dispatch );
++            res = call_seh_handler( rec, dispatch.EstablisherFrame, orig_context,
++                                    &dispatch, dispatch.LanguageHandler );
++            rec->ExceptionFlags &= EXCEPTION_NONCONTINUABLE;
++            TRACE( "handler at %p returned %lu\n", dispatch.LanguageHandler, res );
++
++            switch (res)
++            {
++            case ExceptionContinueExecution:
++                if (rec->ExceptionFlags & EXCEPTION_NONCONTINUABLE) return STATUS_NONCONTINUABLE_EXCEPTION;
++                return STATUS_SUCCESS;
++            case ExceptionContinueSearch:
++                break;
++            case ExceptionNestedException:
++                rec->ExceptionFlags |= EXCEPTION_NESTED_CALL;
++                TRACE( "nested exception\n" );
++                break;
++            case ExceptionCollidedUnwind:
++                RtlVirtualUnwind( UNW_FLAG_NHANDLER, dispatch.ImageBase,
++                                  dispatch.ControlPc, dispatch.FunctionEntry,
++                                  &context, &dispatch.HandlerData, &frame, NULL );
++                goto unwind_done;
++            default:
++                return STATUS_INVALID_DISPOSITION;
++            }
++        }
++        /* hack: call wine handlers registered in the tib list */
++        else while (is_valid_frame( (ULONG_PTR)teb_frame ) && (ULONG64)teb_frame < context.Gpr[3])
++        {
++            TRACE( "calling TEB handler %p (rec=%p frame=%p context=%p dispatch=%p) sp=%I64x\n",
++                   teb_frame->Handler, rec, teb_frame, orig_context, &dispatch, context.Gpr[3] );
++            res = call_seh_handler( rec, (ULONG_PTR)teb_frame, orig_context,
++                                    &dispatch, (PEXCEPTION_ROUTINE)teb_frame->Handler );
++            TRACE( "TEB handler at %p returned %lu\n", teb_frame->Handler, res );
++
++            switch (res)
++            {
++            case ExceptionContinueExecution:
++                if (rec->ExceptionFlags & EXCEPTION_NONCONTINUABLE) return STATUS_NONCONTINUABLE_EXCEPTION;
++                return STATUS_SUCCESS;
++            case ExceptionContinueSearch:
++                break;
++            case ExceptionNestedException:
++                rec->ExceptionFlags |= EXCEPTION_NESTED_CALL;
++                TRACE( "nested exception\n" );
++                break;
++            case ExceptionCollidedUnwind:
++                RtlVirtualUnwind( UNW_FLAG_NHANDLER, dispatch.ImageBase,
++                                  dispatch.ControlPc, dispatch.FunctionEntry,
++                                  &context, &dispatch.HandlerData, &frame, NULL );
++                teb_frame = teb_frame->Prev;
++                goto unwind_done;
++            default:
++                return STATUS_INVALID_DISPOSITION;
++            }
++            teb_frame = teb_frame->Prev;
++        }
++
++        if (context.Gpr[3] == (ULONG64)NtCurrentTeb()->Tib.StackBase) break;
++    }
++    return STATUS_UNHANDLED_EXCEPTION;
++}
++
++
++/*******************************************************************
++ *		KiUserExceptionDispatcher (NTDLL.@)
++ */
++__ASM_GLOBAL_FUNC( KiUserExceptionDispatcher,
++                   "addi.d $a0, $sp, 0x260\n\t"   /* rec */
++                   "move $a1, $sp\n\t"           /* context */
++                   "bl dispatch_exception\n\t"
++                   "break 0x7000" )
++
++
++/*******************************************************************
++ *		KiUserApcDispatcher (NTDLL.@)
++ */
++__ASM_GLOBAL_FUNC( KiUserApcDispatcher,
++                   "ld.d $t0, $sp, 0\n\t"        /* func */
++                   "ld.d $a0, $sp, 8\n\t"        /* arg1 */
++                   "ld.d $a1, $sp, 0x10\n\t"     /* arg2 */
++                   "ld.d $a2, $sp, 0x18\n\t"     /* arg3 */
++                   "addi.d $a3, $sp, 0x30\n\t"   /* context */
++                   "jirl $ra, $t0, 0\n\t"
++                   "addi.d $a0, $sp, 0x30\n\t"   /* context */
++                   "ld.w $a1, $sp, 0x20\n\t"     /* alertable */
++                   "bl NtContinue\n\t"
++                   "break 0x7000" )
++
++
++/*******************************************************************
++ *		KiUserCallbackDispatcher (NTDLL.@)
++ */
++__ASM_GLOBAL_FUNC( KiUserCallbackDispatcher,
++                   "ld.d $a0, $sp, 0\n\t"        /* args */
++                   "ld.w $a1, $sp, 0x08\n\t"     /* len */
++                   "ld.w $a2, $sp, 0x0c\n\t"     /* id */
++                   "ld.d $t0, $r21, 0x60\n\t"    /* peb */
++                   "ld.d $t0, $t0, 0x58\n\t"     /* peb->KernelCallbackTable */
++                   "slli.d $t1, $a2, 3\n\t"
++                   "add.d $t0, $t0, $t1\n\t"
++                   "ld.d $t0, $t0, 0\n\t"
++                   "jirl $ra, $t0, 0\n\t"
++                   ".globl KiUserCallbackDispatcherReturn\n"
++                   "KiUserCallbackDispatcherReturn:\n\t"
++                   "move $a2, $a0\n\t"           /* status */
++                   "move $a1, $zero\n\t"         /* ret_len */
++                   "move $a0, $a1\n\t"           /* ret_ptr */
++                   "bl NtCallbackReturn\n\t"
++                   "bl RtlRaiseStatus\n\t"
++                   "break 0x7000" )
++
++
++/**********************************************************************
++ *           consolidate_callback
++ *
++ * Wrapper function to call a consolidate callback from a fake frame.
++ * If the callback executes RtlUnwindEx (like for example done in C++ handlers),
++ * we have to skip all frames which were already processed. To do that we
++ * trick the unwinding functions into thinking the call came from somewhere
++ * else.
++ */
++void WINAPI DECLSPEC_NORETURN consolidate_callback( CONTEXT *context,
++                                                    void *(CALLBACK *callback)(EXCEPTION_RECORD *),
++                                                    EXCEPTION_RECORD *rec );
++__ASM_GLOBAL_FUNC( consolidate_callback,
++                   "addi.d $sp, $sp, -16\n\t"
++                   "st.d $fp, $sp, 0\n\t"
++                   "st.d $ra, $sp, 8\n\t"
++                   "addi.d $sp, $sp, -0x240\n\t"  /* sizeof(CONTEXT) */
++                   "move $t3, $sp\n\t"
++                   "li.w $t2, 0x24\n\t"           /* 0x240 / 16 */
++                   "1:\tld.d $t0, $a0, 0\n\t"
++                   "ld.d $t1, $a0, 8\n\t"
++                   "st.d $t0, $t3, 0\n\t"
++                   "st.d $t1, $t3, 8\n\t"
++                   "addi.d $a0, $a0, 16\n\t"
++                   "addi.d $t3, $t3, 16\n\t"
++                   "addi.d $t2, $t2, -1\n\t"
++                   "bnez $t2, 1b\n\t"
++                   "move $a0, $a2\n\t"
++                   "b invoke_callback" )
++__ASM_GLOBAL_FUNC( invoke_callback,
++                   "jirl $ra, $a1, 0\n\t"
++                   "st.d $a0, $sp, 0x108\n\t"     /* context->Pc */
++                   "move $a0, $sp\n\t"
++                   "move $a1, $zero\n\t"
++                   "b NtContinue" )
++
++
++/*******************************************************************
++ *              RtlRestoreContext (NTDLL.@)
++ */
++void CDECL RtlRestoreContext( CONTEXT *context, EXCEPTION_RECORD *rec )
++{
++    EXCEPTION_REGISTRATION_RECORD *teb_frame = NtCurrentTeb()->Tib.ExceptionList;
++
++    if (rec && rec->ExceptionCode == STATUS_LONGJUMP && rec->NumberParameters >= 1)
++    {
++        struct _JUMP_BUFFER *jmp = (struct _JUMP_BUFFER *)rec->ExceptionInformation[0];
++        int i;
++
++        context->Gpr[23] = jmp->S0;
++        context->Gpr[24] = jmp->S1;
++        context->Gpr[25] = jmp->S2;
++        context->Gpr[26] = jmp->S3;
++        context->Gpr[27] = jmp->S4;
++        context->Gpr[28] = jmp->S5;
++        context->Gpr[29] = jmp->S6;
++        context->Gpr[30] = jmp->S7;
++        context->Gpr[31] = jmp->S8;
++        context->Gpr[22] = jmp->Fp;
++        context->Gpr[1]  = jmp->Ra;
++        context->Pc      = jmp->Ra;
++        context->Gpr[3]  = jmp->Sp;
++        context->Fcsr    = jmp->Fcsr;
++
++        for (i = 0; i < 8; i++)
++        {
++            union { double d; ULONG64 u; } u;
++            u.d = jmp->D[i];
++            context->Fpr[24 + i] = u.u;
++        }
++    }
++    else if (rec && rec->ExceptionCode == STATUS_UNWIND_CONSOLIDATE && rec->NumberParameters >= 1)
++    {
++        PVOID (CALLBACK *consolidate)(EXCEPTION_RECORD *) = (void *)rec->ExceptionInformation[0];
++        TRACE( "calling consolidate callback %p (rec=%p)\n", consolidate, rec );
++        consolidate_callback( context, consolidate, rec );
++    }
++
++    /* hack: remove no longer accessible TEB frames */
++    while (is_valid_frame( (ULONG_PTR)teb_frame ) && (ULONG64)teb_frame < context->Gpr[3])
++    {
++        TRACE( "removing TEB frame: %p\n", teb_frame );
++        teb_frame = __wine_pop_frame( teb_frame );
++    }
++
++    TRACE( "returning to %I64x stack %I64x\n", context->Pc, context->Gpr[3] );
++    NtContinue( context, FALSE );
++}
++
++/*******************************************************************
++ *		RtlUnwindEx (NTDLL.@)
++ */
++void WINAPI RtlUnwindEx( PVOID end_frame, PVOID target_ip, EXCEPTION_RECORD *rec,
++                         PVOID retval, CONTEXT *context, UNWIND_HISTORY_TABLE *table )
++{
++    EXCEPTION_REGISTRATION_RECORD *teb_frame = NtCurrentTeb()->Tib.ExceptionList;
++    struct loongarch_nonvol_regs nonvol_regs;
++    EXCEPTION_RECORD record;
++    DISPATCHER_CONTEXT dispatch;
++    CONTEXT new_context;
++    NTSTATUS status;
++    ULONG_PTR frame;
++    DWORD i, res;
++
++    RtlCaptureContext( context );
++    new_context = *context;
++
++    /* build an exception record, if we do not have one */
++    if (!rec)
++    {
++        record.ExceptionCode    = STATUS_UNWIND;
++        record.ExceptionFlags   = 0;
++        record.ExceptionRecord  = NULL;
++        record.ExceptionAddress = (void *)context->Pc;
++        record.NumberParameters = 0;
++        rec = &record;
++    }
++
++    rec->ExceptionFlags |= EXCEPTION_UNWINDING | (end_frame ? 0 : EXCEPTION_EXIT_UNWIND);
++
++    TRACE( "code=%lx flags=%lx end_frame=%p target_ip=%p\n",
++           rec->ExceptionCode, rec->ExceptionFlags, end_frame, target_ip );
++    for (i = 0; i < min( EXCEPTION_MAXIMUM_PARAMETERS, rec->NumberParameters ); i++)
++        TRACE( " info[%ld]=%016I64x\n", i, rec->ExceptionInformation[i] );
++    TRACE_CONTEXT( context );
++
++    dispatch.TargetPc         = (ULONG64)target_ip;
++    dispatch.ContextRecord    = context;
++    dispatch.HistoryTable     = table;
++    dispatch.NonVolatileRegisters = (PBYTE)&nonvol_regs;
++
++    for (;;)
++    {
++        status = virtual_unwind( UNW_FLAG_UHANDLER, &dispatch, &new_context );
++        if (status != STATUS_SUCCESS) raise_status( status, rec );
++
++    unwind_done:
++        if (!dispatch.EstablisherFrame) break;
++
++        if (!is_valid_frame( dispatch.EstablisherFrame ))
++        {
++            ERR( "invalid frame %I64x (%p-%p)\n", dispatch.EstablisherFrame,
++                 NtCurrentTeb()->Tib.StackLimit, NtCurrentTeb()->Tib.StackBase );
++            rec->ExceptionFlags |= EXCEPTION_STACK_INVALID;
++            break;
++        }
++
++        if (dispatch.LanguageHandler)
++        {
++            if (end_frame && (dispatch.EstablisherFrame > (ULONG64)end_frame))
++            {
++                ERR( "invalid end frame %I64x/%p\n", dispatch.EstablisherFrame, end_frame );
++                raise_status( STATUS_INVALID_UNWIND_TARGET, rec );
++            }
++            if (dispatch.EstablisherFrame == (ULONG64)end_frame) rec->ExceptionFlags |= EXCEPTION_TARGET_UNWIND;
++
++            TRACE( "calling handler %p (rec=%p, frame=%I64x context=%p, dispatch=%p)\n",
++                   dispatch.LanguageHandler, rec, dispatch.EstablisherFrame,
++                   dispatch.ContextRecord, &dispatch );
++            res = call_unwind_handler( rec, dispatch.EstablisherFrame, dispatch.ContextRecord,
++                                       &dispatch, dispatch.LanguageHandler );
++            TRACE( "handler %p returned %lx\n", dispatch.LanguageHandler, res );
++
++            switch (res)
++            {
++            case ExceptionContinueSearch:
++                rec->ExceptionFlags &= ~EXCEPTION_COLLIDED_UNWIND;
++                break;
++            case ExceptionCollidedUnwind:
++                new_context = *context;
++                RtlVirtualUnwind( UNW_FLAG_NHANDLER, dispatch.ImageBase,
++                                  dispatch.ControlPc, dispatch.FunctionEntry,
++                                  &new_context, &dispatch.HandlerData, &frame,
++                                  NULL );
++                rec->ExceptionFlags |= EXCEPTION_COLLIDED_UNWIND;
++                goto unwind_done;
++            default:
++                raise_status( STATUS_INVALID_DISPOSITION, rec );
++                break;
++            }
++        }
++        else  /* hack: call builtin handlers registered in the tib list */
++        {
++            while (is_valid_frame( (ULONG_PTR)teb_frame ) &&
++                   (ULONG64)teb_frame < new_context.Gpr[3] &&
++                   (ULONG64)teb_frame < (ULONG64)end_frame)
++            {
++                TRACE( "calling TEB handler %p (rec=%p, frame=%p context=%p, dispatch=%p)\n",
++                       teb_frame->Handler, rec, teb_frame, dispatch.ContextRecord, &dispatch );
++                res = call_unwind_handler( rec, (ULONG_PTR)teb_frame, dispatch.ContextRecord, &dispatch,
++                                           (PEXCEPTION_ROUTINE)teb_frame->Handler );
++                TRACE( "handler at %p returned %lu\n", teb_frame->Handler, res );
++                teb_frame = __wine_pop_frame( teb_frame );
++
++                switch (res)
++                {
++                case ExceptionContinueSearch:
++                    rec->ExceptionFlags &= ~EXCEPTION_COLLIDED_UNWIND;
++                    break;
++                case ExceptionCollidedUnwind:
++                    new_context = *context;
++                    RtlVirtualUnwind( UNW_FLAG_NHANDLER, dispatch.ImageBase,
++                                      dispatch.ControlPc, dispatch.FunctionEntry,
++                                      &new_context, &dispatch.HandlerData,
++                                      &frame, NULL );
++                    rec->ExceptionFlags |= EXCEPTION_COLLIDED_UNWIND;
++                    goto unwind_done;
++                default:
++                    raise_status( STATUS_INVALID_DISPOSITION, rec );
++                    break;
++                }
++            }
++            if ((ULONG64)teb_frame == (ULONG64)end_frame && (ULONG64)end_frame < new_context.Gpr[3]) break;
++        }
++
++        if (dispatch.EstablisherFrame == (ULONG64)end_frame) break;
++        *context = new_context;
++    }
++
++    if (rec->ExceptionCode != STATUS_UNWIND_CONSOLIDATE)
++        context->Pc = (ULONG64)target_ip;
++    else if (rec->ExceptionInformation[10] == -1)
++        rec->ExceptionInformation[10] = (ULONG_PTR)&nonvol_regs;
++
++    context->Gpr[4] = (ULONG64)retval;
++    RtlRestoreContext(context, rec);
++}
++
++
++/*************************************************************************
++ *		RtlGetNativeSystemInformation (NTDLL.@)
++ */
++NTSTATUS WINAPI RtlGetNativeSystemInformation( SYSTEM_INFORMATION_CLASS class,
++                                               void *info, ULONG size, ULONG *ret_size )
++{
++    return NtQuerySystemInformation( class, info, size, ret_size );
++}
++
++
++/***********************************************************************
++ *           RtlIsProcessorFeaturePresent [NTDLL.@]
++ */
++BOOLEAN WINAPI RtlIsProcessorFeaturePresent( UINT feature )
++{
++    static const ULONGLONG loongarch_features =
++        (1ull << PF_COMPARE_EXCHANGE_DOUBLE) |
++        (1ull << PF_NX_ENABLED) |
++        (1ull << PF_SECOND_LEVEL_ADDRESS_TRANSLATION) |
++        (1ull << PF_FASTFAIL_AVAILABLE);
++
++    return (feature < PROCESSOR_FEATURE_MAX && (loongarch_features & (1ull << feature)) &&
++            user_shared_data->ProcessorFeatures[feature]);
++}
++
++
++/*************************************************************************
++ *		RtlWalkFrameChain (NTDLL.@)
++ */
++ULONG WINAPI RtlWalkFrameChain( void **buffer, ULONG count, ULONG flags )
++{
++    UNWIND_HISTORY_TABLE table;
++    RUNTIME_FUNCTION *func;
++    PEXCEPTION_ROUTINE handler;
++    ULONG_PTR pc, frame, base;
++    CONTEXT context;
++    void *data;
++    ULONG i, skip = flags >> 8, num_entries = 0;
++
++    RtlCaptureContext( &context );
++
++    for (i = 0; i < count; i++)
++    {
++        pc = context.Pc;
++        if (context.ContextFlags & CONTEXT_LOONGARCH64_UNWOUND_TO_CALL) pc -= 4;
++        func = RtlLookupFunctionEntry( pc, &base, &table );
++        if (RtlVirtualUnwind2( UNW_FLAG_NHANDLER, base, pc, func, &context, NULL,
++                               &data, &frame, NULL, NULL, NULL, &handler, 0 ))
++            break;
++        if (!context.Pc) break;
++        if (!frame || !is_valid_frame( frame )) break;
++        if (context.Gpr[3] == (ULONG_PTR)NtCurrentTeb()->Tib.StackBase) break;
++        if (i >= skip) buffer[num_entries++] = (void *)context.Pc;
++    }
++    return num_entries;
++}
++
++
++/***********************************************************************
++ *		__C_ExecuteExceptionFilter
++ */
++__ASM_GLOBAL_FUNC( __C_ExecuteExceptionFilter,
++                   "addi.d $sp, $sp, -0x60\n\t"
++                   "st.d $fp, $sp, 0\n\t"
++                   "st.d $ra, $sp, 8\n\t"
++                   "st.d $s0, $sp, 0x10\n\t"
++                   "st.d $s1, $sp, 0x18\n\t"
++                   "st.d $s2, $sp, 0x20\n\t"
++                   "st.d $s3, $sp, 0x28\n\t"
++                   "st.d $s4, $sp, 0x30\n\t"
++                   "st.d $s5, $sp, 0x38\n\t"
++                   "st.d $s6, $sp, 0x40\n\t"
++                   "st.d $s7, $sp, 0x48\n\t"
++                   "st.d $s8, $sp, 0x50\n\t"
++                   "ld.d $fp, $a3, 0\n\t"     /* $fp = frame */
++                   "ld.d $s0, $a3, 0x08\n\t"
++                   "ld.d $s1, $a3, 0x10\n\t"
++                   "ld.d $s2, $a3, 0x18\n\t"
++                   "ld.d $s3, $a3, 0x20\n\t"
++                   "ld.d $s4, $a3, 0x28\n\t"
++                   "ld.d $s5, $a3, 0x30\n\t"
++                   "ld.d $s6, $a3, 0x38\n\t"
++                   "ld.d $s7, $a3, 0x40\n\t"
++                   "ld.d $s8, $a3, 0x48\n\t"
++                   "move $a1, $fp\n\t"
++                   "jirl $ra, $a2, 0\n\t"     /* filter */
++                   "ld.d $s0, $sp, 0x10\n\t"
++                   "ld.d $s1, $sp, 0x18\n\t"
++                   "ld.d $s2, $sp, 0x20\n\t"
++                   "ld.d $s3, $sp, 0x28\n\t"
++                   "ld.d $s4, $sp, 0x30\n\t"
++                   "ld.d $s5, $sp, 0x38\n\t"
++                   "ld.d $s6, $sp, 0x40\n\t"
++                   "ld.d $s7, $sp, 0x48\n\t"
++                   "ld.d $s8, $sp, 0x50\n\t"
++                   "ld.d $fp, $sp, 0\n\t"
++                   "ld.d $ra, $sp, 8\n\t"
++                   "addi.d $sp, $sp, 0x60\n\t"
++                   "jr $ra" )
++
++
++/***********************************************************************
++ *		RtlRaiseException (NTDLL.@)
++ */
++__ASM_GLOBAL_FUNC( RtlRaiseException,
++                   "addi.d $sp, $sp, -0x260\n\t"  /* 0x240 (context) + 0x20 */
++                   "st.d $fp, $sp, 0\n\t"
++                   "st.d $ra, $sp, 8\n\t"
++                   "st.d $a0, $sp, 0x10\n\t"
++                   "addi.d $a0, $sp, 0x20\n\t"
++                   "bl RtlCaptureContext\n\t"
++                   "addi.d $a1, $sp, 0x20\n\t"    /* context pointer */
++                   "addi.d $a2, $sp, 0x260\n\t"   /* orig stack pointer */
++                   "st.d $a2, $a1, 0x20\n\t"      /* context->Gpr[3] */
++                   "ld.d $a0, $sp, 0x10\n\t"      /* original first parameter */
++                   "st.d $a0, $a1, 0x28\n\t"      /* context->Gpr[4] */
++                   "ld.d $t0, $sp, 0\n\t"         /* frame pointer */
++                   "ld.d $t1, $sp, 8\n\t"         /* return address */
++                   "st.d $t0, $a1, 0xb8\n\t"      /* context->Gpr[22] */
++                   "st.d $t1, $a1, 0x10\n\t"      /* context->Gpr[1] */
++                   "st.d $t1, $a1, 0x108\n\t"     /* context->Pc */
++                   "st.d $t1, $a0, 0x10\n\t"      /* rec->ExceptionAddress */
++                   "ld.w $t2, $a1, 0\n\t"         /* context->ContextFlags */
++                   "lu12i.w $t3, 0x20000\n\t"     /* CONTEXT_LOONGARCH64_UNWOUND_TO_CALL */
++                   "or $t2, $t2, $t3\n\t"
++                   "st.w $t2, $a1, 0\n\t"
++                   "ld.d $t0, $r21, 0x60\n\t"     /* peb */
++                   "ld.bu $t2, $t0, 0x02\n\t"     /* peb->BeingDebugged */
++                   "bnez $t2, 1f\n\t"
++                   "bl dispatch_exception\n"
++                   "1:\tld.d $a0, $sp, 0x10\n\t"
++                   "addi.d $a1, $sp, 0x20\n\t"
++                   "li.d $a2, 1\n\t"
++                   "bl NtRaiseException\n\t"
++                   "bl RtlRaiseStatus\n\t"
++                   "break 0x7000" )
++
++
++/***********************************************************************
++ *           _setjmpex (NTDLL.@)
++ */
++__ASM_GLOBAL_FUNC( NTDLL__setjmpex,
++                   "st.d $a1, $a0, 0\n\t"          /* jmp_buf->Frame */
++                   "st.d $zero, $a0, 8\n\t"        /* jmp_buf->Reserved */
++                   "st.d $s0, $a0, 0x10\n\t"
++                   "st.d $s1, $a0, 0x18\n\t"
++                   "st.d $s2, $a0, 0x20\n\t"
++                   "st.d $s3, $a0, 0x28\n\t"
++                   "st.d $s4, $a0, 0x30\n\t"
++                   "st.d $s5, $a0, 0x38\n\t"
++                   "st.d $s6, $a0, 0x40\n\t"
++                   "st.d $s7, $a0, 0x48\n\t"
++                   "st.d $s8, $a0, 0x50\n\t"
++                   "st.d $fp, $a0, 0x58\n\t"       /* jmp_buf->Fp */
++                   "st.d $ra, $a0, 0x60\n\t"       /* jmp_buf->Ra */
++                   "st.d $sp, $a0, 0x68\n\t"       /* jmp_buf->Sp */
++                   "movfcsr2gr $t0, $fcsr0\n\t"
++                   "st.w $t0, $a0, 0x70\n\t"       /* jmp_buf->Fcsr */
++                   "st.w $zero, $a0, 0x74\n\t"
++                   "fst.d $f24, $a0, 0x78\n\t"
++                   "fst.d $f25, $a0, 0x80\n\t"
++                   "fst.d $f26, $a0, 0x88\n\t"
++                   "fst.d $f27, $a0, 0x90\n\t"
++                   "fst.d $f28, $a0, 0x98\n\t"
++                   "fst.d $f29, $a0, 0xa0\n\t"
++                   "fst.d $f30, $a0, 0xa8\n\t"
++                   "fst.d $f31, $a0, 0xb0\n\t"
++                   "move $a0, $zero\n\t"
++                   "jr $ra" )
++
++
++/*******************************************************************
++ *		longjmp (NTDLL.@)
++ */
++void __cdecl NTDLL_longjmp( _JUMP_BUFFER *buf, int retval )
++{
++    EXCEPTION_RECORD rec;
++
++    if (!retval) retval = 1;
++
++    rec.ExceptionCode = STATUS_LONGJUMP;
++    rec.ExceptionFlags = 0;
++    rec.ExceptionRecord = NULL;
++    rec.ExceptionAddress = NULL;
++    rec.NumberParameters = 1;
++    rec.ExceptionInformation[0] = (DWORD_PTR)buf;
++    RtlUnwind( (void *)buf->Frame, (void *)buf->Ra, &rec, IntToPtr(retval) );
++}
++
++
++/***********************************************************************
++ *           RtlUserThreadStart (NTDLL.@)
++ */
++__ASM_GLOBAL_FUNC( RtlUserThreadStart,
++                   "addi.d $sp, $sp, -16\n\t"
++                   "st.d $fp, $sp, 0\n\t"
++                   "st.d $ra, $sp, 8\n\t"
++                   "pcalau12i $t0, %pc_hi20(pBaseThreadInitThunk)\n\t"
++                   "addi.d $t0, $t0, %pc_lo12(pBaseThreadInitThunk)\n\t"
++                   "ld.d $t0, $t0, 0\n\t"
++                   "move $a2, $a1\n\t"
++                   "move $a1, $a0\n\t"
++                   "move $a0, $zero\n\t"
++                   "jirl $ra, $t0, 0\n\t"
++                   "break 0x7000" )
++
++/******************************************************************
++ *		LdrInitializeThunk (NTDLL.@)
++ */
++void WINAPI LdrInitializeThunk( CONTEXT *context, ULONG_PTR unk2, ULONG_PTR unk3, ULONG_PTR unk4 )
++{
++    loader_init( context, (void **)&context->Gpr[4] );
++    TRACE_(relay)( "\1Starting thread proc %p (arg=%p)\n", (void *)context->Gpr[4], (void *)context->Gpr[5] );
++    NtContinue( context, TRUE );
++}
++
++
++/***********************************************************************
++ *           process_breakpoint
++ */
++__ASM_GLOBAL_FUNC( process_breakpoint,
++                   "break 0x7000\n\t"
++                   "jr $ra" )
++
++/***********************************************************************
++ *		DbgUiRemoteBreakin   (NTDLL.@)
++ */
++__ASM_GLOBAL_FUNC( DbgUiRemoteBreakin,
++                   "addi.d $sp, $sp, -16\n\t"
++                   "st.d $fp, $sp, 0\n\t"
++                   "st.d $ra, $sp, 8\n\t"
++                   "ld.d $a0, $r21, 0x60\n\t"       /* NtCurrentTeb()->Peb */
++                   "ld.bu $a0, $a0, 0x02\n\t"        /* peb->BeingDebugged */
++                   "beqz $a0, 1f\n\t"
++                   "bl DbgBreakPoint\n"
++                   "1:\tmove $a0, $zero\n\t"
++                   "bl RtlExitUserThread\n\t"
++                   "DbgUiRemoteBreakin_handler:\n\t"
++                   "move $sp, $a1\n\t"               /* frame */
++                   "b 1b" )
++
++/**********************************************************************
++ *              DbgBreakPoint   (NTDLL.@)
++ */
++__ASM_GLOBAL_FUNC( DbgBreakPoint, "break 0x7000; jr $ra"
++                    "\n\tnop; nop; nop; nop; nop; nop; nop; nop"
++                    "\n\tnop; nop; nop; nop; nop; nop" );
++
++/**********************************************************************
++ *              DbgUserBreakPoint   (NTDLL.@)
++ */
++__ASM_GLOBAL_FUNC( DbgUserBreakPoint, "break 0x7000; jr $ra"
++                    "\n\tnop; nop; nop; nop; nop; nop; nop; nop"
++                    "\n\tnop; nop; nop; nop; nop; nop" );
++
++#endif  /* __loongarch__ */
+diff --git a/dlls/ntdll/unix/dwarf.h b/dlls/ntdll/unix/dwarf.h
+index 166b5e6..6b2489d 100644
+--- a/dlls/ntdll/unix/dwarf.h
++++ b/dlls/ntdll/unix/dwarf.h
+@@ -383,6 +383,9 @@ enum reg_rule
+ #define NB_FRAME_REGS 41
+ #elif defined(__aarch64__)
+ #define NB_FRAME_REGS 96
++#elif defined(__loongarch__)
++/* GPR 0-31, FPR 32-63; FCC/FCSR (64-72) are not tracked */
++#define NB_FRAME_REGS 64
+ #else
+ #error Unsupported architecture
+ #endif
+@@ -431,6 +434,15 @@ static const char *dwarf_reg_names[NB_FRAME_REGS] =
+ /* 72-79 */ "v8",  "v9",  "v10", "v11", "v12", "v13", "v14", "v15",
+ /* 80-87 */ "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
+ /* 88-95 */ "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31",
++#elif defined(__loongarch__)
++/*  0-7  */ "r0",  "r1",  "r2",  "r3",  "r4",  "r5",  "r6",  "r7",
++/*  8-15 */ "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15",
++/* 16-23 */ "r16", "r17", "r18", "r19", "r20", "r21", "r22", "r23",
++/* 24-31 */ "r24", "r25", "r26", "r27", "r28", "r29", "r30", "r31",
++/* 32-39 */ "f0",  "f1",  "f2",  "f3",  "f4",  "f5",  "f6",  "f7",
++/* 40-47 */ "f8",  "f9",  "f10", "f11", "f12", "f13", "f14", "f15",
++/* 48-55 */ "f16", "f17", "f18", "f19", "f20", "f21", "f22", "f23",
++/* 56-63 */ "f24", "f25", "f26", "f27", "f28", "f29", "f30", "f31",
+ #endif
+ };
+ 
+@@ -749,6 +761,9 @@ static void *get_context_reg( CONTEXT *context, ULONG_PTR dw_reg )
+     case 94:
+     case 95:
+         return &context->V[dw_reg - 64];
++#elif defined(__loongarch__)
++    case 0 ... 31:  return &context->Gpr[dw_reg];
++    case 32 ... 63: return &context->Fpr[dw_reg - 32];
+ #endif
+     default: return NULL;
+     }
+@@ -869,6 +884,9 @@ static void set_context_reg( CONTEXT *context, ULONG_PTR dw_reg, void *val )
+     case 95:
+         memcpy( &context->V[dw_reg - 64], val, sizeof(ARM64_NT_NEON128) );
+         break;
++#elif defined(__loongarch__)
++    case 0 ... 31:  context->Gpr[dw_reg]      = *(DWORD64 *)val; break;
++    case 32 ... 63: context->Fpr[dw_reg - 32] = *(DWORD64 *)val; break;
+ #endif
+     }
+ }
+@@ -984,6 +1002,8 @@ static void apply_frame_state( CONTEXT *context, struct frame_state *state,
+     new_context.Rsp = cfa;
+ #elif defined(__aarch64__)
+     new_context.Sp = cfa;
++#elif defined(__loongarch__)
++    new_context.Gpr[3] = cfa;
+ #endif
+ 
+     for (i = 0; i < NB_FRAME_REGS; i++)
+@@ -1123,7 +1143,34 @@ static void apply_frame_state( CONTEXT *context, struct frame_state *state,
+ #define DW_REG_v14 78
+ #define DW_REG_v15 79
+ 
+-#endif /* defined(__aarch64__) */
++#elif defined(__loongarch__)
++
++#define DW_OP_ra DW_OP_breg1
++#define DW_OP_sp DW_OP_breg3
++#define DW_OP_fp DW_OP_breg22
++
++#define DW_REG_ra 1
++#define DW_REG_sp 3
++#define DW_REG_fp 22
++#define DW_REG_s0 23
++#define DW_REG_s1 24
++#define DW_REG_s2 25
++#define DW_REG_s3 26
++#define DW_REG_s4 27
++#define DW_REG_s5 28
++#define DW_REG_s6 29
++#define DW_REG_s7 30
++#define DW_REG_s8 31
++#define DW_REG_f24 56
++#define DW_REG_f25 57
++#define DW_REG_f26 58
++#define DW_REG_f27 59
++#define DW_REG_f28 60
++#define DW_REG_f29 61
++#define DW_REG_f30 62
++#define DW_REG_f31 63
++
++#endif /* defined(__aarch64__) || defined(__loongarch__) */
+ 
+ #define __ASM_CFI_STR(...) #__VA_ARGS__
+ #define __ASM_CFI_ESC(...) \
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index 5a770cc..049a4ab 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -128,7 +128,7 @@ static void stub_syscall( const char *name )
+     rec.ExceptionAddress = (void *)context.Eip;
+ #elif defined __x86_64__
+     rec.ExceptionAddress = (void *)context.Rip;
+-#elif defined __arm__ || defined __aarch64__
++#elif defined __arm__ || defined __aarch64__ || defined __loongarch__
+     rec.ExceptionAddress = (void *)context.Pc;
+ #endif
+     NtRaiseException( &rec, &context, TRUE );
+@@ -353,6 +353,7 @@ static const char *get_so_dir( WORD machine )
+     case IMAGE_FILE_MACHINE_AMD64: return "/x86_64-unix";
+     case IMAGE_FILE_MACHINE_ARMNT: return "/arm-unix";
+     case IMAGE_FILE_MACHINE_ARM64: return "/aarch64-unix";
++    case IMAGE_FILE_MACHINE_LOONGARCH64: return "/loongarch64-unix";
+     default: return "";
+     }
+ }
+@@ -365,6 +366,7 @@ static const char *get_pe_dir( WORD machine )
+     case IMAGE_FILE_MACHINE_AMD64: return "/x86_64-windows";
+     case IMAGE_FILE_MACHINE_ARMNT: return "/arm-windows";
+     case IMAGE_FILE_MACHINE_ARM64: return "/aarch64-windows";
++    case IMAGE_FILE_MACHINE_LOONGARCH64: return "/loongarch64-windows";
+     default: return "";
+     }
+ }
+diff --git a/dlls/ntdll/unix/signal_loongarch64.c b/dlls/ntdll/unix/signal_loongarch64.c
+new file mode 100644
+index 0000000..b2fbaea
+--- /dev/null
++++ b/dlls/ntdll/unix/signal_loongarch64.c
+@@ -0,0 +1,1492 @@
++/*
++ * LoongArch64 信号处理
++ *
++ * 由 dlls/ntdll/unix/signal_arm64.c 移植而来。
++ *
++ * 寄存器约定（LoongArch64 ABI）：
++ *   $r0=$zero, $r1=$ra, $r2=$tp, $r3=$sp, $r4-$r11=$a0-$a7,
++ *   $r12-$r20=$t0-$t8, $r21=Wine TEB, $r22=$fp, $r23-$r31=$s0-$s8
++ */
++#if 0
++#pragma makedep unix
++#endif
++
++#ifdef __loongarch__
++
++#include "config.h"
++
++#include <assert.h>
++#include <pthread.h>
++#include <signal.h>
++#include <stdlib.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <setjmp.h>
++
++#ifdef HAVE_SYS_UCONTEXT_H
++# include <sys/ucontext.h>
++# include <asm/sigcontext.h>
++#endif
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winternl.h"
++#include "ddk/wdm.h"
++#include "wine/exception.h"
++#include "ntdll_misc.h"
++#include "unix_private.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(seh);
++
++/***********************************************************************
++ * LoongArch64 的信号上下文访问
++ *
++ * glibc 的 mcontext_t 使用 __pc/__gregs/__flags/__extcontext 命名，
++ * 但其布局与内核的 struct sigcontext 完全一致，这里统一按内核结构访问。
++ */
++#define SIGCONTEXT(context)   ((struct sigcontext *)&(context)->uc_mcontext)
++
++/* All Registers access - only for local access */
++#define REGn_sig(n, context)  (SIGCONTEXT(context)->sc_regs[(n)])
++#define SP_sig(context)       REGn_sig(3, context)              /* 栈指针 */
++#define PC_sig(context)       (SIGCONTEXT(context)->sc_pc)      /* 程序计数器 */
++#define FP_sig(context)       REGn_sig(22, context)             /* 帧指针 */
++#define RA_sig(context)       REGn_sig(1, context)              /* 返回地址 */
++
++static void *get_extended_sigcontext( const ucontext_t *sigcontext, unsigned int magic )
++{
++    struct sctx_info *info;
++    unsigned int i;
++
++    /* 只有实际使用过浮点单元时内核才会写出扩展上下文 */
++    if (!(SIGCONTEXT(sigcontext)->sc_flags & SC_USED_FP)) return NULL;
++
++    info = (struct sctx_info *)((char *)SIGCONTEXT(sigcontext) +
++                                offsetof( struct sigcontext, sc_extcontext ));
++
++    /* 最多遍历 32 项，防止 size 损坏时越界 */
++    for (i = 0; i < 32; i++)
++    {
++        if (!info->magic || !info->size) break;
++        /* sctx_info 之后紧跟着实际的上下文数据 */
++        if (info->magic == magic) return info + 1;
++        info = (struct sctx_info *)((char *)info + info->size);
++    }
++    return NULL;
++}
++
++/***********************************************************************
++ *           syscall_frame
++ *
++ * 内核栈上的系统调用帧，布局与 CONTEXT 前缀一致（便于直接当作 CONTEXT 使用）。
++ */
++struct syscall_frame
++{
++    ULONG                 flags;          /* 000 ContextFlags */
++    ULONG                 reserved;       /* 004 */
++    ULONG64               gpr[32];        /* 008 */
++    ULONG64               pc;             /* 108 */
++    ULONG64               fpr[32];        /* 110 */
++    ULONG                 fcc[8];         /* 210 */
++    ULONG                 fcsr;           /* 230 */
++    ULONG                 restore_flags;  /* 234 */
++    ULONG                 syscall_id;     /* 238 */
++    ULONG                 align;          /* 23c */
++    struct syscall_frame *prev_frame;     /* 240 */
++    void                 *syscall_cfa;    /* 248 */
++};
++
++C_ASSERT( offsetof( struct syscall_frame, gpr ) == 0x008 );
++C_ASSERT( offsetof( struct syscall_frame, pc ) == 0x108 );
++C_ASSERT( offsetof( struct syscall_frame, fpr ) == 0x110 );
++C_ASSERT( offsetof( struct syscall_frame, fcc ) == 0x210 );
++C_ASSERT( offsetof( struct syscall_frame, fcsr ) == 0x230 );
++C_ASSERT( offsetof( struct syscall_frame, restore_flags ) == 0x234 );
++C_ASSERT( offsetof( struct syscall_frame, syscall_id ) == 0x238 );
++C_ASSERT( offsetof( struct syscall_frame, prev_frame ) == 0x240 );
++C_ASSERT( offsetof( struct syscall_frame, syscall_cfa ) == 0x248 );
++C_ASSERT( sizeof( struct syscall_frame ) == 0x250 );
++
++/* 异常派发时使用的栈布局 */
++struct exc_stack_layout
++{
++    CONTEXT context;             /* 000 */
++    CONTEXT_EX context_ex;       /* 240 */
++    EXCEPTION_RECORD rec;        /* 260 */
++    ULONG64 align;               /* 2f8 */
++    ULONG64 sp;                  /* 300 */
++    ULONG64 pc;                  /* 308 */
++    ULONG64 redzone[2];          /* 310 */
++};
++
++C_ASSERT( offsetof( struct exc_stack_layout, context_ex ) == 0x240 );
++C_ASSERT( offsetof( struct exc_stack_layout, rec ) == 0x260 );
++C_ASSERT( offsetof( struct exc_stack_layout, sp ) == 0x300 );
++C_ASSERT( offsetof( struct exc_stack_layout, pc ) == 0x308 );
++C_ASSERT( offsetof( struct exc_stack_layout, redzone ) == 0x310 );
++C_ASSERT( sizeof( struct exc_stack_layout ) == 0x320 );
++
++/* APC 派发时使用的栈布局 */
++struct apc_stack_layout
++{
++    ULONG64 func;                /* 000 */
++    ULONG64 args[3];             /* 008 */
++    BOOL alertable;              /* 020 */
++    ULONG64 align;               /* 028 */
++    CONTEXT context;             /* 030 */
++    ULONG64 redzone[2];          /* 270 */
++};
++
++C_ASSERT( offsetof( struct apc_stack_layout, args ) == 0x008 );
++C_ASSERT( offsetof( struct apc_stack_layout, alertable ) == 0x020 );
++C_ASSERT( offsetof( struct apc_stack_layout, context ) == 0x030 );
++C_ASSERT( offsetof( struct apc_stack_layout, redzone ) == 0x270 );
++C_ASSERT( sizeof( struct apc_stack_layout ) == 0x280 );
++
++/* 用户回调时使用的栈布局 */
++struct callback_stack_layout
++{
++    void                  *args;         /* 000 参数数据指针 */
++    ULONG                  len;          /* 008 参数长度 */
++    ULONG                  id;           /* 00c 回调 id */
++    ULONG64                unknown[5];   /* 010 保留 */
++    ULONG64                lr;           /* 038 返回地址 */
++    ULONG64                sp;           /* 040 机器帧 */
++    ULONG64                pc;           /* 048 */
++    BYTE                   args_data[0]; /* 050 参数数据 */
++};
++
++C_ASSERT( offsetof( struct callback_stack_layout, len ) == 0x008 );
++C_ASSERT( offsetof( struct callback_stack_layout, id ) == 0x00c );
++C_ASSERT( offsetof( struct callback_stack_layout, lr ) == 0x038 );
++C_ASSERT( offsetof( struct callback_stack_layout, sp ) == 0x040 );
++C_ASSERT( offsetof( struct callback_stack_layout, pc ) == 0x048 );
++C_ASSERT( offsetof( struct callback_stack_layout, args_data ) == 0x050 );
++C_ASSERT( sizeof( struct callback_stack_layout ) == 0x050 );
++
++
++/***********************************************************************
++ *           context_init_empty_xstate
++ *
++ * 初始化 CONTEXT_EX，使其指向一个空的 xstate 缓冲区。
++ */
++static inline void context_init_empty_xstate( CONTEXT *context, void *xstate_buffer )
++{
++    CONTEXT_EX *xctx;
++
++    xctx = (CONTEXT_EX *)(context + 1);
++    xctx->Legacy.Length = sizeof(CONTEXT);
++    xctx->Legacy.Offset = -(LONG)sizeof(CONTEXT);
++    xctx->XState.Length = 0;
++    xctx->XState.Offset = (BYTE *)xstate_buffer - (BYTE *)xctx;
++    xctx->All.Length = sizeof(CONTEXT) + xctx->XState.Offset + xctx->XState.Length;
++    xctx->All.Offset = -(LONG)sizeof(CONTEXT);
++}
++
++
++/***********************************************************************
++ *           set_process_instrumentation_callback
++ */
++void set_process_instrumentation_callback( void *callback )
++{
++    if (callback) FIXME( "Not supported.\n" );
++}
++
++
++/***********************************************************************
++ *           syscall_frame_fixup_for_fastpath
++ *
++ * 修正系统调用帧，使调度器在 restore_flags 中设置了 CONTEXT_INTEGER 时
++ * 能走快速返回路径。
++ *
++ * 会覆盖帧中 gpr[12] 与 gpr[13] 的值。
++ */
++static void syscall_frame_fixup_for_fastpath( struct syscall_frame *frame )
++{
++    frame->gpr[12] = frame->pc;
++    frame->gpr[13] = frame->gpr[3];
++}
++
++/***********************************************************************
++ *           save_fpu
++ *
++ * 从 sigcontext 保存 FPU 上下文。
++ */
++static void save_fpu( CONTEXT *context, const ucontext_t *sigcontext )
++{
++    struct fpu_context *fpu;
++    unsigned int i;
++
++    if (!(SIGCONTEXT(sigcontext)->sc_flags & SC_USED_FP)) return;
++    if (!(fpu = (struct fpu_context *)get_extended_sigcontext( sigcontext, FPU_CTX_MAGIC ))) return;
++
++    context->ContextFlags |= CONTEXT_FLOATING_POINT;
++    for (i = 0; i < 32; i++) context->Fpr[i] = fpu->regs[i];
++    /* 内核把 8 个 FCC 各占一个字节保存在 fcc 中 */
++    for (i = 0; i < 8; i++) context->Fcc[i] = (fpu->fcc >> (i * 8)) & 1;
++    context->Fcsr = fpu->fcsr;
++}
++
++
++/***********************************************************************
++ *           restore_fpu
++ *
++ * 把 FPU 上下文恢复到 sigcontext。
++ */
++static void restore_fpu( const CONTEXT *context, ucontext_t *sigcontext )
++{
++    struct fpu_context *fpu;
++    ULONG64 fcc = 0;
++    unsigned int i;
++
++    if (!(SIGCONTEXT(sigcontext)->sc_flags & SC_USED_FP)) return;
++    if (!(fpu = (struct fpu_context *)get_extended_sigcontext( sigcontext, FPU_CTX_MAGIC ))) return;
++
++    for (i = 0; i < 32; i++) fpu->regs[i] = context->Fpr[i];
++    for (i = 0; i < 8; i++) fcc |= (ULONG64)(context->Fcc[i] & 1) << (i * 8);
++    fpu->fcc = fcc;
++    fpu->fcsr = context->Fcsr;
++}
++
++
++/***********************************************************************
++ *           save_context
++ *
++ * 从 sigcontext 取得寄存器值。
++ */
++static void save_context( CONTEXT *context, const ucontext_t *sigcontext )
++{
++    unsigned int i;
++
++    context->ContextFlags = CONTEXT_FULL;
++    for (i = 0; i < 32; i++) context->Gpr[i] = REGn_sig( i, sigcontext );
++    context->Pc = PC_sig( sigcontext );
++    save_fpu( context, sigcontext );
++}
++
++
++/***********************************************************************
++ *           restore_context
++ *
++ * 根据寄存器值构造 sigcontext。
++ */
++static void restore_context( const CONTEXT *context, ucontext_t *sigcontext )
++{
++    unsigned int i;
++
++    for (i = 0; i < 32; i++) REGn_sig( i, sigcontext ) = context->Gpr[i];
++    PC_sig( sigcontext ) = context->Pc;
++    restore_fpu( context, sigcontext );
++}
++
++
++/***********************************************************************
++ *           signal_set_full_context
++ */
++NTSTATUS signal_set_full_context( CONTEXT *context )
++{
++    struct syscall_frame *frame = get_syscall_frame();
++    NTSTATUS status = NtSetContextThread( GetCurrentThread(), context );
++
++    if (!status && (context->ContextFlags & CONTEXT_INTEGER) == CONTEXT_INTEGER)
++        frame->restore_flags |= CONTEXT_INTEGER;
++
++    return status;
++}
++
++
++/***********************************************************************
++ *              get_native_context
++ */
++void *get_native_context( CONTEXT *context )
++{
++    return context;
++}
++
++
++/***********************************************************************
++ *              get_wow_context
++ */
++void *get_wow_context( CONTEXT *context )
++{
++    return NULL;
++}
++
++
++/***********************************************************************
++ *              NtSetContextThread  (NTDLL.@)
++ *              ZwSetContextThread  (NTDLL.@)
++ */
++NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
++{
++    struct syscall_frame *frame = get_syscall_frame();
++    NTSTATUS ret = STATUS_SUCCESS;
++    BOOL self = (handle == GetCurrentThread());
++    DWORD flags = context->ContextFlags & ~CONTEXT_LOONGARCH64;
++
++    if (!self)
++    {
++        ret = set_thread_context( handle, context, &self, IMAGE_FILE_MACHINE_LOONGARCH64 );
++        if (ret || !self) return ret;
++    }
++
++    if (flags & CONTEXT_INTEGER)
++    {
++        frame->gpr[0] = context->Gpr[0];
++        /* 跳过 gpr[1] $ra、gpr[2] $tp、gpr[3] $sp */
++        memcpy( frame->gpr + 4, context->Gpr + 4, sizeof(context->Gpr[0]) * 17 );
++        /* 跳过 gpr[21] TEB、gpr[22] $fp */
++        memcpy( frame->gpr + 23, context->Gpr + 23, sizeof(context->Gpr[0]) * 9 );
++    }
++    if (flags & CONTEXT_CONTROL)
++    {
++        frame->gpr[1]  = context->Gpr[1];
++        frame->gpr[3]  = context->Gpr[3];
++        frame->gpr[22] = context->Gpr[22];
++        frame->pc      = context->Pc;
++    }
++    if (flags & CONTEXT_FLOATING_POINT)
++    {
++        memcpy( frame->fpr, context->Fpr, sizeof(frame->fpr) );
++        memcpy( frame->fcc, context->Fcc, sizeof(frame->fcc) );
++        frame->fcsr = context->Fcsr;
++    }
++    if (flags & CONTEXT_DEBUG_REGISTERS) FIXME( "debug registers not supported\n" );
++    frame->restore_flags |= flags & ~CONTEXT_INTEGER;
++    return STATUS_SUCCESS;
++}
++
++
++/***********************************************************************
++ *              NtGetContextThread  (NTDLL.@)
++ *              ZwGetContextThread  (NTDLL.@)
++ */
++NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
++{
++    struct syscall_frame *frame = get_syscall_frame();
++    DWORD needed_flags = context->ContextFlags & ~CONTEXT_LOONGARCH64;
++    BOOL self = (handle == GetCurrentThread());
++
++    if (!self)
++    {
++        NTSTATUS ret = get_thread_context( handle, context, &self, IMAGE_FILE_MACHINE_LOONGARCH64 );
++        if (ret || !self) return ret;
++    }
++
++    if (needed_flags & CONTEXT_INTEGER)
++    {
++        memcpy( context->Gpr, frame->gpr, sizeof(context->Gpr) );
++        context->ContextFlags |= CONTEXT_INTEGER;
++    }
++    if (needed_flags & CONTEXT_CONTROL)
++    {
++        context->Pc = frame->pc;
++        context->ContextFlags |= CONTEXT_CONTROL;
++    }
++    if (needed_flags & CONTEXT_FLOATING_POINT)
++    {
++        memcpy( context->Fpr, frame->fpr, sizeof(context->Fpr) );
++        memcpy( context->Fcc, frame->fcc, sizeof(context->Fcc) );
++        context->Fcsr = frame->fcsr;
++        context->ContextFlags |= CONTEXT_FLOATING_POINT;
++    }
++    if (needed_flags & CONTEXT_DEBUG_REGISTERS) FIXME( "debug registers not supported\n" );
++    set_context_exception_reporting_flags( &context->ContextFlags, CONTEXT_SERVICE_ACTIVE );
++    return STATUS_SUCCESS;
++}
++
++
++/***********************************************************************
++ *              set_thread_wow64_context
++ */
++NTSTATUS set_thread_wow64_context( HANDLE handle, const void *ctx, ULONG size )
++{
++    return STATUS_NOT_IMPLEMENTED;
++}
++
++
++/***********************************************************************
++ *              get_thread_wow64_context
++ */
++NTSTATUS get_thread_wow64_context( HANDLE handle, void *ctx, ULONG size )
++{
++    return STATUS_NOT_IMPLEMENTED;
++}
++
++
++/***********************************************************************
++ *           setup_raise_exception
++ */
++static void setup_raise_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec, CONTEXT *context )
++{
++    struct exc_stack_layout *stack;
++    void *stack_ptr = (void *)(SP_sig(sigcontext) & ~15);
++    NTSTATUS status;
++
++    status = send_debug_event( rec, context, TRUE, TRUE );
++    if (status == DBG_CONTINUE || status == DBG_EXCEPTION_HANDLED)
++    {
++        restore_context( context, sigcontext );
++        return;
++    }
++
++    /* 为 EXCEPTION_BREAKPOINT 修正 context 中的指令指针 */
++    if (rec->ExceptionCode == EXCEPTION_BREAKPOINT) context->Pc -= 4;
++
++    stack = virtual_setup_exception( stack_ptr, sizeof(*stack), rec );
++    stack->rec = *rec;
++    stack->context = *context;
++    context_init_empty_xstate( &stack->context, stack->redzone );
++    stack->sp = context->Gpr[3];
++    stack->pc = context->Pc;
++
++    SP_sig(sigcontext) = (ULONG_PTR)stack;
++    PC_sig(sigcontext) = (ULONG_PTR)pKiUserExceptionDispatcher;
++    REGn_sig(21, sigcontext) = (ULONG_PTR)NtCurrentTeb();
++}
++
++
++/***********************************************************************
++ *           setup_exception
++ *
++ * 建立异常记录并派发到用户模式。
++ */
++static void setup_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec )
++{
++    CONTEXT context;
++
++    rec->ExceptionAddress = (void *)PC_sig(sigcontext);
++    save_context( &context, sigcontext );
++    setup_raise_exception( sigcontext, rec, &context );
++}
++
++
++/***********************************************************************
++ *           call_user_apc_dispatcher
++ */
++NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_PTR arg1, ULONG_PTR arg2,
++                                   ULONG_PTR arg3, PNTAPCFUNC func, NTSTATUS status )
++{
++    struct syscall_frame *frame = get_syscall_frame();
++    ULONG64 sp = context ? context->Gpr[3] : frame->gpr[3];
++    struct apc_stack_layout *stack;
++
++    if (flags) FIXME( "flags %#x are not supported\n", flags );
++
++    sp &= ~15;
++    stack = (struct apc_stack_layout *)sp - 1;
++
++    if (context)
++    {
++        memmove( &stack->context, context, sizeof(stack->context) );
++        NtSetContextThread( GetCurrentThread(), &stack->context );
++    }
++    else
++    {
++        stack->context.ContextFlags = CONTEXT_FULL;
++        NtGetContextThread( GetCurrentThread(), &stack->context );
++        stack->context.Gpr[4] = status;
++    }
++    stack->func      = (ULONG64)func;
++    stack->args[0]   = arg1;
++    stack->args[1]   = arg2;
++    stack->args[2]   = arg3;
++    stack->alertable = TRUE;
++
++    frame->gpr[3] = (ULONG64)stack;
++    frame->pc = (ULONG64)pKiUserApcDispatcher;
++    frame->restore_flags |= CONTEXT_CONTROL;
++    syscall_frame_fixup_for_fastpath( frame );
++    return status;
++}
++
++
++/***********************************************************************
++ *           call_raise_user_exception_dispatcher
++ */
++void call_raise_user_exception_dispatcher(void)
++{
++    get_syscall_frame()->pc = (ULONG64)pKiRaiseUserExceptionDispatcher;
++}
++
++
++/***********************************************************************
++ *           call_user_exception_dispatcher
++ */
++NTSTATUS call_user_exception_dispatcher( EXCEPTION_RECORD *rec, CONTEXT *context )
++{
++    struct syscall_frame *frame = get_syscall_frame();
++    struct exc_stack_layout *stack;
++    NTSTATUS status = NtSetContextThread( GetCurrentThread(), context );
++
++    if (status) return status;
++    stack = (struct exc_stack_layout *)(context->Gpr[3] & ~15) - 1;
++    memmove( &stack->context, context, sizeof(*context) );
++    memmove( &stack->rec, rec, sizeof(*rec) );
++    context_init_empty_xstate( &stack->context, stack->redzone );
++    stack->sp = stack->context.Gpr[3];
++    stack->pc = stack->context.Pc;
++
++    frame->gpr[3] = (ULONG64)stack;
++    frame->pc = (ULONG64)pKiUserExceptionDispatcher;
++    frame->restore_flags |= CONTEXT_CONTROL;
++    syscall_frame_fixup_for_fastpath( frame );
++    return status;
++}
++
++
++/***********************************************************************
++ *           call_user_mode_callback
++ *
++ * 从内核栈切换到用户栈（用户栈上已经准备好 callback_stack_layout），
++ * 然后跳转到 KiUserCallbackDispatcher。
++ */
++extern NTSTATUS call_user_mode_callback( ULONG64 user_sp, void **ret_ptr, ULONG *ret_len,
++                                         void *func, TEB *teb );
++
++__ASM_GLOBAL_FUNC( call_user_mode_callback,
++                   "addi.d $sp, $sp, -0xd0\n\t"
++                   "st.d $fp, $sp, 0\n\t"
++                   "st.d $ra, $sp, 8\n\t"
++                   "move $fp, $sp\n\t"
++                   "st.d $s0, $fp, 0x10\n\t"
++                   "st.d $s1, $fp, 0x18\n\t"
++                   "st.d $s2, $fp, 0x20\n\t"
++                   "st.d $s3, $fp, 0x28\n\t"
++                   "st.d $s4, $fp, 0x30\n\t"
++                   "st.d $s5, $fp, 0x38\n\t"
++                   "st.d $s6, $fp, 0x40\n\t"
++                   "st.d $s7, $fp, 0x48\n\t"
++                   "st.d $s8, $fp, 0x50\n\t"
++                   "fst.d $f24, $fp, 0x58\n\t"
++                   "fst.d $f25, $fp, 0x60\n\t"
++                   "fst.d $f26, $fp, 0x68\n\t"
++                   "fst.d $f27, $fp, 0x70\n\t"
++                   "fst.d $f28, $fp, 0x78\n\t"
++                   "fst.d $f29, $fp, 0x80\n\t"
++                   "fst.d $f30, $fp, 0x88\n\t"
++                   "fst.d $f31, $fp, 0x90\n\t"
++                   "st.d $a1, $fp, 0x98\n\t"       /* ret_ptr */
++                   "st.d $a2, $fp, 0xa0\n\t"       /* ret_len */
++                   "move $r21, $a4\n\t"            /* teb */
++                   "movfcsr2gr $t0, $fcsr0\n\t"
++                   "st.w $t0, $fp, 0xb0\n\t"
++                   "ld.d $t0, $r21, 0\n\t"         /* teb->Tib.ExceptionList */
++                   "st.d $t0, $fp, 0xa8\n\t"
++                   "ld.d $t0, $r21, 0x378\n\t"     /* thread_data->syscall_frame */
++                   "addi.d $t1, $fp, -0x250\n\t"
++                   "st.d $t1, $r21, 0x378\n\t"
++                   "addi.d $t2, $fp, 0xd0\n\t"
++                   "st.d $t0, $t1, 0x240\n\t"      /* frame->prev_frame */
++                   "st.d $t2, $t1, 0x248\n\t"      /* frame->syscall_cfa */
++                   "ld.w $t3, $r21, 0x380\n\t"     /* thread_data->syscall_trace */
++                   "bnez $t3, 1f\n\t"
++                   "move $sp, $a0\n\t"
++                   "jirl $zero, $a3, 0\n"
++                   "1:\tmove $s0, $r21\n\t"
++                   "move $s1, $a0\n\t"
++                   "move $s2, $a3\n\t"
++                   "move $sp, $t1\n\t"
++                   "ld.d $a1, $s1, 0\n\t"          /* args */
++                   "ld.w $a2, $s1, 8\n\t"          /* len */
++                   "ld.w $a0, $s1, 0xc\n\t"        /* id */
++                   "st.w $a0, $fp, 0xb8\n\t"
++                   "bl " __ASM_NAME("trace_usercall") "\n\t"
++                   "move $r21, $s0\n\t"
++                   "move $sp, $s1\n\t"
++                   "jirl $zero, $s2, 0" )
++
++
++/***********************************************************************
++ *           user_mode_callback_return
++ *
++ * 用户回调返回：恢复 syscall 帧、TEB ExceptionList 与 FPU 控制字，
++ * 把返回值写回调用者，然后回到系统调用返回路径。
++ */
++extern void DECLSPEC_NORETURN user_mode_callback_return( void *ret_ptr, ULONG ret_len,
++                                                         NTSTATUS status, TEB *teb );
++
++__ASM_GLOBAL_FUNC( user_mode_callback_return,
++                   "ld.d $t0, $a3, 0x378\n\t"       /* thread_data->syscall_frame */
++                   "ld.d $t1, $t0, 0x240\n\t"      /* frame->prev_frame */
++                   "ld.d $fp, $t0, 0x248\n\t"      /* frame->syscall_cfa */
++                   "st.d $t1, $a3, 0x378\n\t"
++                   "addi.d $fp, $fp, -0xd0\n\t"
++                   "ld.d $t1, $fp, 0xa8\n\t"
++                   "st.d $t1, $a3, 0\n\t"           /* teb->Tib.ExceptionList */
++                   "ld.w $t1, $fp, 0xb0\n\t"
++                   "movgr2fcsr $fcsr0, $t1\n\t"
++                   "ld.d $t1, $fp, 0x98\n\t"
++                   "st.d $a0, $t1, 0\n\t"           /* *ret_ptr = 回调返回值 */
++                   "ld.d $t1, $fp, 0xa0\n\t"
++                   "st.w $a1, $t1, 0\n\t"           /* *ret_len */
++                   "ld.w $t1, $a3, 0x380\n\t"       /* thread_data->syscall_trace */
++                   "beqz $t1, 1f\n\t"
++                   "move $s0, $a2\n\t"              /* 保存 status */
++                   "ld.w $a3, $fp, 0xb8\n\t"        /* id */
++                   "bl " __ASM_NAME("trace_userret") "\n\t"
++                   "move $a2, $s0\n"
++                   "1:\tmove $a0, $a2\n\t"          /* status */
++                   "ld.d $s0, $fp, 0x10\n\t"
++                   "ld.d $s1, $fp, 0x18\n\t"
++                   "ld.d $s2, $fp, 0x20\n\t"
++                   "ld.d $s3, $fp, 0x28\n\t"
++                   "ld.d $s4, $fp, 0x30\n\t"
++                   "ld.d $s5, $fp, 0x38\n\t"
++                   "ld.d $s6, $fp, 0x40\n\t"
++                   "ld.d $s7, $fp, 0x48\n\t"
++                   "ld.d $s8, $fp, 0x50\n\t"
++                   "fld.d $f24, $fp, 0x58\n\t"
++                   "fld.d $f25, $fp, 0x60\n\t"
++                   "fld.d $f26, $fp, 0x68\n\t"
++                   "fld.d $f27, $fp, 0x70\n\t"
++                   "fld.d $f28, $fp, 0x78\n\t"
++                   "fld.d $f29, $fp, 0x80\n\t"
++                   "fld.d $f30, $fp, 0x88\n\t"
++                   "fld.d $f31, $fp, 0x90\n\t"
++                   "ld.d $ra, $fp, 8\n\t"
++                   "addi.d $t0, $fp, 0xd0\n\t"
++                   "ld.d $fp, $fp, 0\n\t"
++                   "move $sp, $t0\n\t"
++                   "jr $ra" )
++
++
++/***********************************************************************
++ *           KeUserModeCallback   (NTDLL.@)
++ */
++NTSTATUS WINAPI KeUserModeCallback( ULONG id, const void *args, ULONG len,
++                                    void **ret_ptr, ULONG *ret_len )
++{
++    struct syscall_frame *frame = get_syscall_frame();
++    ULONG64 sp = (frame->gpr[3] - offsetof( struct callback_stack_layout, args_data[len] ) - 16) & ~15;
++    struct callback_stack_layout *stack = (struct callback_stack_layout *)sp;
++    struct ntdll_thread_data *thread_data = ntdll_get_thread_data();
++
++    if ((char *)thread_data->kernel_stack + min_kernel_stack > (char *)&frame)
++        return STATUS_STACK_OVERFLOW;
++
++    stack->args = stack->args_data;
++    stack->len = len;
++    stack->id = id;
++    stack->lr = frame->gpr[1];
++    stack->sp = frame->gpr[3];
++    stack->pc = frame->pc;
++
++    memcpy( stack->args_data, args, len );
++    return call_user_mode_callback( sp, ret_ptr, ret_len, pKiUserCallbackDispatcher, NtCurrentTeb() );
++}
++
++
++/***********************************************************************
++ *           NtCallbackReturn   (NTDLL.@)
++ */
++NTSTATUS WINAPI NtCallbackReturn( void *ret_ptr, ULONG ret_len, NTSTATUS status )
++{
++    TRACE( "ret_ptr %p, ret_len %u, status %#lx\n", ret_ptr, ret_len, status );
++
++    if (!get_syscall_frame()->prev_frame) return STATUS_NO_CALLBACK_ACTIVE;
++    user_mode_callback_return( ret_ptr, ret_len, status, NtCurrentTeb() );
++}
++
++
++/***********************************************************************
++ *           user_mode_abort_thread
++ */
++extern void DECLSPEC_NORETURN user_mode_abort_thread( NTSTATUS status, struct syscall_frame *frame );
++
++__ASM_GLOBAL_FUNC( user_mode_abort_thread,
++                   "ld.d $a1, $a1, 0x248\n\t"       /* frame->syscall_cfa */
++                   "addi.d $sp, $a1, -0xd0\n\t"
++                   "move $fp, $sp\n\t"
++                   "bl " __ASM_NAME("abort_thread") )
++
++
++/***********************************************************************
++ *           handle_syscall_fault
++ *
++ * 处理系统调用执行期间发生的异常。
++ */
++static BOOL handle_syscall_fault( ucontext_t *context, EXCEPTION_RECORD *rec )
++{
++    struct syscall_frame *frame = get_syscall_frame();
++    DWORD i;
++
++    if (!is_inside_syscall( SP_sig(context) )) return FALSE;
++
++    TRACE( "code=%x flags=%x addr=%p pc=%p tid=%04x\n",
++           rec->ExceptionCode, rec->ExceptionFlags, rec->ExceptionAddress,
++           (void *)PC_sig(context), GetCurrentThreadId() );
++    for (i = 0; i < rec->NumberParameters; i++)
++        TRACE( " info[%d]=%016lx\n", i, rec->ExceptionInformation[i] );
++
++    if (ntdll_get_thread_data()->jmp_buf)
++    {
++        TRACE( "returning to handler\n" );
++        REGn_sig(4, context) = (ULONG_PTR)ntdll_get_thread_data()->jmp_buf;
++        REGn_sig(5, context) = 1;
++        PC_sig(context)      = (ULONG_PTR)longjmp;
++        ntdll_get_thread_data()->jmp_buf = NULL;
++    }
++    else
++    {
++        TRACE( "returning to user mode ip=%p ret=%08x\n", (void *)frame->pc, rec->ExceptionCode );
++        REGn_sig(4, context)  = rec->ExceptionCode;
++        REGn_sig(21, context) = (ULONG_PTR)NtCurrentTeb();
++        SP_sig(context)       = (ULONG_PTR)frame;
++        PC_sig(context)       = (ULONG_PTR)__wine_syscall_dispatcher_return;
++    }
++    return TRUE;
++}
++
++
++/**********************************************************************
++ *		segv_handler
++ *
++ * SIGSEGV 处理。
++ */
++static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
++{
++    EXCEPTION_RECORD rec = { 0 };
++    ucontext_t *context = sigcontext;
++    DWORD flags = SIGCONTEXT(context)->sc_flags;
++
++    rec.NumberParameters = 2;
++    if (flags & SC_ADDRERR_WR)
++        rec.ExceptionInformation[0] = EXCEPTION_WRITE_FAULT;
++    else if (flags & SC_ADDRERR_RD)
++        rec.ExceptionInformation[0] = EXCEPTION_READ_FAULT;
++    else
++        rec.ExceptionInformation[0] = EXCEPTION_EXECUTE_FAULT;
++    rec.ExceptionInformation[1] = (ULONG_PTR)siginfo->si_addr;
++    if (!virtual_handle_fault( &rec, (void *)SP_sig(context) )) return;
++    if (handle_syscall_fault( context, &rec )) return;
++    setup_exception( context, &rec );
++}
++
++
++/**********************************************************************
++ *		ill_handler
++ *
++ * SIGILL 处理。
++ */
++static void ill_handler( int signal, siginfo_t *siginfo, void *sigcontext )
++{
++    EXCEPTION_RECORD rec = { EXCEPTION_ILLEGAL_INSTRUCTION };
++
++    setup_exception( sigcontext, &rec );
++}
++
++
++/**********************************************************************
++ *		bus_handler
++ *
++ * SIGBUS 处理。
++ */
++static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
++{
++    EXCEPTION_RECORD rec = { EXCEPTION_DATATYPE_MISALIGNMENT };
++
++    setup_exception( sigcontext, &rec );
++}
++
++
++/**********************************************************************
++ *		trap_handler
++ *
++ * SIGTRAP 处理。
++ */
++static void trap_handler( int signal, siginfo_t *siginfo, void *sigcontext )
++{
++    EXCEPTION_RECORD rec = { 0 };
++    ucontext_t *context = sigcontext;
++    CONTEXT ctx;
++
++    rec.ExceptionAddress = (void *)PC_sig(context);
++    save_context( &ctx, sigcontext );
++
++    switch (siginfo->si_code)
++    {
++    case TRAP_TRACE:
++        rec.ExceptionCode = EXCEPTION_SINGLE_STEP;
++        break;
++    case TRAP_BRKPT:
++    {
++        ULONG imm = (*(ULONG *)PC_sig( context )) & 0xffff;
++        switch (imm)
++        {
++        case 0x7000:  /* 断点 */
++            ctx.Pc += 4;  /* 跳过 break 指令 */
++            rec.ExceptionCode = EXCEPTION_BREAKPOINT;
++            rec.NumberParameters = 1;
++            break;
++        case 0x7001:  /* 断言失败 */
++            rec.ExceptionCode = STATUS_ASSERTION_FAILURE;
++            break;
++        case 0x7003:  /* 栈溢出 */
++            rec.ExceptionCode = STATUS_STACK_BUFFER_OVERRUN;
++            rec.ExceptionFlags = EXCEPTION_NONCONTINUABLE;
++            rec.NumberParameters = 1;
++            rec.ExceptionInformation[0] = ctx.Gpr[4];
++            NtRaiseException( &rec, &ctx, FALSE );
++            break;
++        case 0x7004:  /* 整除零 */
++            rec.ExceptionCode = EXCEPTION_INT_DIVIDE_BY_ZERO;
++            break;
++        default:
++            rec.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
++            break;
++        }
++        break;
++    }
++    default:
++        rec.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
++        break;
++    }
++
++    setup_raise_exception( sigcontext, &rec, &ctx );
++}
++
++
++/**********************************************************************
++ *		fpe_handler
++ *
++ * SIGFPE 处理。
++ */
++static void fpe_handler( int signal, siginfo_t *siginfo, void *sigcontext )
++{
++    EXCEPTION_RECORD rec = { 0 };
++
++    switch (siginfo->si_code & 0xffff )
++    {
++#ifdef FPE_FLTSUB
++    case FPE_FLTSUB:
++        rec.ExceptionCode = EXCEPTION_ARRAY_BOUNDS_EXCEEDED;
++        break;
++#endif
++#ifdef FPE_INTDIV
++    case FPE_INTDIV:
++        rec.ExceptionCode = EXCEPTION_INT_DIVIDE_BY_ZERO;
++        break;
++#endif
++#ifdef FPE_INTOVF
++    case FPE_INTOVF:
++        rec.ExceptionCode = EXCEPTION_INT_OVERFLOW;
++        break;
++#endif
++#ifdef FPE_FLTDIV
++    case FPE_FLTDIV:
++        rec.ExceptionCode = EXCEPTION_FLT_DIVIDE_BY_ZERO;
++        break;
++#endif
++#ifdef FPE_FLTOVF
++    case FPE_FLTOVF:
++        rec.ExceptionCode = EXCEPTION_FLT_OVERFLOW;
++        break;
++#endif
++#ifdef FPE_FLTUND
++    case FPE_FLTUND:
++        rec.ExceptionCode = EXCEPTION_FLT_UNDERFLOW;
++        break;
++#endif
++#ifdef FPE_FLTRES
++    case FPE_FLTRES:
++        rec.ExceptionCode = EXCEPTION_FLT_INEXACT_RESULT;
++        break;
++#endif
++#ifdef FPE_FLTINV
++    case FPE_FLTINV:
++#endif
++    default:
++        rec.ExceptionCode = EXCEPTION_FLT_INVALID_OPERATION;
++        break;
++    }
++    setup_exception( sigcontext, &rec );
++}
++
++
++/**********************************************************************
++ *		int_handler
++ *
++ * SIGINT 处理。
++ */
++static void int_handler( int signal, siginfo_t *siginfo, void *sigcontext )
++{
++    HANDLE handle;
++
++    if (!p__wine_ctrl_routine) return;
++    if (!NtCreateThreadEx( &handle, THREAD_ALL_ACCESS, NULL, NtCurrentProcess(),
++                           p__wine_ctrl_routine, 0 /* CTRL_C_EVENT */, 0, 0, 0, 0, NULL ))
++        NtClose( handle );
++}
++
++
++/**********************************************************************
++ *		abrt_handler
++ *
++ * SIGABRT 处理。
++ */
++static void abrt_handler( int signal, siginfo_t *siginfo, void *sigcontext )
++{
++    EXCEPTION_RECORD rec = { EXCEPTION_WINE_ASSERTION, EXCEPTION_NONCONTINUABLE };
++
++    setup_exception( sigcontext, &rec );
++}
++
++
++/**********************************************************************
++ *		quit_handler
++ *
++ * SIGQUIT 处理。
++ */
++static void quit_handler( int signal, siginfo_t *siginfo, void *sigcontext )
++{
++    ucontext_t *context = sigcontext;
++
++    if (!is_inside_syscall( SP_sig(context) )) user_mode_abort_thread( 0, get_syscall_frame() );
++    abort_thread(0);
++}
++
++
++/**********************************************************************
++ *		usr1_handler
++ *
++ * SIGUSR1 处理，用于通知线程它被挂起。
++ */
++static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
++{
++    ucontext_t *ucontext = sigcontext;
++    CONTEXT context;
++
++    if (is_inside_syscall( SP_sig(ucontext) ))
++    {
++        context.ContextFlags = CONTEXT_FULL | CONTEXT_EXCEPTION_REQUEST;
++        NtGetContextThread( GetCurrentThread(), &context );
++        wait_suspend( &context );
++        NtSetContextThread( GetCurrentThread(), &context );
++    }
++    else
++    {
++        save_context( &context, ucontext );
++        context.ContextFlags |= CONTEXT_EXCEPTION_REPORTING;
++        wait_suspend( &context );
++        restore_context( &context, ucontext );
++    }
++}
++
++
++/**********************************************************************
++ *		usr2_handler
++ *
++ * SIGUSR2 处理，用于设置线程上下文。
++ */
++static void usr2_handler( int signal, siginfo_t *siginfo, void *sigcontext )
++{
++    struct syscall_frame *frame = get_syscall_frame();
++    ucontext_t *context = sigcontext;
++    struct fpu_context *fpu;
++    ULONG64 fcc = 0;
++    unsigned int i;
++
++    if (!is_inside_syscall( SP_sig(context) )) return;
++
++    PC_sig(context) = frame->pc;
++    for (i = 0; i < 32; i++) REGn_sig( i, context ) = frame->gpr[i];
++
++    if (!(SIGCONTEXT(context)->sc_flags & SC_USED_FP)) return;
++    if (!(fpu = (struct fpu_context *)get_extended_sigcontext( context, FPU_CTX_MAGIC ))) return;
++
++    for (i = 0; i < 32; i++) fpu->regs[i] = frame->fpr[i];
++    for (i = 0; i < 8; i++) fcc |= (ULONG64)(frame->fcc[i] & 1) << (i * 8);
++    fpu->fcc = fcc;
++    fpu->fcsr = frame->fcsr;
++}
++
++
++/**********************************************************************
++ *           get_thread_ldt_entry
++ */
++NTSTATUS get_thread_ldt_entry( HANDLE handle, void *data, ULONG len, ULONG *ret_len )
++{
++    return STATUS_NOT_IMPLEMENTED;
++}
++
++
++/******************************************************************************
++ *           NtSetLdtEntries   (NTDLL.@)
++ *           ZwSetLdtEntries   (NTDLL.@)
++ */
++NTSTATUS WINAPI NtSetLdtEntries( ULONG sel1, LDT_ENTRY entry1, ULONG sel2, LDT_ENTRY entry2 )
++{
++    return STATUS_NOT_IMPLEMENTED;
++}
++
++
++/**********************************************************************
++ *             signal_init_threading
++ */
++void signal_init_threading(void)
++{
++}
++
++
++/**********************************************************************
++ *             signal_alloc_thread
++ */
++NTSTATUS signal_alloc_thread( TEB *teb )
++{
++    return STATUS_SUCCESS;
++}
++
++
++/**********************************************************************
++ *             signal_free_thread
++ */
++void signal_free_thread( TEB *teb )
++{
++}
++
++
++/**********************************************************************
++ *		signal_init_process
++ */
++void signal_init_process(void)
++{
++    struct sigaction sig_act;
++    struct ntdll_thread_data *thread_data = ntdll_get_thread_data();
++    void *kernel_stack = (char *)thread_data->kernel_stack + kernel_stack_size;
++
++    thread_data->syscall_frame = (struct syscall_frame *)kernel_stack - 1;
++
++    sig_act.sa_mask = server_block_set;
++    sig_act.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
++
++    sig_act.sa_sigaction = int_handler;
++    if (sigaction( SIGINT, &sig_act, NULL ) == -1) goto error;
++    sig_act.sa_sigaction = fpe_handler;
++    if (sigaction( SIGFPE, &sig_act, NULL ) == -1) goto error;
++    sig_act.sa_sigaction = abrt_handler;
++    if (sigaction( SIGABRT, &sig_act, NULL ) == -1) goto error;
++    sig_act.sa_sigaction = quit_handler;
++    if (sigaction( SIGQUIT, &sig_act, NULL ) == -1) goto error;
++    sig_act.sa_sigaction = usr1_handler;
++    if (sigaction( SIGUSR1, &sig_act, NULL ) == -1) goto error;
++    sig_act.sa_sigaction = usr2_handler;
++    if (sigaction( SIGUSR2, &sig_act, NULL ) == -1) goto error;
++    sig_act.sa_sigaction = trap_handler;
++    if (sigaction( SIGTRAP, &sig_act, NULL ) == -1) goto error;
++    sig_act.sa_sigaction = segv_handler;
++    if (sigaction( SIGSEGV, &sig_act, NULL ) == -1) goto error;
++    sig_act.sa_sigaction = ill_handler;
++    if (sigaction( SIGILL, &sig_act, NULL ) == -1) goto error;
++    sig_act.sa_sigaction = bus_handler;
++    if (sigaction( SIGBUS, &sig_act, NULL ) == -1) goto error;
++    return;
++
++ error:
++    perror("sigaction");
++    exit(1);
++}
++
++
++/***********************************************************************
++ *           syscall_dispatcher_return_slowpath
++ */
++void syscall_dispatcher_return_slowpath(void)
++{
++    raise( SIGUSR2 );
++}
++
++/***********************************************************************
++ *           init_syscall_frame
++ */
++void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, TEB *teb )
++{
++    struct syscall_frame *frame = ((struct ntdll_thread_data *)&teb->GdiTebBatch)->syscall_frame;
++    CONTEXT *ctx, context = { CONTEXT_ALL };
++
++    context.Gpr[4]  = (ULONG64)entry;
++    context.Gpr[5]  = (ULONG64)arg;
++    context.Gpr[21] = (ULONG64)teb;
++    context.Gpr[3]  = (ULONG64)teb->Tib.StackBase;
++    context.Pc      = (ULONG64)pRtlUserThreadStart;
++
++    if (suspend)
++    {
++        context.ContextFlags |= CONTEXT_EXCEPTION_REPORTING | CONTEXT_EXCEPTION_ACTIVE;
++        wait_suspend( &context );
++    }
++
++    ctx = (CONTEXT *)((context.Gpr[3] & ~15)) - 1;
++    *ctx = context;
++    ctx->ContextFlags = CONTEXT_FULL;
++    signal_set_full_context( ctx );
++
++    frame->gpr[3]  = (ULONG64)ctx;
++    frame->pc      = (ULONG64)pLdrInitializeThunk;
++    frame->gpr[4]  = (ULONG64)ctx;
++    frame->gpr[21] = (ULONG64)teb;
++    syscall_frame_fixup_for_fastpath( frame );
++
++    pthread_sigmask( SIG_UNBLOCK, &server_block_set, NULL );
++}
++
++
++/***********************************************************************
++ *           signal_start_thread
++ */
++__ASM_GLOBAL_FUNC( signal_start_thread,
++                   "addi.d $sp, $sp, -0xd0\n\t"
++                   "st.d $fp, $sp, 0\n\t"
++                   "st.d $ra, $sp, 8\n\t"
++                   "move $fp, $sp\n\t"
++                   "st.d $s0, $fp, 0x10\n\t"
++                   "st.d $s1, $fp, 0x18\n\t"
++                   "st.d $s2, $fp, 0x20\n\t"
++                   "st.d $s3, $fp, 0x28\n\t"
++                   "st.d $s4, $fp, 0x30\n\t"
++                   "st.d $s5, $fp, 0x38\n\t"
++                   "st.d $s6, $fp, 0x40\n\t"
++                   "st.d $s7, $fp, 0x48\n\t"
++                   "st.d $s8, $fp, 0x50\n\t"
++                   "addi.d $t0, $fp, 0xd0\n\t"     /* syscall_cfa */
++                   "move $r21, $a3\n\t"            /* teb */
++                   /* 设置系统调用帧 */
++                   "ld.d $t1, $r21, 0x378\n\t"     /* thread_data->syscall_frame */
++                   "bnez $t1, 1f\n\t"
++                   "addi.d $t1, $sp, -0x250\n\t"   /* sizeof(struct syscall_frame) */
++                   "st.d $t1, $r21, 0x378\n\t"     /* thread_data->syscall_frame */
++                   "1:\tst.w $zero, $t1, 0x234\n\t" /* frame->restore_flags */
++                   "st.d $zero, $t1, 0x240\n\t"    /* frame->prev_frame */
++                   "st.d $t0, $t1, 0x248\n\t"      /* frame->syscall_cfa */
++                   /* 切换到内核栈 */
++                   "move $sp, $t1\n\t"
++                   "bl " __ASM_NAME("init_syscall_frame") "\n\t"
++                   "b " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") )
++
++
++/***********************************************************************
++ *           __wine_syscall_dispatcher
++ *
++ * 系统调用调度器：$t8 为系统调用号，$t7 为调用者的 $ra，
++ * 入口处的 $ra 是 stub 内 jirl 的返回地址。
++ */
++__ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
++                   "ld.d $t0, $r21, 0x378\n\t"     /* thread_data->syscall_frame */
++                   /* 保存通用寄存器；gpr[12]/gpr[13] 是快速路径哨兵，不能保存 */
++                   "st.d $ra,  $t0, 0x108\n\t"     /* frame->pc */
++                   "st.d $t7,  $t0, 0x10\n\t"      /* frame->gpr[1] */
++                   "st.d $tp,  $t0, 0x18\n\t"      /* frame->gpr[2] */
++                   "st.d $sp,  $t0, 0x20\n\t"      /* frame->gpr[3] */
++                   "st.d $a0,  $t0, 0x28\n\t"
++                   "st.d $a1,  $t0, 0x30\n\t"
++                   "st.d $a2,  $t0, 0x38\n\t"
++                   "st.d $a3,  $t0, 0x40\n\t"
++                   "st.d $a4,  $t0, 0x48\n\t"
++                   "st.d $a5,  $t0, 0x50\n\t"
++                   "st.d $a6,  $t0, 0x58\n\t"
++                   "st.d $a7,  $t0, 0x60\n\t"
++                   "st.d $t2,  $t0, 0x78\n\t"
++                   "st.d $t3,  $t0, 0x80\n\t"
++                   "st.d $t4,  $t0, 0x88\n\t"
++                   "st.d $t5,  $t0, 0x90\n\t"
++                   "st.d $t6,  $t0, 0x98\n\t"
++                   "st.d $t7,  $t0, 0xa0\n\t"
++                   "st.d $t8,  $t0, 0xa8\n\t"
++                   "st.d $r21, $t0, 0xb0\n\t"
++                   "st.d $fp,  $t0, 0xb8\n\t"
++                   "st.d $s0,  $t0, 0xc0\n\t"
++                   "st.d $s1,  $t0, 0xc8\n\t"
++                   "st.d $s2,  $t0, 0xd0\n\t"
++                   "st.d $s3,  $t0, 0xd8\n\t"
++                   "st.d $s4,  $t0, 0xe0\n\t"
++                   "st.d $s5,  $t0, 0xe8\n\t"
++                   "st.d $s6,  $t0, 0xf0\n\t"
++                   "st.d $s7,  $t0, 0xf8\n\t"
++                   "st.d $s8,  $t0, 0x100\n\t"
++                   "st.w $t8,  $t0, 0x238\n\t"     /* frame->syscall_id */
++                   /* 保存浮点寄存器 */
++                   "fst.d $f0,  $t0, 0x110\n\t"
++                   "fst.d $f1,  $t0, 0x118\n\t"
++                   "fst.d $f2,  $t0, 0x120\n\t"
++                   "fst.d $f3,  $t0, 0x128\n\t"
++                   "fst.d $f4,  $t0, 0x130\n\t"
++                   "fst.d $f5,  $t0, 0x138\n\t"
++                   "fst.d $f6,  $t0, 0x140\n\t"
++                   "fst.d $f7,  $t0, 0x148\n\t"
++                   "fst.d $f8,  $t0, 0x150\n\t"
++                   "fst.d $f9,  $t0, 0x158\n\t"
++                   "fst.d $f10, $t0, 0x160\n\t"
++                   "fst.d $f11, $t0, 0x168\n\t"
++                   "fst.d $f12, $t0, 0x170\n\t"
++                   "fst.d $f13, $t0, 0x178\n\t"
++                   "fst.d $f14, $t0, 0x180\n\t"
++                   "fst.d $f15, $t0, 0x188\n\t"
++                   "fst.d $f16, $t0, 0x190\n\t"
++                   "fst.d $f17, $t0, 0x198\n\t"
++                   "fst.d $f18, $t0, 0x1a0\n\t"
++                   "fst.d $f19, $t0, 0x1a8\n\t"
++                   "fst.d $f20, $t0, 0x1b0\n\t"
++                   "fst.d $f21, $t0, 0x1b8\n\t"
++                   "fst.d $f22, $t0, 0x1c0\n\t"
++                   "fst.d $f23, $t0, 0x1c8\n\t"
++                   "fst.d $f24, $t0, 0x1d0\n\t"
++                   "fst.d $f25, $t0, 0x1d8\n\t"
++                   "fst.d $f26, $t0, 0x1e0\n\t"
++                   "fst.d $f27, $t0, 0x1e8\n\t"
++                   "fst.d $f28, $t0, 0x1f0\n\t"
++                   "fst.d $f29, $t0, 0x1f8\n\t"
++                   "fst.d $f30, $t0, 0x200\n\t"
++                   "fst.d $f31, $t0, 0x208\n\t"
++                   "movcf2gr $t1, $fcc0\n\t"
++                   "st.w $t1, $t0, 0x210\n\t"
++                   "movcf2gr $t1, $fcc1\n\t"
++                   "st.w $t1, $t0, 0x214\n\t"
++                   "movcf2gr $t1, $fcc2\n\t"
++                   "st.w $t1, $t0, 0x218\n\t"
++                   "movcf2gr $t1, $fcc3\n\t"
++                   "st.w $t1, $t0, 0x21c\n\t"
++                   "movcf2gr $t1, $fcc4\n\t"
++                   "st.w $t1, $t0, 0x220\n\t"
++                   "movcf2gr $t1, $fcc5\n\t"
++                   "st.w $t1, $t0, 0x224\n\t"
++                   "movcf2gr $t1, $fcc6\n\t"
++                   "st.w $t1, $t0, 0x228\n\t"
++                   "movcf2gr $t1, $fcc7\n\t"
++                   "st.w $t1, $t0, 0x22c\n\t"
++                   "movfcsr2gr $t1, $fcsr0\n\t"
++                   "st.w $t1, $t0, 0x230\n\t"
++                   "move $fp, $t0\n\t"
++                   /* 切换到内核栈 */
++                   "move $sp, $t0\n\t"
++                   /* 解码系统调用号 */
++                   "andi $s0, $t8, 0xfff\n\t"      /* syscall number */
++                   "srli.d $t1, $t8, 12\n\t"
++                   "andi $t1, $t1, 3\n\t"          /* syscall table number */
++                   "slli.d $t1, $t1, 5\n\t"
++                   "ld.d $s1, $r21, 0x370\n\t"     /* thread_data->syscall_table */
++                   "add.d $s1, $s1, $t1\n\t"
++                   "ld.d $t1, $s1, 16\n\t"         /* table->ServiceLimit */
++                   "bgeu $s0, $t1, " __ASM_LOCAL_LABEL("syscall_bad") "\n\t"
++                   "ld.d $t1, $s1, 24\n\t"         /* table->ArgumentTable */
++                   "add.d $t1, $t1, $s0\n\t"
++                   "ld.bu $t1, $t1, 0\n\t"
++                   "addi.d $t1, $t1, -64\n\t"
++                   "bge $zero, $t1, " __ASM_LOCAL_LABEL("syscall_noargs") "\n\t"
++                   /* 把栈参数从用户栈拷贝到内核栈 */
++                   "ld.d $t3, $sp, 0x20\n\t"       /* 用户栈指针 */
++                   "sub.d $sp, $sp, $t1\n\t"
++                   "andi $t2, $t1, 8\n\t"
++                   "beqz $t2, 1f\n\t"
++                   "addi.d $sp, $sp, -8\n"
++                   "1:\taddi.d $t1, $t1, -8\n\t"
++                   "add.d $t2, $t3, $t1\n\t"
++                   "ld.d $t2, $t2, 0\n\t"
++                   "add.d $t4, $sp, $t1\n\t"
++                   "st.d $t2, $t4, 0\n\t"
++                   "bnez $t1, 1b\n"
++                   __ASM_LOCAL_LABEL("syscall_noargs") ":\n\t"
++                   "ld.d $t2, $s1, 0\n\t"          /* table->ServiceTable */
++                   "slli.d $t1, $s0, 3\n\t"
++                   "add.d $t1, $t2, $t1\n\t"
++                   "ld.d $s2, $t1, 0\n\t"          /* 系统调用函数 */
++                   "ld.w $t1, $r21, 0x380\n\t"     /* thread_data->syscall_trace */
++                   "bnez $t1, " __ASM_LOCAL_LABEL("syscall_trace") "\n\t"
++                   "jirl $ra, $s2, 0\n\t"
++                   "move $sp, $fp\n"
++                   __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return") ":\n\t"
++                   __ASM_LOCAL_LABEL("syscall_return") ":\n\t"
++                   "ld.w $t0, $sp, 0x234\n\t"      /* frame->restore_flags */
++                   "andi $t0, $t0, 2\n\t"          /* CONTEXT_INTEGER */
++                   "beqz $t0, " __ASM_LOCAL_LABEL("syscall_fp_check") "\n\t"
++                   "ld.d $t1, $sp, 0x68\n\t"       /* frame->gpr[12] */
++                   "ld.d $t2, $sp, 0x108\n\t"      /* frame->pc */
++                   "bne $t1, $t2, " __ASM_LOCAL_LABEL("syscall_slowpath") "\n\t"
++                   "ld.d $t1, $sp, 0x70\n\t"       /* frame->gpr[13] */
++                   "ld.d $t2, $sp, 0x20\n\t"       /* frame->gpr[3] */
++                   "bne $t1, $t2, " __ASM_LOCAL_LABEL("syscall_slowpath") "\n\t"
++                   "b " __ASM_LOCAL_LABEL("syscall_int_restore") "\n"
++                   __ASM_LOCAL_LABEL("syscall_slowpath") ":\n\t"
++                   "bl " __ASM_NAME("syscall_dispatcher_return_slowpath") "\n"
++                   __ASM_LOCAL_LABEL("syscall_int_restore") ":\n\t"
++                   "ld.d $a0, $sp, 0x28\n\t"
++                   "ld.d $a1, $sp, 0x30\n\t"
++                   "ld.d $a2, $sp, 0x38\n\t"
++                   "ld.d $a3, $sp, 0x40\n\t"
++                   "ld.d $a4, $sp, 0x48\n\t"
++                   "ld.d $a5, $sp, 0x50\n\t"
++                   "ld.d $a6, $sp, 0x58\n\t"
++                   "ld.d $a7, $sp, 0x60\n\t"
++                   "ld.d $t2, $sp, 0x78\n\t"
++                   "ld.d $t3, $sp, 0x80\n\t"
++                   "ld.d $t4, $sp, 0x88\n\t"
++                   "ld.d $t5, $sp, 0x90\n\t"
++                   "ld.d $t6, $sp, 0x98\n\t"
++                   "ld.d $t7, $sp, 0xa0\n\t"
++                   "ld.d $t8, $sp, 0xa8\n"
++                   __ASM_LOCAL_LABEL("syscall_fp_check") ":\n\t"
++                   "ld.w $t0, $sp, 0x234\n\t"      /* frame->restore_flags */
++                   "andi $t0, $t0, 4\n\t"          /* CONTEXT_FLOATING_POINT */
++                   "beqz $t0, " __ASM_LOCAL_LABEL("syscall_callee") "\n\t"
++                   "fld.d $f0,  $sp, 0x110\n\t"
++                   "fld.d $f1,  $sp, 0x118\n\t"
++                   "fld.d $f2,  $sp, 0x120\n\t"
++                   "fld.d $f3,  $sp, 0x128\n\t"
++                   "fld.d $f4,  $sp, 0x130\n\t"
++                   "fld.d $f5,  $sp, 0x138\n\t"
++                   "fld.d $f6,  $sp, 0x140\n\t"
++                   "fld.d $f7,  $sp, 0x148\n\t"
++                   "fld.d $f8,  $sp, 0x150\n\t"
++                   "fld.d $f9,  $sp, 0x158\n\t"
++                   "fld.d $f10, $sp, 0x160\n\t"
++                   "fld.d $f11, $sp, 0x168\n\t"
++                   "fld.d $f12, $sp, 0x170\n\t"
++                   "fld.d $f13, $sp, 0x178\n\t"
++                   "fld.d $f14, $sp, 0x180\n\t"
++                   "fld.d $f15, $sp, 0x188\n\t"
++                   "fld.d $f16, $sp, 0x190\n\t"
++                   "fld.d $f17, $sp, 0x198\n\t"
++                   "fld.d $f18, $sp, 0x1a0\n\t"
++                   "fld.d $f19, $sp, 0x1a8\n\t"
++                   "fld.d $f20, $sp, 0x1b0\n\t"
++                   "fld.d $f21, $sp, 0x1b8\n\t"
++                   "fld.d $f22, $sp, 0x1c0\n\t"
++                   "fld.d $f23, $sp, 0x1c8\n\t"
++                   "fld.d $f24, $sp, 0x1d0\n\t"
++                   "fld.d $f25, $sp, 0x1d8\n\t"
++                   "fld.d $f26, $sp, 0x1e0\n\t"
++                   "fld.d $f27, $sp, 0x1e8\n\t"
++                   "fld.d $f28, $sp, 0x1f0\n\t"
++                   "fld.d $f29, $sp, 0x1f8\n\t"
++                   "fld.d $f30, $sp, 0x200\n\t"
++                   "fld.d $f31, $sp, 0x208\n\t"
++                   "ld.w $t1, $sp, 0x210\n\t"
++                   "movgr2cf $fcc0, $t1\n\t"
++                   "ld.w $t1, $sp, 0x214\n\t"
++                   "movgr2cf $fcc1, $t1\n\t"
++                   "ld.w $t1, $sp, 0x218\n\t"
++                   "movgr2cf $fcc2, $t1\n\t"
++                   "ld.w $t1, $sp, 0x21c\n\t"
++                   "movgr2cf $fcc3, $t1\n\t"
++                   "ld.w $t1, $sp, 0x220\n\t"
++                   "movgr2cf $fcc4, $t1\n\t"
++                   "ld.w $t1, $sp, 0x224\n\t"
++                   "movgr2cf $fcc5, $t1\n\t"
++                   "ld.w $t1, $sp, 0x228\n\t"
++                   "movgr2cf $fcc6, $t1\n\t"
++                   "ld.w $t1, $sp, 0x22c\n\t"
++                   "movgr2cf $fcc7, $t1\n\t"
++                   "ld.w $t1, $sp, 0x230\n\t"
++                   "movgr2fcsr $fcsr0, $t1\n"
++                   __ASM_LOCAL_LABEL("syscall_callee") ":\n\t"
++                   "ld.d $tp,  $sp, 0x18\n\t"
++                   "ld.d $r21, $sp, 0xb0\n\t"
++                   "ld.d $s0,  $sp, 0xc0\n\t"
++                   "ld.d $s1,  $sp, 0xc8\n\t"
++                   "ld.d $s2,  $sp, 0xd0\n\t"
++                   "ld.d $s3,  $sp, 0xd8\n\t"
++                   "ld.d $s4,  $sp, 0xe0\n\t"
++                   "ld.d $s5,  $sp, 0xe8\n\t"
++                   "ld.d $s6,  $sp, 0xf0\n\t"
++                   "ld.d $s7,  $sp, 0xf8\n\t"
++                   "ld.d $s8,  $sp, 0x100\n\t"
++                   "ld.d $t0,  $sp, 0x20\n\t"      /* 用户栈 */
++                   "ld.d $t1,  $sp, 0x108\n\t"     /* pc */
++                   "ld.d $ra,  $sp, 0x10\n\t"
++                   "ld.d $fp,  $sp, 0xb8\n\t"
++                   "move $sp, $t0\n\t"
++                   "jr $t1\n"
++                   /* 系统调用跟踪 */
++                   __ASM_LOCAL_LABEL("syscall_trace") ":\n\t"
++                   "addi.d $sp, $sp, -0x40\n\t"
++                   "st.d $a0, $sp, 0\n\t"
++                   "st.d $a1, $sp, 8\n\t"
++                   "st.d $a2, $sp, 0x10\n\t"
++                   "st.d $a3, $sp, 0x18\n\t"
++                   "st.d $a4, $sp, 0x20\n\t"
++                   "st.d $a5, $sp, 0x28\n\t"
++                   "st.d $a6, $sp, 0x30\n\t"
++                   "st.d $a7, $sp, 0x38\n\t"
++                   "ld.w $a0, $fp, 0x238\n\t"      /* id */
++                   "move $a1, $sp\n\t"             /* args */
++                   "ld.d $t1, $s1, 24\n\t"         /* table->ArgumentTable */
++                   "add.d $t1, $t1, $s0\n\t"
++                   "ld.bu $a2, $t1, 0\n\t"         /* len */
++                   "bl " __ASM_NAME("trace_syscall") "\n\t"
++                   "ld.d $a0, $sp, 0\n\t"
++                   "ld.d $a1, $sp, 8\n\t"
++                   "ld.d $a2, $sp, 0x10\n\t"
++                   "ld.d $a3, $sp, 0x18\n\t"
++                   "ld.d $a4, $sp, 0x20\n\t"
++                   "ld.d $a5, $sp, 0x28\n\t"
++                   "ld.d $a6, $sp, 0x30\n\t"
++                   "ld.d $a7, $sp, 0x38\n\t"
++                   "addi.d $sp, $sp, 0x40\n\t"
++                   "jirl $ra, $s2, 0\n\t"
++                   "move $sp, $fp\n"
++                   __ASM_LOCAL_LABEL("syscall_trace_ret") ":\n\t"
++                   "move $s3, $a0\n\t"             /* 返回值 */
++                   "ld.w $a0, $sp, 0x238\n\t"      /* frame->syscall_id */
++                   "move $a1, $s3\n\t"             /* 返回值 */
++                   "bl " __ASM_NAME("trace_sysret") "\n\t"
++                   "move $a0, $s3\n\t"
++                   "b " __ASM_LOCAL_LABEL("syscall_return") "\n"
++                   __ASM_LOCAL_LABEL("syscall_bad") ":\n\t"
++                   "li.d $a0, 0xc000001c\n\t"      /* STATUS_INVALID_SYSTEM_SERVICE */
++                   "b " __ASM_NAME("__wine_syscall_dispatcher_return") )
++
++
++/***********************************************************************
++ *           __wine_syscall_dispatcher_return
++ */
++__ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_return,
++                   "ld.w $t0, $r21, 0x380\n\t"     /* thread_data->syscall_trace */
++                   "bnez $t0, " __ASM_LOCAL_LABEL("syscall_trace_ret") "\n\t"
++                   "b " __ASM_LOCAL_LABEL("syscall_return") )
++
++
++/***********************************************************************
++ *           __wine_unix_call_dispatcher
++ */
++__ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
++                   "ld.d $t0, $r21, 0x378\n\t"     /* thread_data->syscall_frame */
++                   "st.d $ra,  $t0, 0x10\n\t"
++                   "st.d $sp,  $t0, 0x20\n\t"
++                   "st.d $ra,  $t0, 0x108\n\t"     /* frame->pc */
++                   "st.d $r21, $t0, 0xb0\n\t"
++                   "st.d $fp,  $t0, 0xb8\n\t"
++                   "st.d $s0,  $t0, 0xc0\n\t"
++                   "st.d $s1,  $t0, 0xc8\n\t"
++                   "st.d $s2,  $t0, 0xd0\n\t"
++                   "st.d $s3,  $t0, 0xd8\n\t"
++                   "st.d $s4,  $t0, 0xe0\n\t"
++                   "st.d $s5,  $t0, 0xe8\n\t"
++                   "st.d $s6,  $t0, 0xf0\n\t"
++                   "st.d $s7,  $t0, 0xf8\n\t"
++                   "st.d $s8,  $t0, 0x100\n\t"
++                   "fst.d $f24, $t0, 0x1d0\n\t"
++                   "fst.d $f25, $t0, 0x1d8\n\t"
++                   "fst.d $f26, $t0, 0x1e0\n\t"
++                   "fst.d $f27, $t0, 0x1e8\n\t"
++                   "fst.d $f28, $t0, 0x1f0\n\t"
++                   "fst.d $f29, $t0, 0x1f8\n\t"
++                   "fst.d $f30, $t0, 0x200\n\t"
++                   "fst.d $f31, $t0, 0x208\n\t"
++                   "slli.d $t1, $a1, 3\n\t"
++                   "add.d $t1, $a0, $t1\n\t"
++                   "ld.d $t2, $t1, 0\n\t"
++                   "move $a0, $a2\n\t"             /* args */
++                   /* 切换到内核栈 */
++                   "move $sp, $t0\n\t"
++                   "jirl $ra, $t2, 0\n\t"
++                   "ld.w $t0, $sp, 0x234\n\t"      /* frame->restore_flags */
++                   "bnez $t0, " __ASM_LOCAL_LABEL("syscall_return") "\n\t"
++                   "ld.d $t0, $sp, 0x20\n\t"
++                   "ld.d $t1, $sp, 0x108\n\t"
++                   "ld.d $r21, $sp, 0xb0\n\t"
++                   "ld.d $fp, $sp, 0xb8\n\t"
++                   "move $sp, $t0\n\t"
++                   "jr $t1" )
++
++#endif  /* __loongarch__ */
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index e81eef9..80073f3 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -49,6 +49,8 @@ static const WORD current_machine = IMAGE_FILE_MACHINE_AMD64;
+ static const WORD current_machine = IMAGE_FILE_MACHINE_ARMNT;
+ #elif defined(__aarch64__)
+ static const WORD current_machine = IMAGE_FILE_MACHINE_ARM64;
++#elif defined(__loongarch__)
++static const WORD current_machine = IMAGE_FILE_MACHINE_LOONGARCH64;
+ #endif
+ extern WORD native_machine;
+ 
+@@ -59,7 +61,8 @@ static const ULONG_PTR limit_4g = (ULONG_PTR)((ULONGLONG)1 << 32);
+ 
+ static inline BOOL is_machine_64bit( WORD machine )
+ {
+-    return (machine == IMAGE_FILE_MACHINE_AMD64 || machine == IMAGE_FILE_MACHINE_ARM64);
++    return (machine == IMAGE_FILE_MACHINE_AMD64 || machine == IMAGE_FILE_MACHINE_ARM64 ||
++            machine == IMAGE_FILE_MACHINE_LOONGARCH64);
+ }
+ 
+ #ifdef _WIN64
+diff --git a/dlls/ntdll/unwind.c b/dlls/ntdll/unwind.c
+index cd89808..41e6e67 100644
+--- a/dlls/ntdll/unwind.c
++++ b/dlls/ntdll/unwind.c
+@@ -1647,6 +1647,67 @@ BOOLEAN CDECL RtlAddFunctionTable( RUNTIME_FUNCTION *table, DWORD count, ULONG_P
+ #endif  /* __arm__ */
+ 
+ 
++/***********************************************************************
++ * LoongArch64 support
++ *
++ * Temporary stubs: LoongArch COFF has no .seh_* directives yet, the real
++ * .pdata/.xdata based unwinding is implemented in stage 4.5.
++ */
++#ifdef __loongarch__
++
++NTSTATUS WINAPI RtlVirtualUnwind2( ULONG type, ULONG_PTR base, ULONG_PTR pc,
++                                   RUNTIME_FUNCTION *func, CONTEXT *context,
++                                   BOOLEAN *mach_frame_unwound, void **handler_data,
++                                   ULONG_PTR *frame_ret, KNONVOLATILE_CONTEXT_POINTERS *ctx_ptr,
++                                   ULONG_PTR *limit_low, ULONG_PTR *limit_high,
++                                   PEXCEPTION_ROUTINE *handler_ret, ULONG flags )
++{
++    if (mach_frame_unwound) *mach_frame_unwound = TRUE;
++    if (frame_ret) *frame_ret = context->Gpr[3];
++    if (handler_ret) *handler_ret = NULL;
++    if (handler_data) *handler_data = NULL;
++    context->Pc = 0;
++    return STATUS_UNSUCCESSFUL;
++}
++
++PEXCEPTION_ROUTINE WINAPI RtlVirtualUnwind( ULONG type, ULONG_PTR base, ULONG_PTR pc,
++                                            RUNTIME_FUNCTION *func, CONTEXT *context,
++                                            void **handler_data, ULONG_PTR *frame_ret,
++                                            KNONVOLATILE_CONTEXT_POINTERS *ctx_ptr )
++{
++    PEXCEPTION_ROUTINE handler;
++
++    if (!RtlVirtualUnwind2( type, base, pc, func, context, NULL, handler_data,
++                           frame_ret, ctx_ptr, NULL, NULL, &handler, 0 ))
++        return handler;
++
++    context->Pc = 0;
++    return NULL;
++}
++
++EXCEPTION_DISPOSITION WINAPI __C_specific_handler( EXCEPTION_RECORD *rec, void *frame,
++                                                   CONTEXT *context, DISPATCHER_CONTEXT *dispatch )
++{
++    FIXME( "not implemented\n" );
++    return ExceptionContinueSearch;
++}
++
++PRUNTIME_FUNCTION WINAPI RtlLookupFunctionEntry( ULONG_PTR pc, ULONG_PTR *base,
++                                                 UNWIND_HISTORY_TABLE *table )
++{
++    FIXME( "not implemented for %p\n", (void *)pc );
++    return NULL;
++}
++
++BOOLEAN CDECL RtlAddFunctionTable( RUNTIME_FUNCTION *table, DWORD count, ULONG_PTR base )
++{
++    FIXME( "not implemented\n" );
++    return FALSE;
++}
++
++#endif  /* __loongarch__ */
++
++
+ /***********************************************************************
+  * x86-64 support
+  */
+diff --git a/dlls/setupapi/fakedll.c b/dlls/setupapi/fakedll.c
+index 9f6bc75..ca76c0f 100644
+--- a/dlls/setupapi/fakedll.c
++++ b/dlls/setupapi/fakedll.c
+@@ -52,6 +52,9 @@ static const char current_arch[] = "arm";
+ #elif defined __aarch64__
+ static const WCHAR pe_dir[] = L"\\aarch64-windows";
+ static const char current_arch[] = "arm64";
++#elif defined __loongarch__
++static const WCHAR pe_dir[] = L"\\loongarch64-windows";
++static const char current_arch[] = "loongarch64";
+ #else
+ static const WCHAR pe_dir[] = L"";
+ static const char current_arch[] = "none";
+diff --git a/include/msvcrt/corecrt.h b/include/msvcrt/corecrt.h
+index b5bf31b..1cd27e5 100644
+--- a/include/msvcrt/corecrt.h
++++ b/include/msvcrt/corecrt.h
+@@ -41,7 +41,7 @@
+ # define WIN32
+ #endif
+ 
+-#if (defined(__x86_64__) || defined(__powerpc64__) || defined(__aarch64__)) && !defined(_WIN64)
++#if (defined(__x86_64__) || defined(__powerpc64__) || defined(__aarch64__) || defined(__loongarch__) || defined(__loongarch64__)) && !defined(_WIN64)
+ #define _WIN64
+ #endif
+ 
+diff --git a/include/msvcrt/setjmp.h b/include/msvcrt/setjmp.h
+index 538896f..c169e7d 100644
+--- a/include/msvcrt/setjmp.h
++++ b/include/msvcrt/setjmp.h
+@@ -132,6 +132,32 @@ typedef struct _JUMP_BUFFER
+ #define _JBLEN  24
+ #define _JBTYPE unsigned __int64
+ 
++#elif defined(__loongarch__)
++
++typedef struct _JUMP_BUFFER
++{
++    unsigned __int64 Frame;
++    unsigned __int64 Reserved;
++    unsigned __int64 S0;
++    unsigned __int64 S1;
++    unsigned __int64 S2;
++    unsigned __int64 S3;
++    unsigned __int64 S4;
++    unsigned __int64 S5;
++    unsigned __int64 S6;
++    unsigned __int64 S7;
++    unsigned __int64 S8;
++    unsigned __int64 Fp;
++    unsigned __int64 Ra;
++    unsigned __int64 Sp;
++    unsigned int Fcsr;
++    unsigned int Reserved2;
++    double D[8];
++} _JUMP_BUFFER;
++
++#define _JBLEN  24
++#define _JBTYPE unsigned __int64
++
+ #else
+ 
+ #define _JBLEN 1
+diff --git a/include/wine/asm.h b/include/wine/asm.h
+index 172d7c8..6cf955d 100644
+--- a/include/wine/asm.h
++++ b/include/wine/asm.h
+@@ -45,7 +45,7 @@
+ # define __ASM_EHABI(str)
+ #endif
+ 
+-#if defined(__WINE_PE_BUILD) && !defined(__i386__)
++#if defined(__WINE_PE_BUILD) && !defined(__i386__) && !defined(__loongarch__)
+ # define __ASM_SEH(str) str
+ #else
+ # define __ASM_SEH(str)
+@@ -299,6 +299,19 @@
+                        ".byte 0xff,0x14,0x25\n\t" /* 18: callq *(0x7ffe1000) */ \
+                        ".long 0x7ffe1000\n\t" \
+                        ".byte 0xc3" )             /* 1f: ret */
++#elif defined __loongarch__
++/* $t8 (r20) passes the syscall id, $t7 (r19) preserves the caller's link
++ * register, so that the dispatcher can rebuild the call chain. */
++# define __ASM_SYSCALL_FUNC(id,name) \
++    __ASM_GLOBAL_FUNC( name, \
++                       "li.d $t8, (" #id ")\n\t" \
++                       "move $t7, $ra\n\t" \
++                       "pcalau12i $t6, %pc_hi20(" __ASM_LOCAL_LABEL("syscall_dispatcher_ptr") ")\n\t" \
++                       "addi.d $t6, $t6, %pc_lo12(" __ASM_LOCAL_LABEL("syscall_dispatcher_ptr") ")\n\t" \
++                       "ld.d $t6, $t6, 0\n\t" \
++                       "jirl $ra, $t6, 0\n\t" \
++                       "jr $ra\n" \
++                       __ASM_LOCAL_LABEL("syscall_dispatcher_ptr") ":\t.quad " __ASM_NAME("__wine_syscall_dispatcher") )
+ #elif defined __arm__
+ # define __ASM_SYSCALL_FUNC(id,name,args) \
+     __ASM_GLOBAL_FUNC( name, \
+diff --git a/include/wine/exception.h b/include/wine/exception.h
+index 25c6f2a..0efbb6e 100644
+--- a/include/wine/exception.h
++++ b/include/wine/exception.h
+@@ -105,6 +105,8 @@ typedef struct { DECLSPEC_ALIGN(16) struct { unsigned __int64 Part[2]; } reg[16]
+ typedef struct { int reg[28]; } __wine_jmp_buf;
+ #elif defined(__aarch64__)
+ typedef struct { __int64 reg[24]; } __wine_jmp_buf;
++#elif defined(__loongarch__)
++typedef struct { __int64 reg[24]; } __wine_jmp_buf;
+ #else
+ typedef struct { int reg; } __wine_jmp_buf;
+ #endif
+diff --git a/programs/winecfg/libraries.c b/programs/winecfg/libraries.c
+index 09fd397..81296bf 100644
+--- a/programs/winecfg/libraries.c
++++ b/programs/winecfg/libraries.c
+@@ -40,6 +40,8 @@ static const WCHAR pe_dir[] = L"\\x86_64-windows";
+ static const WCHAR pe_dir[] = L"\\arm-windows";
+ #elif defined __aarch64__
+ static const WCHAR pe_dir[] = L"\\aarch64-windows";
++#elif defined __loongarch__
++static const WCHAR pe_dir[] = L"\\loongarch64-windows";
+ #else
+ static const WCHAR pe_dir[] = L"";
+ #endif
+-- 
+2.47.3
+

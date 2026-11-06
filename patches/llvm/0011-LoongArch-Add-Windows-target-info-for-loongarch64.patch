@@ -1,0 +1,70 @@
+From 3a8e6a2550423df7c0e05a517dd1d29b31b027dd Mon Sep 17 00:00:00 2001
+From: ChenghaoLiu <linkmecry@gmail.com>
+Date: Thu, 5 Nov 2026 18:37:42 +0800
+Subject: [PATCH 11/13] [LoongArch] Add Windows target info for loongarch64
+
+Provide 16-bit wchar_t and ignore the x86 calling conventions so that
+MSVC-mangled names are not generated and winebuild exports still match.
+---
+ clang/lib/Basic/Targets.cpp         |  2 ++
+ clang/lib/Basic/Targets/LoongArch.h | 24 ++++++++++++++++++++++++
+ 2 files changed, 26 insertions(+)
+
+diff --git a/clang/lib/Basic/Targets.cpp b/clang/lib/Basic/Targets.cpp
+index 6314cdf12..80d4e29c0 100644
+--- a/clang/lib/Basic/Targets.cpp
++++ b/clang/lib/Basic/Targets.cpp
+@@ -825,6 +825,8 @@ std::unique_ptr<TargetInfo> AllocateTarget(const llvm::Triple &Triple,
+     case llvm::Triple::OpenBSD:
+       return std::make_unique<OpenBSDTargetInfo<LoongArch64TargetInfo>>(Triple,
+                                                                         Opts);
++    case llvm::Triple::Win32:
++      return std::make_unique<LoongArch64WindowsTargetInfo>(Triple, Opts);
+     default:
+       return std::make_unique<LoongArch64TargetInfo>(Triple, Opts);
+     }
+diff --git a/clang/lib/Basic/Targets/LoongArch.h b/clang/lib/Basic/Targets/LoongArch.h
+index 95d5653f0..abb4d6eb8 100644
+--- a/clang/lib/Basic/Targets/LoongArch.h
++++ b/clang/lib/Basic/Targets/LoongArch.h
+@@ -13,6 +13,7 @@
+ #ifndef LLVM_CLANG_LIB_BASIC_TARGETS_LOONGARCH_H
+ #define LLVM_CLANG_LIB_BASIC_TARGETS_LOONGARCH_H
+ 
++#include "OSTargets.h"
+ #include "clang/Basic/TargetInfo.h"
+ #include "clang/Basic/TargetOptions.h"
+ #include "llvm/Support/Compiler.h"
+@@ -179,6 +180,29 @@ public:
+     MaxAtomicPromoteWidth = MaxAtomicInlineWidth = 64;
+   }
+ };
++
++// Windows LoongArch64 target (MinGW and MSVC environments)
++class LLVM_LIBRARY_VISIBILITY LoongArch64WindowsTargetInfo
++    : public WindowsTargetInfo<LoongArch64TargetInfo> {
++public:
++  LoongArch64WindowsTargetInfo(const llvm::Triple &Triple,
++                               const TargetOptions &Opts)
++      : WindowsTargetInfo<LoongArch64TargetInfo>(Triple, Opts) {
++    // Windows uses a 16-bit wchar_t, matching the generic Windows target.
++    this->WCharType = TargetInfo::UnsignedShort;
++    this->WIntType = TargetInfo::UnsignedShort;
++  }
++
++  // Windows PE 目标上 __stdcall/__fastcall/__thiscall 应与 AArch64 一样被
++  // 忽略（CCCR_Ignore 会让 Sema 保留 CC_C），否则 C 函数会被 Microsoft
++  // 名称修饰为 _Foo@N，与 winebuild 生成的未修饰导出名/导入名不匹配。
++  CallingConvCheckResult checkCallingConvention(CallingConv CC) const override {
++    if (CC == CC_X86StdCall || CC == CC_X86FastCall || CC == CC_X86ThisCall ||
++        CC == CC_X86VectorCall)
++      return CCCR_Ignore;
++    return LoongArch64TargetInfo::checkCallingConvention(CC);
++  }
++};
+ } // end namespace targets
+ } // end namespace clang
+ 
+-- 
+2.47.3
+

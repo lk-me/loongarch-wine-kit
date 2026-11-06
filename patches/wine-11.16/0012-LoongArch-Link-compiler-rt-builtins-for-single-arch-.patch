@@ -1,0 +1,51 @@
+From c1e8ae4efa42f672c4ad07cd41e16150b032c084 Mon Sep 17 00:00:00 2001
+From: k <k@l>
+Date: Fri, 6 Nov 2026 17:29:22 +0800
+Subject: [PATCH 12/20] [LoongArch] Link compiler-rt builtins for single-arch
+ PE builds
+
+---
+ tools/makedep.c | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/tools/makedep.c b/tools/makedep.c
+index 9b3eb06..93f82b0 100644
+--- a/tools/makedep.c
++++ b/tools/makedep.c
+@@ -2436,6 +2436,16 @@ static const char *get_crt_define( const struct makefile *make )
+ }
+ 
+ 
++/*******************************************************************
++ *         needs_compiler_rt
++ */
++static bool needs_compiler_rt(void)
++{
++    /* loongarch64 PE objects need the compiler-rt builtins (64-bit division etc)
++       even when only a single PE architecture is built. */
++    return archs.count > 1 || (archs.count == 1 && !strcmp( archs.str[0], "loongarch64" ));
++}
++
+ /*******************************************************************
+  *         get_default_imports
+  */
+@@ -2448,14 +2458,14 @@ static struct strarray get_default_imports( const struct makefile *make, struct
+     if (nodefaultlibs)
+     {
+         if (!strarray_exists( ret, "winecrt0" )) strarray_add( &ret, "winecrt0" );
+-        if (archs.count > 1) strarray_add( &ret, "compiler-rt" );
++        if (needs_compiler_rt()) strarray_add( &ret, "compiler-rt" );
+         return ret;
+     }
+ 
+     STRARRAY_FOR_EACH( imp, &imports ) if (is_crt_module( imp )) crt_dll = imp;
+ 
+     strarray_add( &ret, "winecrt0" );
+-    if (archs.count > 1) strarray_add( &ret, "compiler-rt" );
++    if (needs_compiler_rt()) strarray_add( &ret, "compiler-rt" );
+     if (crt_dll) strarray_add( &ret, crt_dll );
+ 
+     if (make->is_win16 && (!make->importlib || strcmp( make->importlib, "kernel" )))
+-- 
+2.47.3
+

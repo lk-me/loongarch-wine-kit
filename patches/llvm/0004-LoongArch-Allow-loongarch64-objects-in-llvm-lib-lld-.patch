@@ -1,0 +1,32 @@
+From 1d5822e14e01b0dac6967e551c0b293032476d7b Mon Sep 17 00:00:00 2001
+From: ChenghaoLiu <linkmecry@gmail.com>
+Date: Mon, 2 Nov 2026 19:09:45 +0800
+Subject: [PATCH 04/13] [LoongArch] Allow loongarch64 objects in llvm-lib /
+ lld-link /lib
+
+getCOFFFileMachine() only accepted x86, x64, mips and ARM machines, so
+lld-link /lib rejected LoongArch64 objects with "unknown machine: 25188".
+Accept IMAGE_FILE_MACHINE_LOONGARCH64 so that Wine import libraries can
+be packed for the loongarch64 target.
+---
+ llvm/lib/ToolDrivers/llvm-lib/LibDriver.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/llvm/lib/ToolDrivers/llvm-lib/LibDriver.cpp b/llvm/lib/ToolDrivers/llvm-lib/LibDriver.cpp
+index 55e59aa6a..76f0707b2 100644
+--- a/llvm/lib/ToolDrivers/llvm-lib/LibDriver.cpp
++++ b/llvm/lib/ToolDrivers/llvm-lib/LibDriver.cpp
+@@ -159,7 +159,9 @@ static Expected<COFF::MachineTypes> getCOFFFileMachine(MemoryBufferRef MB) {
+   if (Machine != COFF::IMAGE_FILE_MACHINE_I386 &&
+       Machine != COFF::IMAGE_FILE_MACHINE_AMD64 &&
+       Machine != COFF::IMAGE_FILE_MACHINE_R4000 &&
+-      Machine != COFF::IMAGE_FILE_MACHINE_ARMNT && !COFF::isAnyArm64(Machine)) {
++      Machine != COFF::IMAGE_FILE_MACHINE_ARMNT &&
++      Machine != COFF::IMAGE_FILE_MACHINE_LOONGARCH64 &&
++      !COFF::isAnyArm64(Machine)) {
+     return createStringError(inconvertibleErrorCode(),
+                              "unknown machine: " + std::to_string(Machine));
+   }
+-- 
+2.47.3
+

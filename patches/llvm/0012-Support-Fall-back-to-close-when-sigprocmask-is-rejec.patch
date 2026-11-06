@@ -1,0 +1,43 @@
+From 8ef775d9a3bbc5a7179fe7f1b248bf56e407bb7a Mon Sep 17 00:00:00 2001
+From: ChenghaoLiu <linkmecry@gmail.com>
+Date: Thu, 5 Nov 2026 18:37:42 +0800
+Subject: [PATCH 12/13] [Support] Fall back to close() when sigprocmask is
+ rejected
+
+Older LoongArch kernels reject the sigset_t built by a newer glibc, which
+made SafelyCloseFileDescriptor fail for every file it closed.
+---
+ llvm/lib/Support/Unix/Process.inc | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/llvm/lib/Support/Unix/Process.inc b/llvm/lib/Support/Unix/Process.inc
+index 1c0a29787..f9a2c5ccf 100644
+--- a/llvm/lib/Support/Unix/Process.inc
++++ b/llvm/lib/Support/Unix/Process.inc
+@@ -257,10 +257,20 @@ std::error_code Process::SafelyCloseFileDescriptor(int FD) {
+   if (sigfillset(&FullSet) < 0 || sigfillset(&SavedSet) < 0)
+     return errnoAsErrorCode();
+ 
+-    // Atomically swap our current signal mask with a full mask.
++  // Atomically swap our current signal mask with a full mask.
++  //
++  // Some older LoongArch kernels (e.g. Loongnix 4.19) disagree with a newer
++  // glibc about the size of sigset_t, so rt_sigprocmask() rejects any set
++  // built by sigfillset() with EINVAL. Blocking signals around close() is only
++  // a best-effort hardening measure, so fall back to a plain close() instead of
++  // failing the whole operation.
+ #if LLVM_ENABLE_THREADS
+-  if (int EC = pthread_sigmask(SIG_SETMASK, &FullSet, &SavedSet))
+-    return std::error_code(EC, std::generic_category());
++  if (int EC = pthread_sigmask(SIG_SETMASK, &FullSet, &SavedSet)) {
++    (void)EC;
++    if (::close(FD) < 0)
++      return errnoAsErrorCode();
++    return std::error_code();
++  }
+ #else
+   if (sigprocmask(SIG_SETMASK, &FullSet, &SavedSet) < 0)
+     return errnoAsErrorCode();
+-- 
+2.47.3
+

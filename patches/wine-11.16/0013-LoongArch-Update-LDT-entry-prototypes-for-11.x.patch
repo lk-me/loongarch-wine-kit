@@ -1,0 +1,35 @@
+From e127804f96079a0230d12d4acf820b185d1cdfa9 Mon Sep 17 00:00:00 2001
+From: k <k@l>
+Date: Fri, 6 Nov 2026 17:49:17 +0800
+Subject: [PATCH 13/20] [LoongArch] Update LDT entry prototypes for 11.x
+
+---
+ dlls/ntdll/unix/signal_loongarch64.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/ntdll/unix/signal_loongarch64.c b/dlls/ntdll/unix/signal_loongarch64.c
+index 9f03207..c26c431 100644
+--- a/dlls/ntdll/unix/signal_loongarch64.c
++++ b/dlls/ntdll/unix/signal_loongarch64.c
+@@ -1006,7 +1006,7 @@ static void usr2_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+ /**********************************************************************
+  *           get_thread_ldt_entry
+  */
+-NTSTATUS get_thread_ldt_entry( HANDLE handle, void *data, ULONG len, ULONG *ret_len )
++NTSTATUS get_thread_ldt_entry( HANDLE handle, THREAD_DESCRIPTOR_INFORMATION *info, ULONG len )
+ {
+     return STATUS_NOT_IMPLEMENTED;
+ }
+@@ -1016,7 +1016,8 @@ NTSTATUS get_thread_ldt_entry( HANDLE handle, void *data, ULONG len, ULONG *ret_
+  *           NtSetLdtEntries   (NTDLL.@)
+  *           ZwSetLdtEntries   (NTDLL.@)
+  */
+-NTSTATUS WINAPI NtSetLdtEntries( ULONG sel1, LDT_ENTRY entry1, ULONG sel2, LDT_ENTRY entry2 )
++NTSTATUS WINAPI NtSetLdtEntries( ULONG sel1, ULONG entry1_low, ULONG entry1_high,
++                                 ULONG sel2, ULONG entry2_low, ULONG entry2_high )
+ {
+     return STATUS_NOT_IMPLEMENTED;
+ }
+-- 
+2.47.3
+

@@ -1,0 +1,375 @@
+From 323600754fca7f8fedb8adfdf8f7f14e016dd7b8 Mon Sep 17 00:00:00 2001
+From: ChenghaoLiu <linkmecry@gmail.com>
+Date: Mon, 2 Nov 2026 18:30:19 +0800
+Subject: [PATCH 01/11] [LoongArch] Add build system and tool support for
+ loongarch64
+
+Recognize loongarch64 as a CPU and PE target in configure, tools.h,
+winebuild, winegcc and widl, and define IMAGE_FILE_MACHINE_LOONGARCH64.
+---
+ configure                | 37 ++++++++++++++++++++++++++++++++++---
+ configure.ac             | 13 +++++++++----
+ include/basetsd.h        |  2 +-
+ include/minwindef.h      |  2 +-
+ include/winnt.h          |  1 +
+ tools/tools.h            | 12 ++++++++++--
+ tools/widl/typegen.c     |  4 +++-
+ tools/winebuild/build.h  |  2 +-
+ tools/winebuild/spec32.c |  3 +++
+ tools/winegcc/winegcc.c  |  3 ++-
+ 10 files changed, 65 insertions(+), 14 deletions(-)
+
+diff --git a/configure b/configure
+index 8388093..518c0d9 100755
+--- a/configure
++++ b/configure
+@@ -815,6 +815,15 @@ x86_64_LDFLAGS
+ x86_64_EXTRACFLAGS
+ x86_64_CFLAGS
+ x86_64_CC
++loongarch64_DISABLED_SUBDIRS
++loongarch64_DELAYLOADFLAG
++loongarch64_STRIP
++loongarch64_TARGET
++loongarch64_DEBUG
++loongarch64_LDFLAGS
++loongarch64_EXTRACFLAGS
++loongarch64_CFLAGS
++loongarch64_CC
+ i386_DISABLED_SUBDIRS
+ i386_DELAYLOADFLAG
+ i386_STRIP
+@@ -2524,7 +2533,7 @@ Optional Features:
+   --disable-option-checking  ignore unrecognized --enable/--with options
+   --disable-FEATURE       do not include FEATURE (same as --enable-FEATURE=no)
+   --enable-FEATURE[=ARG]  include FEATURE [ARG=yes]
+-  --enable-archs={i386,x86_64,arm,aarch64}
++  --enable-archs={i386,x86_64,arm,aarch64,loongarch64}
+                           enable multiple architectures for PE compilation
+   --disable-win16         do not include Win16 support
+   --enable-win64          build a Win64 emulator on AMD64 (won't run Win32
+@@ -6521,6 +6530,7 @@ case "$host_cpu" in
+   arm*)            HOST_ARCH=arm ;;
+   i[3456789]86*) HOST_ARCH=i386 ;;
+   x86_64)          HOST_ARCH=x86_64 ;;
++  loongarch64*)    HOST_ARCH=loongarch64 ;;
+ esac
+ 
+ 
+@@ -7287,7 +7297,7 @@ then :
+      for arch
+      do
+          case $arch in
+-           i386|x86_64|arm|aarch64|arm64ec) cross_archs="$cross_archs $arch" ;;
++           i386|x86_64|arm|aarch64|arm64ec|loongarch64) cross_archs="$cross_archs $arch" ;;
+            no|none) PE_ARCHS=none ;;
+            *) as_fn_error $? "Unknown cross-compilation architecture '$arch'" "$LINENO" 5 ;;
+          esac
+@@ -7332,6 +7342,17 @@ do
+     if eval \${${wine_arch}_CC:+false} :
+ then :
+   case $wine_arch in
++          loongarch64)
++            for ac_prog in loongarch64-w64-mingw32-clang loongarch64-w64-mingw32-gcc clang
++do
++  set dummy $ac_prog; ac_word=$2
++  if test -n "$ac_word" && command -v "$ac_word" >/dev/null 2>&1; then
++    loongarch64_CC=$ac_prog
++    break
++  fi
++done
++test -n "$loongarch64_CC" || loongarch64_CC="false"
++            ;;
+           aarch64)
+             for ac_prog in aarch64-w64-mingw32-clang aarch64-w64-mingw32-gcc clang
+ do
+@@ -9378,7 +9399,7 @@ CPPFLAGS=$saved_CPPFLAGS
+ LDFLAGS=$saved_LDFLAGS
+ 
+ case $HOST_ARCH in
+-  arm|aarch64)
++  arm|aarch64|loongarch64)
+     test "x$PE_ARCHS" != x || as_fn_error $? "PE cross-compilation is required for $HOST_ARCH, please install clang/llvm-dlltool/lld, or llvm-mingw." "$LINENO" 5
+     DLLEXT="" ;;
+   *)
+@@ -21012,6 +21033,7 @@ if test "x$ac_cv_cpp_def___powerpc64__" = xyes
+ then :
+   EXTRACFLAGS="$EXTRACFLAGS -D__powerpc64__"
+ fi ;;
++  *loongarch*)      EXTRACFLAGS="$EXTRACFLAGS -D__loongarch__" ;;
+   *aarch64*)        { printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking whether we need to define __aarch64__" >&5
+ printf %s "checking whether we need to define __aarch64__... " >&6; }
+ if test ${ac_cv_cpp_def___aarch64__+y}
+@@ -23220,6 +23242,15 @@ i386_TARGET = $i386_TARGET
+ i386_STRIP = $i386_STRIP
+ i386_DELAYLOADFLAG = $i386_DELAYLOADFLAG
+ i386_DISABLED_SUBDIRS = $i386_DISABLED_SUBDIRS
++loongarch64_CC = $loongarch64_CC
++loongarch64_CFLAGS = $loongarch64_CFLAGS
++loongarch64_EXTRACFLAGS = $loongarch64_EXTRACFLAGS
++loongarch64_LDFLAGS = $loongarch64_LDFLAGS
++loongarch64_DEBUG = $loongarch64_DEBUG
++loongarch64_TARGET = $loongarch64_TARGET
++loongarch64_STRIP = $loongarch64_STRIP
++loongarch64_DELAYLOADFLAG = $loongarch64_DELAYLOADFLAG
++loongarch64_DISABLED_SUBDIRS = $loongarch64_DISABLED_SUBDIRS
+ x86_64_CC = $x86_64_CC
+ x86_64_CFLAGS = $x86_64_CFLAGS
+ x86_64_EXTRACFLAGS = $x86_64_EXTRACFLAGS
+diff --git a/configure.ac b/configure.ac
+index caa6bf1..e74111e 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -15,7 +15,7 @@ libwine_version="1.0"
+ 
+ dnl **** Command-line arguments ****
+ 
+-AC_ARG_ENABLE(archs, AS_HELP_STRING([--enable-archs={i386,x86_64,arm,aarch64}],[enable multiple architectures for PE compilation]))
++AC_ARG_ENABLE(archs, AS_HELP_STRING([--enable-archs={i386,x86_64,arm,aarch64,loongarch64}],[enable multiple architectures for PE compilation]))
+ AC_ARG_ENABLE(win16, AS_HELP_STRING([--disable-win16],[do not include Win16 support]))
+ AC_ARG_ENABLE(win64, AS_HELP_STRING([--enable-win64],[build a Win64 emulator on AMD64 (won't run Win32 binaries)]))
+ AC_ARG_ENABLE(tests, AS_HELP_STRING([--disable-tests],[do not build the regression tests]))
+@@ -180,8 +180,9 @@ case "$host_cpu" in
+   arm*)            HOST_ARCH=arm ;;
+   i[[3456789]]86*) HOST_ARCH=i386 ;;
+   x86_64)          HOST_ARCH=x86_64 ;;
++  loongarch64*)    HOST_ARCH=loongarch64 ;;
+ esac
+-m4_set_add_all([_AC_SUBST_VARS],[HOST_ARCH]m4_foreach([cpu],[aarch64,arm,arm64ec,i386,x86_64],
++m4_set_add_all([_AC_SUBST_VARS],[HOST_ARCH]m4_foreach([cpu],[aarch64,arm,arm64ec,i386,loongarch64,x86_64],
+                                 [m4_foreach([var],[CC,CFLAGS,EXTRACFLAGS,LDFLAGS,DEBUG,TARGET,STRIP,DELAYLOADFLAG,DISABLED_SUBDIRS],[,cpu[_]var])]))
+ 
+ AC_SUBST(toolsdir,[$with_wine_tools])
+@@ -372,7 +373,7 @@ AS_VAR_SET_IF([enable_archs],
+      for arch
+      do
+          case $arch in
+-           i386|x86_64|arm|aarch64|arm64ec) cross_archs="$cross_archs $arch" ;;
++           i386|x86_64|arm|aarch64|arm64ec|loongarch64) cross_archs="$cross_archs $arch" ;;
+            no|none) PE_ARCHS=none ;;
+            *) AC_MSG_ERROR([Unknown cross-compilation architecture '$arch']) ;;
+          esac
+@@ -424,6 +425,9 @@ do
+             ac_prefix_list="m4_foreach([cc],[gcc,clang],m4_foreach([cpu],[i686,i586,i486,i386],[cpu-w64-mingw32-cc ]))"
+             AC_CHECK_PROGS(i386_CC,[$ac_prefix_list clang],[false])
+             ;;
++          loongarch64)
++            AC_CHECK_PROGS(loongarch64_CC,[loongarch64-w64-mingw32-clang loongarch64-w64-mingw32-gcc clang],[false])
++            ;;
+           x86_64)
+             ac_prefix_list="m4_foreach([cc],[gcc,clang],m4_foreach([cpu],[x86_64,amd64],[cpu-w64-mingw32-cc ]))"
+             AC_CHECK_PROGS(x86_64_CC,[$ac_prefix_list clang],[false])
+@@ -639,7 +643,7 @@ CPPFLAGS=$saved_CPPFLAGS
+ LDFLAGS=$saved_LDFLAGS
+ 
+ case $HOST_ARCH in
+-  arm|aarch64)
++  arm|aarch64|loongarch64)
+     test "x$PE_ARCHS" != x || AC_MSG_ERROR([PE cross-compilation is required for $HOST_ARCH, please install clang/llvm-dlltool/lld, or llvm-mingw.])
+     DLLEXT="" ;;
+   *)
+@@ -2385,6 +2389,7 @@ case $host_cpu in
+   *x86_64*)         WINE_CHECK_DEFINE([__x86_64__]) ;;
+   *powerpc64*)      WINE_CHECK_DEFINE([__powerpc64__]) ;;
+   *aarch64*)        WINE_CHECK_DEFINE([__aarch64__]) ;;
++  *loongarch*)      WINE_CHECK_DEFINE([__loongarch__]) ;;
+   *arm*)            WINE_CHECK_DEFINE([__arm__]) ;;
+ esac
+ 
+diff --git a/include/basetsd.h b/include/basetsd.h
+index b3587da..bd8b593 100644
+--- a/include/basetsd.h
++++ b/include/basetsd.h
+@@ -36,7 +36,7 @@ extern "C" {
+  * 64-bit.
+  */
+ 
+-#if (defined(__x86_64__) || defined(__powerpc64__) || defined(__aarch64__)) && !defined(_WIN64)
++#if (defined(__x86_64__) || defined(__powerpc64__) || defined(__aarch64__) || defined(__loongarch__) || defined(__loongarch64__) || defined(__loongarch64)) && !defined(_WIN64)
+ #define _WIN64
+ #endif
+ 
+diff --git a/include/minwindef.h b/include/minwindef.h
+index 0e386ad..aa91a86 100644
+--- a/include/minwindef.h
++++ b/include/minwindef.h
+@@ -37,7 +37,7 @@ extern "C" {
+ 
+ /* Calling conventions definitions */
+ 
+-#if (defined(__x86_64__) || defined(__powerpc64__) || defined(__aarch64__)) && !defined(_WIN64)
++#if (defined(__x86_64__) || defined(__powerpc64__) || defined(__aarch64__) || defined(__loongarch__) || defined(__loongarch64__) || defined(__loongarch64)) && !defined(_WIN64)
+ #define _WIN64
+ #endif
+ 
+diff --git a/include/winnt.h b/include/winnt.h
+index e8a47fe..bf74e3a 100644
+--- a/include/winnt.h
++++ b/include/winnt.h
+@@ -2758,6 +2758,7 @@ typedef struct _IMAGE_VXD_HEADER {
+ #define IMAGE_FILE_MACHINE_RISCV32      0x5032
+ #define IMAGE_FILE_MACHINE_RISCV64      0x5064
+ #define IMAGE_FILE_MACHINE_RISCV128     0x5128
++#define IMAGE_FILE_MACHINE_LOONGARCH64  0x6264
+ #define IMAGE_FILE_MACHINE_CEE          0xc0ee
+ 
+ #define	IMAGE_SIZEOF_FILE_HEADER		20
+diff --git a/tools/tools.h b/tools/tools.h
+index f55bdd9..e9fb143 100644
+--- a/tools/tools.h
++++ b/tools/tools.h
+@@ -71,7 +71,7 @@ extern char **environ;
+ #  define O_BINARY 0
+ # endif
+ # ifndef __int64
+-#   if defined(__x86_64__) || defined(__aarch64__) || defined(__powerpc64__)
++#   if defined(__x86_64__) || defined(__aarch64__) || defined(__powerpc64__) || defined(__loongarch__) || defined(__loongarch64__) || defined(__loongarch64)
+ #     define __int64 long
+ #   else
+ #     define __int64 long long
+@@ -96,7 +96,7 @@ extern char **environ;
+ 
+ struct target
+ {
+-    enum { CPU_i386, CPU_x86_64, CPU_ARM, CPU_ARM64, CPU_ARM64EC } cpu;
++    enum { CPU_i386, CPU_x86_64, CPU_ARM, CPU_ARM64, CPU_ARM64EC, CPU_LOONGARCH64 } cpu;
+ 
+     enum
+     {
+@@ -491,6 +491,8 @@ static inline struct target get_default_target(void)
+     target.cpu = CPU_ARM;
+ #elif defined(__aarch64__)
+     target.cpu = CPU_ARM64;
++#elif defined(__loongarch__) || defined(__loongarch64__) || defined(__loongarch64)
++    target.cpu = CPU_LOONGARCH64;
+ #else
+ #error Unsupported CPU
+ #endif
+@@ -526,6 +528,7 @@ static inline unsigned int get_target_ptr_size( struct target target )
+         [CPU_ARM]       = 4,
+         [CPU_ARM64]     = 8,
+         [CPU_ARM64EC]   = 8,
++        [CPU_LOONGARCH64] = 8,
+     };
+     return sizes[target.cpu];
+ }
+@@ -548,6 +551,8 @@ static inline void set_target_ptr_size( struct target *target, unsigned int size
+     case CPU_ARM64EC:
+         if (size == 4) target->cpu = CPU_ARM;
+         break;
++    case CPU_LOONGARCH64:
++        break;
+     }
+ }
+ 
+@@ -579,6 +584,8 @@ static inline int get_cpu_from_name( const char *name )
+         { "arm64ec",   CPU_ARM64EC },
+         { "arm64",     CPU_ARM64 },
+         { "arm",       CPU_ARM },
++        { "loongarch64", CPU_LOONGARCH64 },
++        { "loongarch",   CPU_LOONGARCH64 },
+     };
+     unsigned int i;
+ 
+@@ -626,6 +633,7 @@ static inline const char *get_arch_dir( struct target target )
+         [CPU_ARM]     = "arm",
+         [CPU_ARM64]   = "aarch64",
+         [CPU_ARM64EC] = "aarch64",
++        [CPU_LOONGARCH64] = "loongarch64",
+     };
+ 
+     if (!cpu_names[target.cpu]) return "";
+diff --git a/tools/widl/typegen.c b/tools/widl/typegen.c
+index 76d7a2b..0014724 100644
+--- a/tools/widl/typegen.c
++++ b/tools/widl/typegen.c
+@@ -457,6 +457,7 @@ static unsigned int get_stack_size( const var_t *var, unsigned int *stack_align,
+             by_val = (stack_size == 1 || stack_size == 2 || stack_size == 4 || stack_size == 8);
+             break;
+         case CPU_ARM64:
++        case CPU_LOONGARCH64:
+             by_val = (stack_size <= 2 * pointer_size);
+             break;
+         case CPU_ARM:
+@@ -1423,7 +1424,7 @@ static unsigned int fill_params_array( const type_t *iface, const var_t *func,
+         offset = ROUND_SIZE( offset, align );
+         pos = offset / pointer_size;
+ 
+-        if (target.cpu == CPU_ARM64)
++        if (target.cpu == CPU_ARM64 || target.cpu == CPU_LOONGARCH64)
+         {
+             switch (type)
+             {
+@@ -1641,6 +1642,7 @@ static void write_proc_func_interp( FILE *file, int indent, const type_t *iface,
+     }
+     case CPU_ARM:
+     case CPU_ARM64:
++    case CPU_LOONGARCH64:
+     {
+         unsigned int i, len, count = stack_size / pointer_size;
+         unsigned char *params = xmalloc( count );
+diff --git a/tools/winebuild/build.h b/tools/winebuild/build.h
+index 7bce8bd..fe2510e 100644
+--- a/tools/winebuild/build.h
++++ b/tools/winebuild/build.h
+@@ -199,7 +199,7 @@ static inline int is_pe(void)
+ 
+ #define FLAG_CPU(cpu)  (0x10000 << (cpu))
+ #define FLAG_CPU_MASK  (FLAG_CPU_WIN32 | FLAG_CPU_WIN64)
+-#define FLAG_CPU_WIN64 (FLAG_CPU(CPU_x86_64) | FLAG_CPU(CPU_ARM64) | FLAG_CPU(CPU_ARM64EC))
++#define FLAG_CPU_WIN64 (FLAG_CPU(CPU_x86_64) | FLAG_CPU(CPU_ARM64) | FLAG_CPU(CPU_ARM64EC) | FLAG_CPU(CPU_LOONGARCH64))
+ #define FLAG_CPU_WIN32 (FLAG_CPU(CPU_i386) | FLAG_CPU(CPU_ARM))
+ 
+ #define MAX_ORDINALS  65535
+diff --git a/tools/winebuild/spec32.c b/tools/winebuild/spec32.c
+index 5ebbce9..bdab284 100644
+--- a/tools/winebuild/spec32.c
++++ b/tools/winebuild/spec32.c
+@@ -37,6 +37,7 @@
+ #define IMAGE_FILE_MACHINE_AMD64   0x8664
+ #define IMAGE_FILE_MACHINE_ARMNT   0x01c4
+ #define IMAGE_FILE_MACHINE_ARM64   0xaa64
++#define IMAGE_FILE_MACHINE_LOONGARCH64 0x6264
+ 
+ #define IMAGE_SIZEOF_NT_OPTIONAL32_HEADER 224
+ #define IMAGE_SIZEOF_NT_OPTIONAL64_HEADER 240
+@@ -758,6 +759,7 @@ void output_module( DLLSPEC *spec )
+     case CPU_x86_64:  machine = IMAGE_FILE_MACHINE_AMD64; break;
+     case CPU_ARM:     machine = IMAGE_FILE_MACHINE_ARMNT; break;
+     case CPU_ARM64:   machine = IMAGE_FILE_MACHINE_ARM64; break;
++    case CPU_LOONGARCH64: machine = IMAGE_FILE_MACHINE_LOONGARCH64; break;
+     }
+     output( "\t.short 0x%04x\n",          /* Machine */
+              machine );
+@@ -1179,6 +1181,7 @@ static void output_pe_file( DLLSPEC *spec, const char signature[32] )
+     case CPU_x86_64:  put_word( IMAGE_FILE_MACHINE_AMD64 ); break;
+     case CPU_ARM:     put_word( IMAGE_FILE_MACHINE_ARMNT ); break;
+     case CPU_ARM64:   put_word( IMAGE_FILE_MACHINE_ARM64 ); break;
++    case CPU_LOONGARCH64: put_word( IMAGE_FILE_MACHINE_LOONGARCH64 ); break;
+     }
+     put_word( pe.sec_count );                        /* NumberOfSections */
+     put_dword( hash_filename(spec->file_name) );     /* TimeDateStamp */
+diff --git a/tools/winegcc/winegcc.c b/tools/winegcc/winegcc.c
+index 374f754..943e25c 100644
+--- a/tools/winegcc/winegcc.c
++++ b/tools/winegcc/winegcc.c
+@@ -674,6 +674,7 @@ static const char *get_multiarch_dir( struct target target )
+    case CPU_x86_64:  return "/x86_64-linux-gnu";
+    case CPU_ARM:     return "/arm-linux-gnueabi";
+    case CPU_ARM64:   return "/aarch64-linux-gnu";
++   case CPU_LOONGARCH64: return "/loongarch64-linux-gnu";
+    default:
+        assert(0);
+    }
+@@ -2070,7 +2071,7 @@ int main(int argc, char **argv)
+ 
+     if (!is_pe && target.cpu != CPU_i386 && target.cpu != CPU_x86_64)
+         error( "Non-PE builds are not supported on this platform. You need to use something like '--target=%s-windows'.\n",
+-               target.cpu == CPU_ARM ? "arm" : "aarch64" );
++               target.cpu == CPU_ARM ? "arm" : target.cpu == CPU_LOONGARCH64 ? "loongarch64" : "aarch64" );
+ 
+     if (!winebuild)
+     {
+-- 
+2.47.3
+

@@ -1,0 +1,241 @@
+From c36cadc00eba167bd2c710251cab97e5a2bb981e Mon Sep 17 00:00:00 2001
+From: ChenghaoLiu <linkmecry@gmail.com>
+Date: Tue, 3 Nov 2026 14:54:17 +0800
+Subject: [PATCH 07/13] [LoongArch] Emit .pdata/.xdata for leaf PE functions
+
+Add a LoongArchUnwindEmitter that writes RUNTIME_FUNCTION entries and
+leaf-only UNWIND_INFO records, mirroring the format consumed by Wine's
+ntdll RtlVirtualUnwind2. The WinCOFFStreamer now drives this emitter, and
+the AsmPrinter opens a WinCFI frame only for functions with an empty
+prologue, so no invalid unwind records are produced.
+---
+ llvm/include/llvm/MC/MCWin64EH.h              | 11 +++
+ llvm/lib/MC/MCWin64EH.cpp                     | 73 +++++++++++++++++++
+ .../Target/LoongArch/LoongArchAsmPrinter.cpp  | 26 +++++++
+ .../Target/LoongArch/LoongArchAsmPrinter.h    |  5 ++
+ .../MCTargetDesc/LoongArchMCAsmInfo.cpp       |  4 +
+ .../MCTargetDesc/LoongArchWinCOFFStreamer.cpp | 19 +++++
+ 6 files changed, 138 insertions(+)
+
+diff --git a/llvm/include/llvm/MC/MCWin64EH.h b/llvm/include/llvm/MC/MCWin64EH.h
+index 56584cd23..1898e68a4 100644
+--- a/llvm/include/llvm/MC/MCWin64EH.h
++++ b/llvm/include/llvm/MC/MCWin64EH.h
+@@ -73,6 +73,17 @@ public:
+   void EmitUnwindInfo(MCStreamer &Streamer, WinEH::FrameInfo *FI,
+                       bool HandlerData) const override;
+ };
++
++/// LoongArch 的 PE 展开信息发射器。LoongArch 没有官方 Windows ABI，这里沿用
++/// x64 的 RUNTIME_FUNCTION（3×DWORD）布局，UNWIND_INFO 头为
++/// version/flags、count、frame_reg、frame_offset 四个字节。当前仅支持无帧
++/// 叶子函数（count == 0、frame_reg == 0）。
++class LLVM_ABI LoongArchUnwindEmitter : public WinEH::UnwindEmitter {
++public:
++  void Emit(MCStreamer &Streamer) const override;
++  void EmitUnwindInfo(MCStreamer &Streamer, WinEH::FrameInfo *FI,
++                      bool HandlerData) const override;
++};
+ /// Encode a single WinEH::Instruction as V3 WOD bytes.
+ /// Appends encoded bytes to Out.
+ LLVM_ABI void EncodeWOD(const WinEH::Instruction &Inst,
+diff --git a/llvm/lib/MC/MCWin64EH.cpp b/llvm/lib/MC/MCWin64EH.cpp
+index 542e2ea6b..509aff9f5 100644
+--- a/llvm/lib/MC/MCWin64EH.cpp
++++ b/llvm/lib/MC/MCWin64EH.cpp
+@@ -3594,3 +3594,76 @@ void llvm::Win64EH::ARMUnwindEmitter::EmitUnwindInfo(MCStreamer &Streamer,
+   Streamer.switchSection(XData);
+   ARMEmitUnwindInfo(Streamer, info, /* TryPacked = */ !HandlerData);
+ }
++
++//===----------------------------------------------------------------------===//
++// LoongArch UNWIND_INFO Emission
++//
++// LoongArch 没有官方 Windows ABI，这里定义的 UNWIND_INFO 头紧凑排布为：
++//   byte 0: version:3 | flags:5
++//   byte 1: count（unwind code 数量）
++//   byte 2: frame_reg
++//   byte 3: frame_offset
++// 与 dlls/ntdll/unwind.c 的 struct loongarch_unwind_info 一致。当前只发射
++// 无帧叶子函数（count == 0、frame_reg == 0），出现 unwind code 时报错。
++//===----------------------------------------------------------------------===//
++
++static void LoongArchEmitUnwindInfo(MCStreamer &Streamer,
++                                    WinEH::FrameInfo *Info) {
++  // 已经发射过（.seh_handlerdata 早期触发）则跳过。
++  if (Info->Symbol)
++    return;
++
++  if (!Info->Instructions.empty()) {
++    Streamer.getContext().reportError(
++        Info->FunctionLoc,
++        "LoongArch unwind codes are not implemented yet in " +
++            Info->Function->getName());
++    return;
++  }
++
++  MCContext &Context = Streamer.getContext();
++  Streamer.emitValueToAlignment(Align(4));
++  MCSymbol *Label = Context.createTempSymbol();
++  Streamer.emitLabel(Label);
++  Info->Symbol = Label;
++
++  Streamer.emitInt8(1); // version = 1, flags = 0
++  Streamer.emitInt8(0); // count
++  Streamer.emitInt8(0); // frame_reg
++  Streamer.emitInt8(0); // frame_offset
++}
++
++void llvm::Win64EH::LoongArchUnwindEmitter::Emit(MCStreamer &Streamer) const {
++  // 先发射 unwind info 结构。
++  for (const auto &CFI : Streamer.getWinFrameInfos()) {
++    WinEH::FrameInfo *Info = CFI.get();
++    if (Info->Symbol)
++      continue;
++    if (!Info->Begin || !Info->End)
++      continue;
++    MCSection *XData = Streamer.getAssociatedXDataSection(Info->TextSection);
++    Streamer.switchSection(XData);
++    LoongArchEmitUnwindInfo(Streamer, Info);
++  }
++
++  // 再发射 RUNTIME_FUNCTION 条目。
++  for (const auto &CFI : Streamer.getWinFrameInfos()) {
++    WinEH::FrameInfo *Info = CFI.get();
++    if (!Info->Symbol || !Info->Begin || !Info->End)
++      continue;
++    MCSection *PData = Streamer.getAssociatedPDataSection(Info->TextSection);
++    Streamer.switchSection(PData);
++    EmitRuntimeFunction(Streamer, Info);
++  }
++}
++
++void llvm::Win64EH::LoongArchUnwindEmitter::EmitUnwindInfo(
++    MCStreamer &Streamer, WinEH::FrameInfo *Info, bool HandlerData) const {
++  if (!Info->FuncletOrFuncEnd) {
++    Streamer.switchSection(Info->TextSection);
++    Info->FuncletOrFuncEnd = Streamer.emitCFILabel();
++  }
++  MCSection *XData = Streamer.getAssociatedXDataSection(Info->TextSection);
++  Streamer.switchSection(XData);
++  LoongArchEmitUnwindInfo(Streamer, Info);
++}
+diff --git a/llvm/lib/Target/LoongArch/LoongArchAsmPrinter.cpp b/llvm/lib/Target/LoongArch/LoongArchAsmPrinter.cpp
+index 2fd290c84..48e351b44 100644
+--- a/llvm/lib/Target/LoongArch/LoongArchAsmPrinter.cpp
++++ b/llvm/lib/Target/LoongArch/LoongArchAsmPrinter.cpp
+@@ -57,6 +57,32 @@ void LoongArchAsmPrinter::emitStartOfAsmFile(Module &M) {
+   }
+ }
+ 
++void LoongArchAsmPrinter::emitFunctionBodyStart() {
++  WinCFIActive = false;
++  if (!TM.getTargetTriple().isOSBinFormatCOFF())
++    return;
++  if (MF->getFunction().getCallingConv() == CallingConv::GHC)
++    return;
++
++  // 目前只为“无帧叶子函数”生成 .pdata/.xdata：prologue 为空，$ra 没有被
++  // 写回栈，因此按叶子规则展开（Pc = $ra，Sp 不变）是正确的。其余函数在
++  // 补齐带栈帧的 unwind code 之前不生成条目。
++  const MachineFrameInfo &MFI = MF->getFrameInfo();
++  if (MFI.getStackSize() != 0 || MFI.adjustsStack())
++    return;
++
++  OutStreamer->emitWinCFIStartProc(CurrentFnSym);
++  OutStreamer->emitWinCFIEndProlog();
++  WinCFIActive = true;
++}
++
++void LoongArchAsmPrinter::emitFunctionBodyEnd() {
++  if (!WinCFIActive)
++    return;
++  OutStreamer->emitWinCFIEndProc();
++  WinCFIActive = false;
++}
++
+ void LoongArchAsmPrinter::emitInstruction(const MachineInstr *MI) {
+   LoongArch_MC::verifyInstructionPredicates(
+       MI->getOpcode(), getSubtargetInfo().getFeatureBits());
+diff --git a/llvm/lib/Target/LoongArch/LoongArchAsmPrinter.h b/llvm/lib/Target/LoongArch/LoongArchAsmPrinter.h
+index 09d8a36b8..22b2890ee 100644
+--- a/llvm/lib/Target/LoongArch/LoongArchAsmPrinter.h
++++ b/llvm/lib/Target/LoongArch/LoongArchAsmPrinter.h
+@@ -28,6 +28,8 @@ public:
+ 
+ private:
+   const MCSubtargetInfo *STI;
++  /// 当前函数是否已开启 PE 展开信息（.seh_proc/.seh_endproc）记录。
++  bool WinCFIActive = false;
+ 
+   LoongArchTargetStreamer &getTargetStreamer() const;
+ 
+@@ -45,6 +47,9 @@ public:
+ 
+   void emitStartOfAsmFile(Module &M) override;
+ 
++  void emitFunctionBodyStart() override;
++  void emitFunctionBodyEnd() override;
++
+   void emitInstruction(const MachineInstr *MI) override;
+ 
+   bool PrintAsmOperand(const MachineInstr *MI, unsigned OpNo,
+diff --git a/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchMCAsmInfo.cpp b/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchMCAsmInfo.cpp
+index ce5c5abd4..254d99ece 100644
+--- a/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchMCAsmInfo.cpp
++++ b/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchMCAsmInfo.cpp
+@@ -263,6 +263,10 @@ LoongArchMCAsmInfoGNUCOFF::LoongArchMCAsmInfoGNUCOFF(
+   ZeroDirective = "\t.space\t";
+   CommentString = "#";
+   SupportsDebugInformation = true;
++  // LoongArch PE 使用自定义的 SEH 展开表（见 MCWin64EH 中的
++  // LoongArchUnwindEmitter）。Itanium 只表示“非 x86 风格的 .seh_* 编码”，
++  // 从而让 MCStreamer 允许发射 .seh_* 并生成 .pdata/.xdata。
++  WinEHEncodingType = WinEH::EncodingType::Itanium;
+ }
+ 
+ void LoongArchMCAsmInfo::printSpecifierExpr(raw_ostream &OS,
+diff --git a/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchWinCOFFStreamer.cpp b/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchWinCOFFStreamer.cpp
+index ce73caa64..e37db2965 100644
+--- a/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchWinCOFFStreamer.cpp
++++ b/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchWinCOFFStreamer.cpp
+@@ -12,17 +12,36 @@
+ #include "llvm/MC/MCCodeEmitter.h"
+ #include "llvm/MC/MCContext.h"
+ #include "llvm/MC/MCObjectWriter.h"
++#include "llvm/MC/MCWin64EH.h"
+ 
+ using namespace llvm;
+ 
+ namespace {
+ 
+ class LoongArchWinCOFFStreamer : public MCWinCOFFStreamer {
++  Win64EH::LoongArchUnwindEmitter EHStreamer;
++
+ public:
+   LoongArchWinCOFFStreamer(MCContext &C, std::unique_ptr<MCAsmBackend> AB,
+                            std::unique_ptr<MCCodeEmitter> CE,
+                            std::unique_ptr<MCObjectWriter> OW)
+       : MCWinCOFFStreamer(C, std::move(AB), std::move(CE), std::move(OW)) {}
++
++  void emitWindowsUnwindTables(WinEH::FrameInfo *Frame) override {
++    assert(Frame);
++    EHStreamer.EmitUnwindInfo(*this, Frame, /*HandlerData=*/false);
++  }
++
++  void emitWindowsUnwindTables() override {
++    if (!getNumWinFrameInfos())
++      return;
++    EHStreamer.Emit(*this);
++  }
++
++  void finishImpl() override {
++    EHStreamer.Emit(*this);
++    MCWinCOFFStreamer::finishImpl();
++  }
+ };
+ 
+ } // end anonymous namespace
+-- 
+2.47.3
+

@@ -1,0 +1,4206 @@
+From aa63b98a752f5d53af90afa295c43a42c4034aab Mon Sep 17 00:00:00 2001
+From: k <k@l>
+Date: Fri, 6 Nov 2026 19:56:21 +0800
+Subject: [PATCH 18/20] [LoongArch] Add quad-precision compiler-rt builtins
+
+---
+ libs/compiler-rt/Makefile.in                  |  21 +-
+ libs/compiler-rt/lib/builtins/addtf3.c        |  23 +
+ libs/compiler-rt/lib/builtins/comparetf2.c    |  63 +++
+ libs/compiler-rt/lib/builtins/divtf3.c        |  26 ++
+ libs/compiler-rt/lib/builtins/extenddftf2.c   |  19 +
+ libs/compiler-rt/lib/builtins/extendsftf2.c   |  19 +
+ libs/compiler-rt/lib/builtins/fixtfdi.c       |  18 +
+ libs/compiler-rt/lib/builtins/fixtfsi.c       |  18 +
+ libs/compiler-rt/lib/builtins/fixunstfdi.c    |  17 +
+ libs/compiler-rt/lib/builtins/fixunstfsi.c    |  17 +
+ libs/compiler-rt/lib/builtins/floatditf.c     |  49 ++
+ libs/compiler-rt/lib/builtins/floatsitf.c     |  49 ++
+ libs/compiler-rt/lib/builtins/floatunditf.c   |  40 ++
+ libs/compiler-rt/lib/builtins/floatunsitf.c   |  40 ++
+ libs/compiler-rt/lib/builtins/fp_add_impl.inc | 172 +++++++
+ .../lib/builtins/fp_compare_impl.inc          | 122 +++++
+ libs/compiler-rt/lib/builtins/fp_div_impl.inc | 424 ++++++++++++++++++
+ libs/compiler-rt/lib/builtins/fp_extend.h     | 196 ++++++++
+ .../lib/builtins/fp_extend_impl.inc           | 108 +++++
+ .../lib/builtins/fp_fixint_impl.inc           |  47 +-
+ .../lib/builtins/fp_fixuint_impl.inc          |  43 +-
+ libs/compiler-rt/lib/builtins/fp_lib.h        | 424 +++++++++++-------
+ libs/compiler-rt/lib/builtins/fp_mode.c       |  22 +
+ libs/compiler-rt/lib/builtins/fp_mode.h       |  29 ++
+ libs/compiler-rt/lib/builtins/fp_mul_impl.inc | 128 ++++++
+ libs/compiler-rt/lib/builtins/fp_trunc.h      | 186 ++++++++
+ .../lib/builtins/fp_trunc_impl.inc            | 155 +++++++
+ .../compiler-rt/lib/builtins/int_endianness.h |  98 ++--
+ libs/compiler-rt/lib/builtins/int_lib.h       | 159 ++++---
+ libs/compiler-rt/lib/builtins/int_math.h      |  93 ++--
+ libs/compiler-rt/lib/builtins/int_to_fp.h     |  82 ++++
+ .../lib/builtins/int_to_fp_impl.inc           |  72 +++
+ libs/compiler-rt/lib/builtins/int_types.h     | 325 +++++++++-----
+ libs/compiler-rt/lib/builtins/int_util.h      |  52 ++-
+ libs/compiler-rt/lib/builtins/multf3.c        |  22 +
+ libs/compiler-rt/lib/builtins/powitf2.c       |  34 ++
+ libs/compiler-rt/lib/builtins/subtf3.c        |  24 +
+ libs/compiler-rt/lib/builtins/trunctfdf2.c    |  19 +
+ libs/compiler-rt/lib/builtins/trunctfsf2.c    |  19 +
+ 39 files changed, 2968 insertions(+), 506 deletions(-)
+ create mode 100644 libs/compiler-rt/lib/builtins/addtf3.c
+ create mode 100644 libs/compiler-rt/lib/builtins/comparetf2.c
+ create mode 100644 libs/compiler-rt/lib/builtins/divtf3.c
+ create mode 100644 libs/compiler-rt/lib/builtins/extenddftf2.c
+ create mode 100644 libs/compiler-rt/lib/builtins/extendsftf2.c
+ create mode 100644 libs/compiler-rt/lib/builtins/fixtfdi.c
+ create mode 100644 libs/compiler-rt/lib/builtins/fixtfsi.c
+ create mode 100644 libs/compiler-rt/lib/builtins/fixunstfdi.c
+ create mode 100644 libs/compiler-rt/lib/builtins/fixunstfsi.c
+ create mode 100644 libs/compiler-rt/lib/builtins/floatditf.c
+ create mode 100644 libs/compiler-rt/lib/builtins/floatsitf.c
+ create mode 100644 libs/compiler-rt/lib/builtins/floatunditf.c
+ create mode 100644 libs/compiler-rt/lib/builtins/floatunsitf.c
+ create mode 100644 libs/compiler-rt/lib/builtins/fp_add_impl.inc
+ create mode 100644 libs/compiler-rt/lib/builtins/fp_compare_impl.inc
+ create mode 100644 libs/compiler-rt/lib/builtins/fp_div_impl.inc
+ create mode 100644 libs/compiler-rt/lib/builtins/fp_extend.h
+ create mode 100644 libs/compiler-rt/lib/builtins/fp_extend_impl.inc
+ create mode 100644 libs/compiler-rt/lib/builtins/fp_mode.c
+ create mode 100644 libs/compiler-rt/lib/builtins/fp_mode.h
+ create mode 100644 libs/compiler-rt/lib/builtins/fp_mul_impl.inc
+ create mode 100644 libs/compiler-rt/lib/builtins/fp_trunc.h
+ create mode 100644 libs/compiler-rt/lib/builtins/fp_trunc_impl.inc
+ create mode 100644 libs/compiler-rt/lib/builtins/int_to_fp.h
+ create mode 100644 libs/compiler-rt/lib/builtins/int_to_fp_impl.inc
+ create mode 100644 libs/compiler-rt/lib/builtins/multf3.c
+ create mode 100644 libs/compiler-rt/lib/builtins/powitf2.c
+ create mode 100644 libs/compiler-rt/lib/builtins/subtf3.c
+ create mode 100644 libs/compiler-rt/lib/builtins/trunctfdf2.c
+ create mode 100644 libs/compiler-rt/lib/builtins/trunctfsf2.c
+
+diff --git a/libs/compiler-rt/Makefile.in b/libs/compiler-rt/Makefile.in
+index de2d2ba..8d9eff2 100644
+--- a/libs/compiler-rt/Makefile.in
++++ b/libs/compiler-rt/Makefile.in
+@@ -40,6 +40,25 @@ SOURCES = \
+ 	lib/builtins/umodsi3.c \
+ 	lib/builtins/umodti3.c \
+ 	lib/builtins/x86_64/chkstk.S \
+-	lib/builtins/x86_64/chkstk2.S
++        lib/builtins/x86_64/chkstk2.S \
++        lib/builtins/addtf3.c \
++        lib/builtins/subtf3.c \
++        lib/builtins/multf3.c \
++        lib/builtins/divtf3.c \
++        lib/builtins/comparetf2.c \
++        lib/builtins/extenddftf2.c \
++        lib/builtins/extendsftf2.c \
++        lib/builtins/trunctfdf2.c \
++        lib/builtins/trunctfsf2.c \
++        lib/builtins/fixtfdi.c \
++        lib/builtins/fixtfsi.c \
++        lib/builtins/fixunstfdi.c \
++        lib/builtins/fixunstfsi.c \
++        lib/builtins/floatditf.c \
++        lib/builtins/floatunditf.c \
++        lib/builtins/floatsitf.c \
++        lib/builtins/floatunsitf.c \
++        lib/builtins/powitf2.c \
++        lib/builtins/fp_mode.c
+ 
+ INSTALL_DEV = $(STATICLIB)
+diff --git a/libs/compiler-rt/lib/builtins/addtf3.c b/libs/compiler-rt/lib/builtins/addtf3.c
+new file mode 100644
+index 0000000..2cb3a4d
+--- /dev/null
++++ b/libs/compiler-rt/lib/builtins/addtf3.c
+@@ -0,0 +1,23 @@
++//===-- lib/addtf3.c - Quad-precision addition --------------------*- C -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file implements quad-precision soft-float addition.
++//
++//===----------------------------------------------------------------------===//
++
++#define QUAD_PRECISION
++#include "fp_lib.h"
++
++#if defined(CRT_HAS_TF_MODE)
++#include "fp_add_impl.inc"
++
++COMPILER_RT_ABI fp_t __addtf3(fp_t a, fp_t b) {
++  return __addXf3__(a, b);
++}
++
++#endif
+diff --git a/libs/compiler-rt/lib/builtins/comparetf2.c b/libs/compiler-rt/lib/builtins/comparetf2.c
+new file mode 100644
+index 0000000..be5e9e5
+--- /dev/null
++++ b/libs/compiler-rt/lib/builtins/comparetf2.c
+@@ -0,0 +1,63 @@
++//===-- lib/comparetf2.c - Quad-precision comparisons -------------*- C -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// // This file implements the following soft-float comparison routines:
++//
++//   __eqtf2   __getf2   __unordtf2
++//   __letf2   __gttf2
++//   __lttf2
++//   __netf2
++//
++// The semantics of the routines grouped in each column are identical, so there
++// is a single implementation for each, and wrappers to provide the other names.
++//
++// The main routines behave as follows:
++//
++//   __letf2(a,b) returns -1 if a < b
++//                         0 if a == b
++//                         1 if a > b
++//                         1 if either a or b is NaN
++//
++//   __getf2(a,b) returns -1 if a < b
++//                         0 if a == b
++//                         1 if a > b
++//                        -1 if either a or b is NaN
++//
++//   __unordtf2(a,b) returns 0 if both a and b are numbers
++//                           1 if either a or b is NaN
++//
++// Note that __letf2( ) and __getf2( ) are identical except in their handling of
++// NaN values.
++//
++//===----------------------------------------------------------------------===//
++
++#define QUAD_PRECISION
++#include "fp_lib.h"
++
++#if defined(CRT_HAS_TF_MODE)
++#include "fp_compare_impl.inc"
++
++COMPILER_RT_ABI CMP_RESULT __letf2(fp_t a, fp_t b) { return __leXf2__(a, b); }
++
++#if defined(__ELF__)
++// Alias for libgcc compatibility
++COMPILER_RT_ALIAS(__letf2, __cmptf2)
++#endif
++COMPILER_RT_ALIAS(__letf2, __eqtf2)
++COMPILER_RT_ALIAS(__letf2, __lttf2)
++COMPILER_RT_ALIAS(__letf2, __netf2)
++
++COMPILER_RT_ABI CMP_RESULT __getf2(fp_t a, fp_t b) { return __geXf2__(a, b); }
++
++COMPILER_RT_ALIAS(__getf2, __gttf2)
++
++COMPILER_RT_ABI CMP_RESULT __unordtf2(fp_t a, fp_t b) {
++  return __unordXf2__(a, b);
++}
++
++#endif
+diff --git a/libs/compiler-rt/lib/builtins/divtf3.c b/libs/compiler-rt/lib/builtins/divtf3.c
+new file mode 100644
+index 0000000..bd76763
+--- /dev/null
++++ b/libs/compiler-rt/lib/builtins/divtf3.c
+@@ -0,0 +1,26 @@
++//===-- lib/divtf3.c - Quad-precision division --------------------*- C -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file implements quad-precision soft-float division
++// with the IEEE-754 default rounding (to nearest, ties to even).
++//
++//===----------------------------------------------------------------------===//
++
++#define QUAD_PRECISION
++#include "fp_lib.h"
++
++#if defined(CRT_HAS_TF_MODE)
++
++#define NUMBER_OF_HALF_ITERATIONS 4
++#define NUMBER_OF_FULL_ITERATIONS 1
++
++#include "fp_div_impl.inc"
++
++COMPILER_RT_ABI fp_t __divtf3(fp_t a, fp_t b) { return __divXf3__(a, b); }
++
++#endif
+diff --git a/libs/compiler-rt/lib/builtins/extenddftf2.c b/libs/compiler-rt/lib/builtins/extenddftf2.c
+new file mode 100644
+index 0000000..a61ef53
+--- /dev/null
++++ b/libs/compiler-rt/lib/builtins/extenddftf2.c
+@@ -0,0 +1,19 @@
++//===-- lib/extenddftf2.c - double -> quad conversion -------------*- C -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#define QUAD_PRECISION
++#include "fp_lib.h"
++
++#if defined(CRT_HAS_TF_MODE)
++#define SRC_DOUBLE
++#define DST_QUAD
++#include "fp_extend_impl.inc"
++
++COMPILER_RT_ABI dst_t __extenddftf2(src_t a) { return __extendXfYf2__(a); }
++
++#endif
+diff --git a/libs/compiler-rt/lib/builtins/extendsftf2.c b/libs/compiler-rt/lib/builtins/extendsftf2.c
+new file mode 100644
+index 0000000..4ab2982
+--- /dev/null
++++ b/libs/compiler-rt/lib/builtins/extendsftf2.c
+@@ -0,0 +1,19 @@
++//===-- lib/extendsftf2.c - single -> quad conversion -------------*- C -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#define QUAD_PRECISION
++#include "fp_lib.h"
++
++#if defined(CRT_HAS_TF_MODE)
++#define SRC_SINGLE
++#define DST_QUAD
++#include "fp_extend_impl.inc"
++
++COMPILER_RT_ABI dst_t __extendsftf2(src_t a) { return __extendXfYf2__(a); }
++
++#endif
+diff --git a/libs/compiler-rt/lib/builtins/fixtfdi.c b/libs/compiler-rt/lib/builtins/fixtfdi.c
+new file mode 100644
+index 0000000..d27a99b
+--- /dev/null
++++ b/libs/compiler-rt/lib/builtins/fixtfdi.c
+@@ -0,0 +1,18 @@
++//===-- fixtfdi.c - Implement __fixtfdi -----------------------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#define QUAD_PRECISION
++#include "fp_lib.h"
++
++#if defined(CRT_HAS_TF_MODE)
++typedef di_int fixint_t;
++typedef du_int fixuint_t;
++#include "fp_fixint_impl.inc"
++
++COMPILER_RT_ABI di_int __fixtfdi(fp_t a) { return __fixint(a); }
++#endif
+diff --git a/libs/compiler-rt/lib/builtins/fixtfsi.c b/libs/compiler-rt/lib/builtins/fixtfsi.c
+new file mode 100644
+index 0000000..01e352a
+--- /dev/null
++++ b/libs/compiler-rt/lib/builtins/fixtfsi.c
+@@ -0,0 +1,18 @@
++//===-- fixtfsi.c - Implement __fixtfsi -----------------------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#define QUAD_PRECISION
++#include "fp_lib.h"
++
++#if defined(CRT_HAS_TF_MODE)
++typedef si_int fixint_t;
++typedef su_int fixuint_t;
++#include "fp_fixint_impl.inc"
++
++COMPILER_RT_ABI si_int __fixtfsi(fp_t a) { return __fixint(a); }
++#endif
+diff --git a/libs/compiler-rt/lib/builtins/fixunstfdi.c b/libs/compiler-rt/lib/builtins/fixunstfdi.c
+new file mode 100644
+index 0000000..febdb8f
+--- /dev/null
++++ b/libs/compiler-rt/lib/builtins/fixunstfdi.c
+@@ -0,0 +1,17 @@
++//===-- fixunstfdi.c - Implement __fixunstfdi -----------------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#define QUAD_PRECISION
++#include "fp_lib.h"
++
++#if defined(CRT_HAS_TF_MODE)
++typedef du_int fixuint_t;
++#include "fp_fixuint_impl.inc"
++
++COMPILER_RT_ABI du_int __fixunstfdi(fp_t a) { return __fixuint(a); }
++#endif
+diff --git a/libs/compiler-rt/lib/builtins/fixunstfsi.c b/libs/compiler-rt/lib/builtins/fixunstfsi.c
+new file mode 100644
+index 0000000..4efc387
+--- /dev/null
++++ b/libs/compiler-rt/lib/builtins/fixunstfsi.c
+@@ -0,0 +1,17 @@
++//===-- fixunstfsi.c - Implement __fixunstfsi -----------------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#define QUAD_PRECISION
++#include "fp_lib.h"
++
++#if defined(CRT_HAS_TF_MODE)
++typedef su_int fixuint_t;
++#include "fp_fixuint_impl.inc"
++
++COMPILER_RT_ABI su_int __fixunstfsi(fp_t a) { return __fixuint(a); }
++#endif
+diff --git a/libs/compiler-rt/lib/builtins/floatditf.c b/libs/compiler-rt/lib/builtins/floatditf.c
+new file mode 100644
+index 0000000..c6e326a
+--- /dev/null
++++ b/libs/compiler-rt/lib/builtins/floatditf.c
+@@ -0,0 +1,49 @@
++//===-- lib/floatditf.c - integer -> quad-precision conversion ----*- C -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file implements di_int to quad-precision conversion for the
++// compiler-rt library in the IEEE-754 default round-to-nearest, ties-to-even
++// mode.
++//
++//===----------------------------------------------------------------------===//
++
++#define QUAD_PRECISION
++#include "fp_lib.h"
++
++#if defined(CRT_HAS_TF_MODE)
++COMPILER_RT_ABI fp_t __floatditf(di_int a) {
++
++  const int aWidth = sizeof a * CHAR_BIT;
++
++  // Handle zero as a special case to protect clz
++  if (a == 0)
++    return fromRep(0);
++
++  // All other cases begin by extracting the sign and absolute value of a
++  rep_t sign = 0;
++  du_int aAbs = (du_int)a;
++  if (a < 0) {
++    sign = signBit;
++    aAbs = ~(du_int)a + 1U;
++  }
++
++  // Exponent of (fp_t)a is the width of abs(a).
++  const int exponent = (aWidth - 1) - __builtin_clzll(aAbs);
++  rep_t result;
++
++  // Shift a into the significand field, rounding if it is a right-shift
++  const int shift = significandBits - exponent;
++  result = (rep_t)aAbs << shift ^ implicitBit;
++
++  // Insert the exponent
++  result += (rep_t)(exponent + exponentBias) << significandBits;
++  // Insert the sign bit and return
++  return fromRep(result | sign);
++}
++
++#endif
+diff --git a/libs/compiler-rt/lib/builtins/floatsitf.c b/libs/compiler-rt/lib/builtins/floatsitf.c
+new file mode 100644
+index 0000000..314a8a7
+--- /dev/null
++++ b/libs/compiler-rt/lib/builtins/floatsitf.c
+@@ -0,0 +1,49 @@
++//===-- lib/floatsitf.c - integer -> quad-precision conversion ----*- C -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file implements integer to quad-precision conversion for the
++// compiler-rt library in the IEEE-754 default round-to-nearest, ties-to-even
++// mode.
++//
++//===----------------------------------------------------------------------===//
++
++#define QUAD_PRECISION
++#include "fp_lib.h"
++
++#if defined(CRT_HAS_TF_MODE)
++COMPILER_RT_ABI fp_t __floatsitf(si_int a) {
++
++  const int aWidth = sizeof a * CHAR_BIT;
++
++  // Handle zero as a special case to protect clz
++  if (a == 0)
++    return fromRep(0);
++
++  // All other cases begin by extracting the sign and absolute value of a
++  rep_t sign = 0;
++  su_int aAbs = (su_int)a;
++  if (a < 0) {
++    sign = signBit;
++    aAbs = -aAbs;
++  }
++
++  // Exponent of (fp_t)a is the width of abs(a).
++  const int exponent = (aWidth - 1) - clzsi(aAbs);
++  rep_t result;
++
++  // Shift a into the significand field and clear the implicit bit.
++  const int shift = significandBits - exponent;
++  result = (rep_t)aAbs << shift ^ implicitBit;
++
++  // Insert the exponent
++  result += (rep_t)(exponent + exponentBias) << significandBits;
++  // Insert the sign bit and return
++  return fromRep(result | sign);
++}
++
++#endif
+diff --git a/libs/compiler-rt/lib/builtins/floatunditf.c b/libs/compiler-rt/lib/builtins/floatunditf.c
+new file mode 100644
+index 0000000..abe0ca9
+--- /dev/null
++++ b/libs/compiler-rt/lib/builtins/floatunditf.c
+@@ -0,0 +1,40 @@
++//===-- lib/floatunditf.c - uint -> quad-precision conversion -----*- C -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file implements du_int to quad-precision conversion for the
++// compiler-rt library in the IEEE-754 default round-to-nearest, ties-to-even
++// mode.
++//
++//===----------------------------------------------------------------------===//
++
++#define QUAD_PRECISION
++#include "fp_lib.h"
++
++#if defined(CRT_HAS_TF_MODE)
++COMPILER_RT_ABI fp_t __floatunditf(du_int a) {
++
++  const int aWidth = sizeof a * CHAR_BIT;
++
++  // Handle zero as a special case to protect clz
++  if (a == 0)
++    return fromRep(0);
++
++  // Exponent of (fp_t)a is the width of abs(a).
++  const int exponent = (aWidth - 1) - __builtin_clzll(a);
++  rep_t result;
++
++  // Shift a into the significand field and clear the implicit bit.
++  const int shift = significandBits - exponent;
++  result = (rep_t)a << shift ^ implicitBit;
++
++  // Insert the exponent
++  result += (rep_t)(exponent + exponentBias) << significandBits;
++  return fromRep(result);
++}
++
++#endif
+diff --git a/libs/compiler-rt/lib/builtins/floatunsitf.c b/libs/compiler-rt/lib/builtins/floatunsitf.c
+new file mode 100644
+index 0000000..3f0a524
+--- /dev/null
++++ b/libs/compiler-rt/lib/builtins/floatunsitf.c
+@@ -0,0 +1,40 @@
++//===-- lib/floatunsitf.c - uint -> quad-precision conversion -----*- C -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file implements unsigned integer to quad-precision conversion for the
++// compiler-rt library in the IEEE-754 default round-to-nearest, ties-to-even
++// mode.
++//
++//===----------------------------------------------------------------------===//
++
++#define QUAD_PRECISION
++#include "fp_lib.h"
++
++#if defined(CRT_HAS_TF_MODE)
++COMPILER_RT_ABI fp_t __floatunsitf(su_int a) {
++
++  const int aWidth = sizeof a * CHAR_BIT;
++
++  // Handle zero as a special case to protect clz
++  if (a == 0)
++    return fromRep(0);
++
++  // Exponent of (fp_t)a is the width of abs(a).
++  const int exponent = (aWidth - 1) - clzsi(a);
++  rep_t result;
++
++  // Shift a into the significand field and clear the implicit bit.
++  const int shift = significandBits - exponent;
++  result = (rep_t)a << shift ^ implicitBit;
++
++  // Insert the exponent
++  result += (rep_t)(exponent + exponentBias) << significandBits;
++  return fromRep(result);
++}
++
++#endif
+diff --git a/libs/compiler-rt/lib/builtins/fp_add_impl.inc b/libs/compiler-rt/lib/builtins/fp_add_impl.inc
+new file mode 100644
+index 0000000..7a05f48
+--- /dev/null
++++ b/libs/compiler-rt/lib/builtins/fp_add_impl.inc
+@@ -0,0 +1,172 @@
++//===----- lib/fp_add_impl.inc - floaing point addition -----------*- C -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file implements soft-float addition with the IEEE-754 default rounding
++// (to nearest, ties to even).
++//
++//===----------------------------------------------------------------------===//
++
++#include "fp_lib.h"
++#include "fp_mode.h"
++
++static __inline fp_t __addXf3__(fp_t a, fp_t b) {
++  rep_t aRep = toRep(a);
++  rep_t bRep = toRep(b);
++  const rep_t aAbs = aRep & absMask;
++  const rep_t bAbs = bRep & absMask;
++
++  // Detect if a or b is zero, infinity, or NaN.
++  if (aAbs - REP_C(1) >= infRep - REP_C(1) ||
++      bAbs - REP_C(1) >= infRep - REP_C(1)) {
++    // NaN + anything = qNaN
++    if (aAbs > infRep)
++      return fromRep(toRep(a) | quietBit);
++    // anything + NaN = qNaN
++    if (bAbs > infRep)
++      return fromRep(toRep(b) | quietBit);
++
++    if (aAbs == infRep) {
++      // +/-infinity + -/+infinity = qNaN
++      if ((toRep(a) ^ toRep(b)) == signBit)
++        return fromRep(qnanRep);
++      // +/-infinity + anything remaining = +/- infinity
++      else
++        return a;
++    }
++
++    // anything remaining + +/-infinity = +/-infinity
++    if (bAbs == infRep)
++      return b;
++
++    // zero + anything = anything
++    if (!aAbs) {
++      // We need to get the sign right for zero + zero.
++      if (!bAbs)
++        return fromRep(toRep(a) & toRep(b));
++      else
++        return b;
++    }
++
++    // anything + zero = anything
++    if (!bAbs)
++      return a;
++  }
++
++  // Swap a and b if necessary so that a has the larger absolute value.
++  if (bAbs > aAbs) {
++    const rep_t temp = aRep;
++    aRep = bRep;
++    bRep = temp;
++  }
++
++  // Extract the exponent and significand from the (possibly swapped) a and b.
++  int aExponent = aRep >> significandBits & maxExponent;
++  int bExponent = bRep >> significandBits & maxExponent;
++  rep_t aSignificand = aRep & significandMask;
++  rep_t bSignificand = bRep & significandMask;
++
++  // Normalize any denormals, and adjust the exponent accordingly.
++  if (aExponent == 0)
++    aExponent = normalize(&aSignificand);
++  if (bExponent == 0)
++    bExponent = normalize(&bSignificand);
++
++  // The sign of the result is the sign of the larger operand, a.  If they
++  // have opposite signs, we are performing a subtraction.  Otherwise, we
++  // perform addition.
++  const rep_t resultSign = aRep & signBit;
++  const bool subtraction = (aRep ^ bRep) & signBit;
++
++  // Shift the significands to give us round, guard and sticky, and set the
++  // implicit significand bit.  If we fell through from the denormal path it
++  // was already set by normalize( ), but setting it twice won't hurt
++  // anything.
++  aSignificand = (aSignificand | implicitBit) << 3;
++  bSignificand = (bSignificand | implicitBit) << 3;
++
++  // Shift the significand of b by the difference in exponents, with a sticky
++  // bottom bit to get rounding correct.
++  const unsigned int align = (unsigned int)(aExponent - bExponent);
++  if (align) {
++    if (align < typeWidth) {
++      const bool sticky = (bSignificand << (typeWidth - align)) != 0;
++      bSignificand = bSignificand >> align | sticky;
++    } else {
++      bSignificand = 1; // Set the sticky bit.  b is known to be non-zero.
++    }
++  }
++  if (subtraction) {
++    aSignificand -= bSignificand;
++    // If a == -b, return +zero.
++    if (aSignificand == 0)
++      return fromRep(0);
++
++    // If partial cancellation occurred, we need to left-shift the result
++    // and adjust the exponent.
++    if (aSignificand < implicitBit << 3) {
++      const int shift = rep_clz(aSignificand) - rep_clz(implicitBit << 3);
++      aSignificand <<= shift;
++      aExponent -= shift;
++    }
++  } else /* addition */ {
++    aSignificand += bSignificand;
++
++    // If the addition carried up, we need to right-shift the result and
++    // adjust the exponent.
++    if (aSignificand & implicitBit << 4) {
++      const bool sticky = aSignificand & 1;
++      aSignificand = aSignificand >> 1 | sticky;
++      aExponent += 1;
++    }
++  }
++
++  // If we have overflowed the type, return +/- infinity.
++  if (aExponent >= maxExponent)
++    return fromRep(infRep | resultSign);
++
++  if (aExponent <= 0) {
++    // The result is denormal before rounding.  The exponent is zero and we
++    // need to shift the significand.
++    const int shift = 1 - aExponent;
++    const bool sticky = (aSignificand << (typeWidth - shift)) != 0;
++    aSignificand = aSignificand >> shift | sticky;
++    aExponent = 0;
++  }
++
++  // Low three bits are round, guard, and sticky.
++  const int roundGuardSticky = aSignificand & 0x7;
++
++  // Shift the significand into place, and mask off the implicit bit.
++  rep_t result = aSignificand >> 3 & significandMask;
++
++  // Insert the exponent and sign.
++  result |= (rep_t)aExponent << significandBits;
++  result |= resultSign;
++
++  // Perform the final rounding.  The result may overflow to infinity, but
++  // that is the correct result in that case.
++  switch (__fe_getround()) {
++  case CRT_FE_TONEAREST:
++    if (roundGuardSticky > 0x4)
++      result++;
++    if (roundGuardSticky == 0x4)
++      result += result & 1;
++    break;
++  case CRT_FE_DOWNWARD:
++    if (resultSign && roundGuardSticky) result++;
++    break;
++  case CRT_FE_UPWARD:
++    if (!resultSign && roundGuardSticky) result++;
++    break;
++  case CRT_FE_TOWARDZERO:
++    break;
++  }
++  if (roundGuardSticky)
++    __fe_raise_inexact();
++  return fromRep(result);
++}
+diff --git a/libs/compiler-rt/lib/builtins/fp_compare_impl.inc b/libs/compiler-rt/lib/builtins/fp_compare_impl.inc
+new file mode 100644
+index 0000000..129d013
+--- /dev/null
++++ b/libs/compiler-rt/lib/builtins/fp_compare_impl.inc
+@@ -0,0 +1,122 @@
++//===-- lib/fp_compare_impl.inc - Floating-point comparison -------*- C -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#include "fp_lib.h"
++
++// GCC uses long (at least for x86_64) as the return type of the comparison
++// functions. We need to ensure that the return value is sign-extended in the
++// same way as GCC expects (since otherwise GCC-generated __builtin_isinf
++// returns true for finite 128-bit floating-point numbers).
++#if defined(__aarch64__) || defined(__arm64ec__)
++// AArch64 GCC overrides libgcc_cmp_return to use int instead of long.
++typedef int CMP_RESULT;
++#elif defined(__wasm__)
++// Both wasm32 and wasm64 use i32
++typedef int CMP_RESULT;
++#elif __SIZEOF_POINTER__ == 8 && __SIZEOF_LONG__ == 4
++// LLP64 ABIs use long long instead of long.
++typedef long long CMP_RESULT;
++#elif __AVR__
++// AVR uses a single byte for the return value.
++typedef char CMP_RESULT;
++#else
++// Otherwise the comparison functions return long.
++typedef long CMP_RESULT;
++#endif
++
++#if !defined(__clang__) && defined(__GNUC__)
++// GCC uses a special __libgcc_cmp_return__ mode to define the return type, so
++// check that we are ABI-compatible when compiling the builtins with GCC.
++typedef int GCC_CMP_RESULT __attribute__((__mode__(__libgcc_cmp_return__)));
++_Static_assert(sizeof(GCC_CMP_RESULT) == sizeof(CMP_RESULT),
++               "SOFTFP ABI not compatible with GCC");
++#endif
++
++enum {
++  LE_LESS = -1,
++  LE_EQUAL = 0,
++  LE_GREATER = 1,
++  LE_UNORDERED = 1,
++};
++
++static inline CMP_RESULT __leXf2__(fp_t a, fp_t b) {
++  const srep_t aInt = toRep(a);
++  const srep_t bInt = toRep(b);
++  const rep_t aAbs = aInt & absMask;
++  const rep_t bAbs = bInt & absMask;
++
++  // If either a or b is NaN, they are unordered.
++  if (aAbs > infRep || bAbs > infRep)
++    return LE_UNORDERED;
++
++  // If a and b are both zeros, they are equal.
++  if ((aAbs | bAbs) == 0)
++    return LE_EQUAL;
++
++  // If at least one of a and b is positive, we get the same result comparing
++  // a and b as signed integers as we would with a floating-point compare.
++  if ((aInt & bInt) >= 0) {
++    if (aInt < bInt)
++      return LE_LESS;
++    else if (aInt == bInt)
++      return LE_EQUAL;
++    else
++      return LE_GREATER;
++  } else {
++    // Otherwise, both are negative, so we need to flip the sense of the
++    // comparison to get the correct result.  (This assumes a twos- or ones-
++    // complement integer representation; if integers are represented in a
++    // sign-magnitude representation, then this flip is incorrect).
++    if (aInt > bInt)
++      return LE_LESS;
++    else if (aInt == bInt)
++      return LE_EQUAL;
++    else
++      return LE_GREATER;
++  }
++}
++
++enum {
++  GE_LESS = -1,
++  GE_EQUAL = 0,
++  GE_GREATER = 1,
++  GE_UNORDERED = -1 // Note: different from LE_UNORDERED
++};
++
++static inline CMP_RESULT __geXf2__(fp_t a, fp_t b) {
++  const srep_t aInt = toRep(a);
++  const srep_t bInt = toRep(b);
++  const rep_t aAbs = aInt & absMask;
++  const rep_t bAbs = bInt & absMask;
++
++  if (aAbs > infRep || bAbs > infRep)
++    return GE_UNORDERED;
++  if ((aAbs | bAbs) == 0)
++    return GE_EQUAL;
++  if ((aInt & bInt) >= 0) {
++    if (aInt < bInt)
++      return GE_LESS;
++    else if (aInt == bInt)
++      return GE_EQUAL;
++    else
++      return GE_GREATER;
++  } else {
++    if (aInt > bInt)
++      return GE_LESS;
++    else if (aInt == bInt)
++      return GE_EQUAL;
++    else
++      return GE_GREATER;
++  }
++}
++
++static inline CMP_RESULT __unordXf2__(fp_t a, fp_t b) {
++  const rep_t aAbs = toRep(a) & absMask;
++  const rep_t bAbs = toRep(b) & absMask;
++  return aAbs > infRep || bAbs > infRep;
++}
+diff --git a/libs/compiler-rt/lib/builtins/fp_div_impl.inc b/libs/compiler-rt/lib/builtins/fp_div_impl.inc
+new file mode 100644
+index 0000000..de61e55
+--- /dev/null
++++ b/libs/compiler-rt/lib/builtins/fp_div_impl.inc
+@@ -0,0 +1,424 @@
++//===-- fp_div_impl.inc - Floating point division -----------------*- C -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file implements soft-float division with the IEEE-754 default
++// rounding (to nearest, ties to even).
++//
++//===----------------------------------------------------------------------===//
++
++#include "fp_lib.h"
++
++// The __divXf3__ function implements Newton-Raphson floating point division.
++// It uses 3 iterations for float32, 4 for float64 and 5 for float128,
++// respectively. Due to number of significant bits being roughly doubled
++// every iteration, the two modes are supported: N full-width iterations (as
++// it is done for float32 by default) and (N-1) half-width iteration plus one
++// final full-width iteration. It is expected that half-width integer
++// operations (w.r.t rep_t size) can be performed faster for some hardware but
++// they require error estimations to be computed separately due to larger
++// computational errors caused by truncating intermediate results.
++
++// Half the bit-size of rep_t
++#define HW (typeWidth / 2)
++// rep_t-sized bitmask with lower half of bits set to ones
++#define loMask (REP_C(-1) >> HW)
++
++#if NUMBER_OF_FULL_ITERATIONS < 1
++#error At least one full iteration is required
++#endif
++
++static __inline fp_t __divXf3__(fp_t a, fp_t b) {
++
++  const unsigned int aExponent = toRep(a) >> significandBits & maxExponent;
++  const unsigned int bExponent = toRep(b) >> significandBits & maxExponent;
++  const rep_t quotientSign = (toRep(a) ^ toRep(b)) & signBit;
++
++  rep_t aSignificand = toRep(a) & significandMask;
++  rep_t bSignificand = toRep(b) & significandMask;
++  int scale = 0;
++
++  // Detect if a or b is zero, denormal, infinity, or NaN.
++  if (aExponent - 1U >= maxExponent - 1U ||
++      bExponent - 1U >= maxExponent - 1U) {
++
++    const rep_t aAbs = toRep(a) & absMask;
++    const rep_t bAbs = toRep(b) & absMask;
++
++    // NaN / anything = qNaN
++    if (aAbs > infRep)
++      return fromRep(toRep(a) | quietBit);
++    // anything / NaN = qNaN
++    if (bAbs > infRep)
++      return fromRep(toRep(b) | quietBit);
++
++    if (aAbs == infRep) {
++      // infinity / infinity = NaN
++      if (bAbs == infRep)
++        return fromRep(qnanRep);
++      // infinity / anything else = +/- infinity
++      else
++        return fromRep(aAbs | quotientSign);
++    }
++
++    // anything else / infinity = +/- 0
++    if (bAbs == infRep)
++      return fromRep(quotientSign);
++
++    if (!aAbs) {
++      // zero / zero = NaN
++      if (!bAbs)
++        return fromRep(qnanRep);
++      // zero / anything else = +/- zero
++      else
++        return fromRep(quotientSign);
++    }
++    // anything else / zero = +/- infinity
++    if (!bAbs)
++      return fromRep(infRep | quotientSign);
++
++    // One or both of a or b is denormal.  The other (if applicable) is a
++    // normal number.  Renormalize one or both of a and b, and set scale to
++    // include the necessary exponent adjustment.
++    if (aAbs < implicitBit)
++      scale += normalize(&aSignificand);
++    if (bAbs < implicitBit)
++      scale -= normalize(&bSignificand);
++  }
++
++  // Set the implicit significand bit.  If we fell through from the
++  // denormal path it was already set by normalize( ), but setting it twice
++  // won't hurt anything.
++  aSignificand |= implicitBit;
++  bSignificand |= implicitBit;
++
++  int writtenExponent = (aExponent - bExponent + scale) + exponentBias;
++
++  const rep_t b_UQ1 = bSignificand << (typeWidth - significandBits - 1);
++
++  // Align the significand of b as a UQ1.(n-1) fixed-point number in the range
++  // [1.0, 2.0) and get a UQ0.n approximate reciprocal using a small minimax
++  // polynomial approximation: x0 = 3/4 + 1/sqrt(2) - b/2.
++  // The max error for this approximation is achieved at endpoints, so
++  //   abs(x0(b) - 1/b) <= abs(x0(1) - 1/1) = 3/4 - 1/sqrt(2) = 0.04289...,
++  // which is about 4.5 bits.
++  // The initial approximation is between x0(1.0) = 0.9571... and x0(2.0) = 0.4571...
++
++  // Then, refine the reciprocal estimate using a quadratically converging
++  // Newton-Raphson iteration:
++  //     x_{n+1} = x_n * (2 - x_n * b)
++  //
++  // Let b be the original divisor considered "in infinite precision" and
++  // obtained from IEEE754 representation of function argument (with the
++  // implicit bit set). Corresponds to rep_t-sized b_UQ1 represented in
++  // UQ1.(W-1).
++  //
++  // Let b_hw be an infinitely precise number obtained from the highest (HW-1)
++  // bits of divisor significand (with the implicit bit set). Corresponds to
++  // half_rep_t-sized b_UQ1_hw represented in UQ1.(HW-1) that is a **truncated**
++  // version of b_UQ1.
++  //
++  // Let e_n := x_n - 1/b_hw
++  //     E_n := x_n - 1/b
++  // abs(E_n) <= abs(e_n) + (1/b_hw - 1/b)
++  //           = abs(e_n) + (b - b_hw) / (b*b_hw)
++  //          <= abs(e_n) + 2 * 2^-HW
++
++  // rep_t-sized iterations may be slower than the corresponding half-width
++  // variant depending on the handware and whether single/double/quad precision
++  // is selected.
++  // NB: Using half-width iterations increases computation errors due to
++  // rounding, so error estimations have to be computed taking the selected
++  // mode into account!
++#if NUMBER_OF_HALF_ITERATIONS > 0
++  // Starting with (n-1) half-width iterations
++  const half_rep_t b_UQ1_hw = bSignificand >> (significandBits + 1 - HW);
++
++  // C is (3/4 + 1/sqrt(2)) - 1 truncated to W0 fractional bits as UQ0.HW
++  // with W0 being either 16 or 32 and W0 <= HW.
++  // That is, C is the aforementioned 3/4 + 1/sqrt(2) constant (from which
++  // b/2 is subtracted to obtain x0) wrapped to [0, 1) range.
++#if defined(SINGLE_PRECISION)
++  // Use 16-bit initial estimation in case we are using half-width iterations
++  // for float32 division. This is expected to be useful for some 16-bit
++  // targets. Not used by default as it requires performing more work during
++  // rounding and would hardly help on regular 32- or 64-bit targets.
++  const half_rep_t C_hw = HALF_REP_C(0x7504);
++#else
++  // HW is at least 32. Shifting into the highest bits if needed.
++  const half_rep_t C_hw = HALF_REP_C(0x7504F333) << (HW - 32);
++#endif
++
++  // b >= 1, thus an upper bound for 3/4 + 1/sqrt(2) - b/2 is about 0.9572,
++  // so x0 fits to UQ0.HW without wrapping.
++  half_rep_t x_UQ0_hw = C_hw - (b_UQ1_hw /* exact b_hw/2 as UQ0.HW */);
++  // An e_0 error is comprised of errors due to
++  // * x0 being an inherently imprecise first approximation of 1/b_hw
++  // * C_hw being some (irrational) number **truncated** to W0 bits
++  // Please note that e_0 is calculated against the infinitely precise
++  // reciprocal of b_hw (that is, **truncated** version of b).
++  //
++  // e_0 <= 3/4 - 1/sqrt(2) + 2^-W0
++
++  // By construction, 1 <= b < 2
++  // f(x)  = x * (2 - b*x) = 2*x - b*x^2
++  // f'(x) = 2 * (1 - b*x)
++  //
++  // On the [0, 1] interval, f(0)   = 0,
++  // then it increses until  f(1/b) = 1 / b, maximum on (0, 1),
++  // then it decreses to     f(1)   = 2 - b
++  //
++  // Let g(x) = x - f(x) = b*x^2 - x.
++  // On (0, 1/b), g(x) < 0 <=> f(x) > x
++  // On (1/b, 1], g(x) > 0 <=> f(x) < x
++  //
++  // For half-width iterations, b_hw is used instead of b.
++  REPEAT_N_TIMES(NUMBER_OF_HALF_ITERATIONS, {
++    // corr_UQ1_hw can be **larger** than 2 - b_hw*x by at most 1*Ulp
++    // of corr_UQ1_hw.
++    // "0.0 - (...)" is equivalent to "2.0 - (...)" in UQ1.(HW-1).
++    // On the other hand, corr_UQ1_hw should not overflow from 2.0 to 0.0 provided
++    // no overflow occurred earlier: ((rep_t)x_UQ0_hw * b_UQ1_hw >> HW) is
++    // expected to be strictly positive because b_UQ1_hw has its highest bit set
++    // and x_UQ0_hw should be rather large (it converges to 1/2 < 1/b_hw <= 1).
++    half_rep_t corr_UQ1_hw = 0 - ((rep_t)x_UQ0_hw * b_UQ1_hw >> HW);
++
++    // Now, we should multiply UQ0.HW and UQ1.(HW-1) numbers, naturally
++    // obtaining an UQ1.(HW-1) number and proving its highest bit could be
++    // considered to be 0 to be able to represent it in UQ0.HW.
++    // From the above analysis of f(x), if corr_UQ1_hw would be represented
++    // without any intermediate loss of precision (that is, in twice_rep_t)
++    // x_UQ0_hw could be at most [1.]000... if b_hw is exactly 1.0 and strictly
++    // less otherwise. On the other hand, to obtain [1.]000..., one have to pass
++    // 1/b_hw == 1.0 to f(x), so this cannot occur at all without overflow (due
++    // to 1.0 being not representable as UQ0.HW).
++    // The fact corr_UQ1_hw was virtually round up (due to result of
++    // multiplication being **first** truncated, then negated - to improve
++    // error estimations) can increase x_UQ0_hw by up to 2*Ulp of x_UQ0_hw.
++    x_UQ0_hw = (rep_t)x_UQ0_hw * corr_UQ1_hw >> (HW - 1);
++    // Now, either no overflow occurred or x_UQ0_hw is 0 or 1 in its half_rep_t
++    // representation. In the latter case, x_UQ0_hw will be either 0 or 1 after
++    // any number of iterations, so just subtract 2 from the reciprocal
++    // approximation after last iteration.
++
++    // In infinite precision, with 0 <= eps1, eps2 <= U = 2^-HW:
++    // corr_UQ1_hw = 2 - (1/b_hw + e_n) * b_hw + 2*eps1
++    //             = 1 - e_n * b_hw + 2*eps1
++    // x_UQ0_hw = (1/b_hw + e_n) * (1 - e_n*b_hw + 2*eps1) - eps2
++    //          = 1/b_hw - e_n + 2*eps1/b_hw + e_n - e_n^2*b_hw + 2*e_n*eps1 - eps2
++    //          = 1/b_hw + 2*eps1/b_hw - e_n^2*b_hw + 2*e_n*eps1 - eps2
++    // e_{n+1} = -e_n^2*b_hw + 2*eps1/b_hw + 2*e_n*eps1 - eps2
++    //         = 2*e_n*eps1 - (e_n^2*b_hw + eps2) + 2*eps1/b_hw
++    //                        \------ >0 -------/   \-- >0 ---/
++    // abs(e_{n+1}) <= 2*abs(e_n)*U + max(2*e_n^2 + U, 2 * U)
++  })
++  // For initial half-width iterations, U = 2^-HW
++  // Let  abs(e_n)     <= u_n * U,
++  // then abs(e_{n+1}) <= 2 * u_n * U^2 + max(2 * u_n^2 * U^2 + U, 2 * U)
++  // u_{n+1} <= 2 * u_n * U + max(2 * u_n^2 * U + 1, 2)
++
++  // Account for possible overflow (see above). For an overflow to occur for the
++  // first time, for "ideal" corr_UQ1_hw (that is, without intermediate
++  // truncation), the result of x_UQ0_hw * corr_UQ1_hw should be either maximum
++  // value representable in UQ0.HW or less by 1. This means that 1/b_hw have to
++  // be not below that value (see g(x) above), so it is safe to decrement just
++  // once after the final iteration. On the other hand, an effective value of
++  // divisor changes after this point (from b_hw to b), so adjust here.
++  x_UQ0_hw -= 1U;
++  rep_t x_UQ0 = (rep_t)x_UQ0_hw << HW;
++  x_UQ0 -= 1U;
++
++#else
++  // C is (3/4 + 1/sqrt(2)) - 1 truncated to 32 fractional bits as UQ0.n
++  const rep_t C = REP_C(0x7504F333) << (typeWidth - 32);
++  rep_t x_UQ0 = C - b_UQ1;
++  // E_0 <= 3/4 - 1/sqrt(2) + 2 * 2^-32
++#endif
++
++  // Error estimations for full-precision iterations are calculated just
++  // as above, but with U := 2^-W and taking extra decrementing into account.
++  // We need at least one such iteration.
++
++#ifdef USE_NATIVE_FULL_ITERATIONS
++  REPEAT_N_TIMES(NUMBER_OF_FULL_ITERATIONS, {
++    rep_t corr_UQ1 = 0 - ((twice_rep_t)x_UQ0 * b_UQ1 >> typeWidth);
++    x_UQ0 = (twice_rep_t)x_UQ0 * corr_UQ1 >> (typeWidth - 1);
++  })
++#else
++#if NUMBER_OF_FULL_ITERATIONS != 1
++#error Only a single emulated full iteration is supported
++#endif
++#if !(NUMBER_OF_HALF_ITERATIONS > 0)
++  // Cannot normally reach here: only one full-width iteration is requested and
++  // the total number of iterations should be at least 3 even for float32.
++#error Check NUMBER_OF_HALF_ITERATIONS, NUMBER_OF_FULL_ITERATIONS and USE_NATIVE_FULL_ITERATIONS.
++#endif
++  // Simulating operations on a twice_rep_t to perform a single final full-width
++  // iteration. Using ad-hoc multiplication implementations to take advantage
++  // of particular structure of operands.
++  rep_t blo = b_UQ1 & loMask;
++  // x_UQ0 = x_UQ0_hw * 2^HW - 1
++  // x_UQ0 * b_UQ1 = (x_UQ0_hw * 2^HW) * (b_UQ1_hw * 2^HW + blo) - b_UQ1
++  //
++  //   <--- higher half ---><--- lower half --->
++  //   [x_UQ0_hw * b_UQ1_hw]
++  // +            [  x_UQ0_hw *  blo  ]
++  // -                      [      b_UQ1       ]
++  // = [      result       ][.... discarded ...]
++  rep_t corr_UQ1 = 0U - (   (rep_t)x_UQ0_hw * b_UQ1_hw
++                         + ((rep_t)x_UQ0_hw * blo >> HW)
++                         - REP_C(1)); // account for *possible* carry
++  rep_t lo_corr = corr_UQ1 & loMask;
++  rep_t hi_corr = corr_UQ1 >> HW;
++  // x_UQ0 * corr_UQ1 = (x_UQ0_hw * 2^HW) * (hi_corr * 2^HW + lo_corr) - corr_UQ1
++  x_UQ0 =   ((rep_t)x_UQ0_hw * hi_corr << 1)
++          + ((rep_t)x_UQ0_hw * lo_corr >> (HW - 1))
++          - REP_C(2); // 1 to account for the highest bit of corr_UQ1 can be 1
++                      // 1 to account for possible carry
++  // Just like the case of half-width iterations but with possibility
++  // of overflowing by one extra Ulp of x_UQ0.
++  x_UQ0 -= 1U;
++  // ... and then traditional fixup by 2 should work
++
++  // On error estimation:
++  // abs(E_{N-1}) <=   (u_{N-1} + 2 /* due to conversion e_n -> E_n */) * 2^-HW
++  //                 + (2^-HW + 2^-W))
++  // abs(E_{N-1}) <= (u_{N-1} + 3.01) * 2^-HW
++
++  // Then like for the half-width iterations:
++  // With 0 <= eps1, eps2 < 2^-W
++  // E_N  = 4 * E_{N-1} * eps1 - (E_{N-1}^2 * b + 4 * eps2) + 4 * eps1 / b
++  // abs(E_N) <= 2^-W * [ 4 * abs(E_{N-1}) + max(2 * abs(E_{N-1})^2 * 2^W + 4, 8)) ]
++  // abs(E_N) <= 2^-W * [ 4 * (u_{N-1} + 3.01) * 2^-HW + max(4 + 2 * (u_{N-1} + 3.01)^2, 8) ]
++#endif
++
++  // Finally, account for possible overflow, as explained above.
++  x_UQ0 -= 2U;
++
++  // u_n for different precisions (with N-1 half-width iterations):
++  // W0 is the precision of C
++  //   u_0 = (3/4 - 1/sqrt(2) + 2^-W0) * 2^HW
++
++  // Estimated with bc:
++  //   define half1(un) { return 2.0 * (un + un^2) / 2.0^hw + 1.0; }
++  //   define half2(un) { return 2.0 * un / 2.0^hw + 2.0; }
++  //   define full1(un) { return 4.0 * (un + 3.01) / 2.0^hw + 2.0 * (un + 3.01)^2 + 4.0; }
++  //   define full2(un) { return 4.0 * (un + 3.01) / 2.0^hw + 8.0; }
++
++  //             | f32 (0 + 3) | f32 (2 + 1)  | f64 (3 + 1)  | f128 (4 + 1)
++  // u_0         | < 184224974 | < 2812.1     | < 184224974  | < 791240234244348797
++  // u_1         | < 15804007  | < 242.7      | < 15804007   | < 67877681371350440
++  // u_2         | < 116308    | < 2.81       | < 116308     | < 499533100252317
++  // u_3         | < 7.31      |              | < 7.31       | < 27054456580
++  // u_4         |             |              |              | < 80.4
++  // Final (U_N) | same as u_3 | < 72         | < 218        | < 13920
++
++  // Add 2 to U_N due to final decrement.
++
++#if defined(SINGLE_PRECISION) && NUMBER_OF_HALF_ITERATIONS == 2 && NUMBER_OF_FULL_ITERATIONS == 1
++#define RECIPROCAL_PRECISION REP_C(74)
++#elif defined(SINGLE_PRECISION) && NUMBER_OF_HALF_ITERATIONS == 0 && NUMBER_OF_FULL_ITERATIONS == 3
++#define RECIPROCAL_PRECISION REP_C(10)
++#elif defined(DOUBLE_PRECISION) && NUMBER_OF_HALF_ITERATIONS == 3 && NUMBER_OF_FULL_ITERATIONS == 1
++#define RECIPROCAL_PRECISION REP_C(220)
++#elif defined(QUAD_PRECISION) && NUMBER_OF_HALF_ITERATIONS == 4 && NUMBER_OF_FULL_ITERATIONS == 1
++#define RECIPROCAL_PRECISION REP_C(13922)
++#else
++#error Invalid number of iterations
++#endif
++
++  // Suppose 1/b - P * 2^-W < x < 1/b + P * 2^-W
++  x_UQ0 -= RECIPROCAL_PRECISION;
++  // Now 1/b - (2*P) * 2^-W < x < 1/b
++
++  rep_t quotient_UQ1, dummy;
++  wideMultiply(x_UQ0, aSignificand << 1, &quotient_UQ1, &dummy);
++  // Now, a/b - 4*P * 2^-W < q < a/b for q=<quotient_UQ1:dummy> in UQ1.(SB+1+W).
++
++  // quotient_UQ1 is in [0.5, 2.0) as UQ1.(SB+1),
++  // adjust it to be in [1.0, 2.0) as UQ1.SB.
++  rep_t residualLo;
++  if (quotient_UQ1 < (implicitBit << 1)) {
++    if (quotient_UQ1 < implicitBit) {
++      // In a rare case where quotient is < 0.5, we can adjust the quotient and
++      // the written exponent, and then treat them the same way as in [0.5, 1.0)
++      quotient_UQ1 <<= 1;
++      writtenExponent -= 1;
++    }
++    // Highest bit is 0, so just reinterpret quotient_UQ1 as UQ1.SB,
++    // effectively doubling its value as well as its error estimation.
++    residualLo = (aSignificand << (significandBits + 1)) - quotient_UQ1 * bSignificand;
++    writtenExponent -= 1;
++    aSignificand <<= 1;
++  } else {
++    // Highest bit is 1 (the UQ1.(SB+1) value is in [1, 2)), convert it
++    // to UQ1.SB by right shifting by 1. Least significant bit is omitted.
++    quotient_UQ1 >>= 1;
++    residualLo = (aSignificand << significandBits) - quotient_UQ1 * bSignificand;
++  }
++  // NB: residualLo is calculated above for the normal result case.
++  //     It is re-computed on denormal path that is expected to be not so
++  //     performance-sensitive.
++
++  // Now, q cannot be greater than a/b and can differ by at most 8*P * 2^-W + 2^-SB
++  // Each NextAfter() increments the floating point value by at least 2^-SB
++  // (more, if exponent was incremented).
++  // Different cases (<---> is of 2^-SB length, * = a/b that is shown as a midpoint):
++  //   q
++  //   |   | * |   |   |       |       |
++  //       <--->      2^t
++  //   |   |   |   |   |   *   |       |
++  //               q
++  // To require at most one NextAfter(), an error should be less than 1.5 * 2^-SB.
++  //   (8*P) * 2^-W + 2^-SB < 1.5 * 2^-SB
++  //   (8*P) * 2^-W         < 0.5 * 2^-SB
++  //   P < 2^(W-4-SB)
++  // Generally, for at most R NextAfter() to be enough,
++  //   P < (2*R - 1) * 2^(W-4-SB)
++  // For f32 (0+3): 10 < 32 (OK)
++  // For f32 (2+1): 32 < 74 < 32 * 3, so two NextAfter() are required
++  // For f64: 220 < 256 (OK)
++  // For f128: 4096 * 3 < 13922 < 4096 * 5 (three NextAfter() are required)
++
++  // If we have overflowed the exponent, return infinity
++  if (writtenExponent >= maxExponent)
++    return fromRep(infRep | quotientSign);
++
++  // Now, quotient_UQ1_SB <= the correctly-rounded result
++  // and may need taking NextAfter() up to 3 times (see error estimates above)
++  // r = a - b * q
++  rep_t absResult;
++  if (writtenExponent > 0) {
++    // Clear the implicit bit
++    absResult = quotient_UQ1 & significandMask;
++    // Insert the exponent
++    absResult |= (rep_t)writtenExponent << significandBits;
++    residualLo <<= 1;
++  } else {
++    // Prevent shift amount from being negative
++    if (significandBits + writtenExponent < 0)
++      return fromRep(quotientSign);
++
++    absResult = quotient_UQ1 >> (-writtenExponent + 1);
++
++    // multiplied by two to prevent shift amount to be negative
++    residualLo = (aSignificand << (significandBits + writtenExponent)) - (absResult * bSignificand << 1);
++  }
++
++  // Round
++  residualLo += absResult & 1; // tie to even
++  // The above line conditionally turns the below LT comparison into LTE
++  absResult += residualLo > bSignificand;
++#if defined(QUAD_PRECISION) || (defined(SINGLE_PRECISION) && NUMBER_OF_HALF_ITERATIONS > 0)
++  // Do not round Infinity to NaN
++  absResult += absResult < infRep && residualLo > (2 + 1) * bSignificand;
++#endif
++#if defined(QUAD_PRECISION)
++  absResult += absResult < infRep && residualLo > (4 + 1) * bSignificand;
++#endif
++  return fromRep(absResult | quotientSign);
++}
+diff --git a/libs/compiler-rt/lib/builtins/fp_extend.h b/libs/compiler-rt/lib/builtins/fp_extend.h
+new file mode 100644
+index 0000000..dab19e1
+--- /dev/null
++++ b/libs/compiler-rt/lib/builtins/fp_extend.h
+@@ -0,0 +1,196 @@
++//===-lib/fp_extend.h - low precision -> high precision conversion -*- C
++//-*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// Set source and destination setting
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef FP_EXTEND_HEADER
++#define FP_EXTEND_HEADER
++
++#include "int_lib.h"
++
++#if defined SRC_SINGLE
++typedef float src_t;
++typedef uint32_t src_rep_t;
++#define SRC_REP_C UINT32_C
++static const int srcBits = sizeof(src_t) * CHAR_BIT;
++static const int srcSigFracBits = 23;
++// -1 accounts for the sign bit.
++// srcBits - srcSigFracBits - 1
++static const int srcExpBits = 8;
++#define src_rep_t_clz clzsi
++
++#elif defined SRC_DOUBLE
++typedef double src_t;
++typedef uint64_t src_rep_t;
++#define SRC_REP_C UINT64_C
++static const int srcBits = sizeof(src_t) * CHAR_BIT;
++static const int srcSigFracBits = 52;
++// -1 accounts for the sign bit.
++// srcBits - srcSigFracBits - 1
++static const int srcExpBits = 11;
++
++static inline int src_rep_t_clz_impl(src_rep_t a) { return __builtin_clzll(a); }
++#define src_rep_t_clz src_rep_t_clz_impl
++
++#elif defined SRC_80
++typedef xf_float src_t;
++typedef __uint128_t src_rep_t;
++#define SRC_REP_C (__uint128_t)
++// sign bit, exponent and significand occupy the lower 80 bits.
++static const int srcBits = 80;
++static const int srcSigFracBits = 63;
++// -1 accounts for the sign bit.
++// -1 accounts for the explicitly stored integer bit.
++// srcBits - srcSigFracBits - 1 - 1
++static const int srcExpBits = 15;
++
++#elif defined SRC_HALF
++#ifdef COMPILER_RT_HAS_FLOAT16
++typedef _Float16 src_t;
++#else
++typedef uint16_t src_t;
++#endif
++typedef uint16_t src_rep_t;
++#define SRC_REP_C UINT16_C
++static const int srcBits = sizeof(src_t) * CHAR_BIT;
++static const int srcSigFracBits = 10;
++// -1 accounts for the sign bit.
++// srcBits - srcSigFracBits - 1
++static const int srcExpBits = 5;
++
++static inline int src_rep_t_clz_impl(src_rep_t a) {
++  return __builtin_clz(a) - 16;
++}
++
++#define src_rep_t_clz src_rep_t_clz_impl
++
++#elif defined SRC_BFLOAT16
++#ifdef COMPILER_RT_HAS_BFLOAT16
++typedef __bf16 src_t;
++#else
++typedef uint16_t src_t;
++#endif
++typedef uint16_t src_rep_t;
++#define SRC_REP_C UINT16_C
++static const int srcBits = sizeof(src_t) * CHAR_BIT;
++static const int srcSigFracBits = 7;
++// -1 accounts for the sign bit.
++// srcBits - srcSigFracBits - 1
++static const int srcExpBits = 8;
++#define src_rep_t_clz __builtin_clz
++
++#else
++#error Source should be half, single, or double precision!
++#endif // end source precision
++
++#if defined DST_SINGLE
++typedef float dst_t;
++typedef uint32_t dst_rep_t;
++#define DST_REP_C UINT32_C
++static const int dstBits = sizeof(dst_t) * CHAR_BIT;
++static const int dstSigFracBits = 23;
++// -1 accounts for the sign bit.
++// dstBits - dstSigFracBits - 1
++static const int dstExpBits = 8;
++
++#elif defined DST_DOUBLE
++typedef double dst_t;
++typedef uint64_t dst_rep_t;
++#define DST_REP_C UINT64_C
++static const int dstBits = sizeof(dst_t) * CHAR_BIT;
++static const int dstSigFracBits = 52;
++// -1 accounts for the sign bit.
++// dstBits - dstSigFracBits - 1
++static const int dstExpBits = 11;
++
++#elif defined DST_QUAD
++typedef tf_float dst_t;
++typedef __uint128_t dst_rep_t;
++#define DST_REP_C (__uint128_t)
++static const int dstBits = sizeof(dst_t) * CHAR_BIT;
++static const int dstSigFracBits = 112;
++// -1 accounts for the sign bit.
++// dstBits - dstSigFracBits - 1
++static const int dstExpBits = 15;
++
++#else
++#error Destination should be single, double, or quad precision!
++#endif // end destination precision
++
++// End of specialization parameters.
++
++// TODO: These helper routines should be placed into fp_lib.h
++// Currently they depend on macros/constants defined above.
++
++static inline src_rep_t extract_sign_from_src(src_rep_t x) {
++  const src_rep_t srcSignMask = SRC_REP_C(1) << (srcBits - 1);
++  return (x & srcSignMask) >> (srcBits - 1);
++}
++
++static inline src_rep_t extract_exp_from_src(src_rep_t x) {
++  const int srcSigBits = srcBits - 1 - srcExpBits;
++  const src_rep_t srcExpMask = ((SRC_REP_C(1) << srcExpBits) - 1) << srcSigBits;
++  return (x & srcExpMask) >> srcSigBits;
++}
++
++static inline src_rep_t extract_sig_frac_from_src(src_rep_t x) {
++  const src_rep_t srcSigFracMask = (SRC_REP_C(1) << srcSigFracBits) - 1;
++  return x & srcSigFracMask;
++}
++
++#ifdef src_rep_t_clz
++static inline int clz_in_sig_frac(src_rep_t sigFrac) {
++      const int skip = 1 + srcExpBits;
++      return src_rep_t_clz(sigFrac) - skip;
++}
++#endif
++
++static inline dst_rep_t construct_dst_rep(dst_rep_t sign, dst_rep_t exp, dst_rep_t sigFrac) {
++  return (sign << (dstBits - 1)) | (exp << (dstBits - 1 - dstExpBits)) | sigFrac;
++}
++
++// Helper routines for conversion to and from the representation of
++// floating-point data as integer values follow.
++
++static inline src_rep_t srcToRep(src_t x) {
++  const union {
++    src_t f;
++    src_rep_t i;
++  } rep = {.f = x};
++  return rep.i;
++}
++
++static inline src_t srcFromRep(src_rep_t x) {
++  const union {
++    src_t f;
++    src_rep_t i;
++  } rep = {.i = x};
++  return rep.f;
++}
++
++static inline dst_rep_t dstToRep(dst_t x) {
++  const union {
++    dst_t f;
++    dst_rep_t i;
++  } rep = {.f = x};
++  return rep.i;
++}
++
++static inline dst_t dstFromRep(dst_rep_t x) {
++  const union {
++    dst_t f;
++    dst_rep_t i;
++  } rep = {.i = x};
++  return rep.f;
++}
++// End helper routines.  Conversion implementation follows.
++
++#endif // FP_EXTEND_HEADER
+diff --git a/libs/compiler-rt/lib/builtins/fp_extend_impl.inc b/libs/compiler-rt/lib/builtins/fp_extend_impl.inc
+new file mode 100644
+index 0000000..f4f6630
+--- /dev/null
++++ b/libs/compiler-rt/lib/builtins/fp_extend_impl.inc
+@@ -0,0 +1,108 @@
++//=-lib/fp_extend_impl.inc - low precision -> high precision conversion -*-- -//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file implements a fairly generic conversion from a narrower to a wider
++// IEEE-754 floating-point type.  The constants and types defined following the
++// includes below parameterize the conversion.
++//
++// It does not support types that don't use the usual IEEE-754 interchange
++// formats; specifically, some work would be needed to adapt it to
++// (for example) the Intel 80-bit format or PowerPC double-double format.
++//
++// Note please, however, that this implementation is only intended to support
++// *widening* operations; if you need to convert to a *narrower* floating-point
++// type (e.g. double -> float), then this routine will not do what you want it
++// to.
++//
++// It also requires that integer types at least as large as both formats
++// are available on the target platform; this may pose a problem when trying
++// to add support for quad on some 32-bit systems, for example.  You also may
++// run into trouble finding an appropriate CLZ function for wide source types;
++// you will likely need to roll your own on some platforms.
++//
++// Finally, the following assumptions are made:
++//
++// 1. Floating-point types and integer types have the same endianness on the
++//    target platform.
++//
++// 2. Quiet NaNs, if supported, are indicated by the leading bit of the
++//    significand field being set.
++//
++//===----------------------------------------------------------------------===//
++
++#include "fp_extend.h"
++
++// The source type may use a usual IEEE-754 interchange format or Intel 80-bit
++// format. In particular, for the source type srcSigFracBits may be not equal to
++// srcSigBits. The destination type is assumed to be one of IEEE-754 standard
++// types.
++static __inline dst_t __extendXfYf2__(src_t a) {
++  // Various constants whose values follow from the type parameters.
++  // Any reasonable optimizer will fold and propagate all of these.
++  const int srcInfExp = (1 << srcExpBits) - 1;
++  const int srcExpBias = srcInfExp >> 1;
++
++  const int dstInfExp = (1 << dstExpBits) - 1;
++  const int dstExpBias = dstInfExp >> 1;
++
++  // Break a into a sign and representation of the absolute value.
++  const src_rep_t aRep = srcToRep(a);
++  const src_rep_t srcSign = extract_sign_from_src(aRep);
++  const src_rep_t srcExp = extract_exp_from_src(aRep);
++  const src_rep_t srcSigFrac = extract_sig_frac_from_src(aRep);
++
++  dst_rep_t dstSign = srcSign;
++  dst_rep_t dstExp;
++  dst_rep_t dstSigFrac;
++
++  if (srcExp >= 1 && srcExp < (src_rep_t)srcInfExp) {
++    // a is a normal number.
++    dstExp = (dst_rep_t)srcExp + (dst_rep_t)(dstExpBias - srcExpBias);
++    dstSigFrac = (dst_rep_t)srcSigFrac << (dstSigFracBits - srcSigFracBits);
++  }
++
++  else if (srcExp == srcInfExp) {
++    // a is NaN or infinity.
++    dstExp = dstInfExp;
++    dstSigFrac = (dst_rep_t)srcSigFrac << (dstSigFracBits - srcSigFracBits);
++  }
++
++  else if (srcSigFrac) {
++    // a is denormal.
++    if (srcExpBits == dstExpBits) {
++      // The exponent fields are identical and this is a denormal number, so all
++      // the non-significand bits are zero. In particular, this branch is always
++      // taken when we extend a denormal F80 to F128.
++      dstExp = 0;
++      dstSigFrac = ((dst_rep_t)srcSigFrac) << (dstSigFracBits - srcSigFracBits);
++    } else {
++#ifndef src_rep_t_clz
++      // If src_rep_t_clz is not defined this branch must be unreachable.
++      __builtin_unreachable();
++#else
++      // Renormalize the significand and clear the leading bit.
++      // For F80 -> F128 this codepath is unused.
++      const int scale = clz_in_sig_frac(srcSigFrac) + 1;
++      dstExp = dstExpBias - srcExpBias - scale + 1;
++      dstSigFrac = (dst_rep_t)srcSigFrac
++                   << (dstSigFracBits - srcSigFracBits + scale);
++      const dst_rep_t dstMinNormal = DST_REP_C(1) << (dstBits - 1 - dstExpBits);
++      dstSigFrac ^= dstMinNormal;
++#endif
++    }
++  }
++
++  else {
++    // a is zero.
++    dstExp = 0;
++    dstSigFrac = 0;
++  }
++
++  const dst_rep_t result = construct_dst_rep(dstSign, dstExp, dstSigFrac);
++  return dstFromRep(result);
++}
+diff --git a/libs/compiler-rt/lib/builtins/fp_fixint_impl.inc b/libs/compiler-rt/lib/builtins/fp_fixint_impl.inc
+index da70d4d..2f2f77c 100644
+--- a/libs/compiler-rt/lib/builtins/fp_fixint_impl.inc
++++ b/libs/compiler-rt/lib/builtins/fp_fixint_impl.inc
+@@ -1,9 +1,8 @@
+ //===-- lib/fixdfsi.c - Double-precision -> integer conversion ----*- C -*-===//
+ //
+-//                     The LLVM Compiler Infrastructure
+-//
+-// This file is dual licensed under the MIT and the University of Illinois Open
+-// Source Licenses. See LICENSE.TXT for details.
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ //
+ //===----------------------------------------------------------------------===//
+ //
+@@ -15,27 +14,27 @@
+ #include "fp_lib.h"
+ 
+ static __inline fixint_t __fixint(fp_t a) {
+-    const fixint_t fixint_max = (fixint_t)((~(fixuint_t)0) / 2);
+-    const fixint_t fixint_min = -fixint_max - 1;
+-    // Break a into sign, exponent, significand
+-    const rep_t aRep = toRep(a);
+-    const rep_t aAbs = aRep & absMask;
+-    const fixint_t sign = aRep & signBit ? -1 : 1;
+-    const int exponent = (aAbs >> significandBits) - exponentBias;
+-    const rep_t significand = (aAbs & significandMask) | implicitBit;
++  const fixint_t fixint_max = (fixint_t)((~(fixuint_t)0) / 2);
++  const fixint_t fixint_min = -fixint_max - 1;
++  // Break a into sign, exponent, significand parts.
++  const rep_t aRep = toRep(a);
++  const rep_t aAbs = aRep & absMask;
++  const fixint_t sign = aRep & signBit ? -1 : 1;
++  const int exponent = (aAbs >> significandBits) - exponentBias;
++  const rep_t significand = (aAbs & significandMask) | implicitBit;
+ 
+-    // If exponent is negative, the result is zero.
+-    if (exponent < 0)
+-        return 0;
++  // If exponent is negative, the result is zero.
++  if (exponent < 0)
++    return 0;
+ 
+-    // If the value is too large for the integer type, saturate.
+-    if ((unsigned)exponent >= sizeof(fixint_t) * CHAR_BIT)
+-        return sign == 1 ? fixint_max : fixint_min;
++  // If the value is too large for the integer type, saturate.
++  if ((unsigned)exponent >= sizeof(fixint_t) * CHAR_BIT)
++    return sign == 1 ? fixint_max : fixint_min;
+ 
+-    // If 0 <= exponent < significandBits, right shift to get the result.
+-    // Otherwise, shift left.
+-    if (exponent < significandBits)
+-        return sign * (significand >> (significandBits - exponent));
+-    else
+-        return sign * ((fixint_t)significand << (exponent - significandBits));
++  // If 0 <= exponent < significandBits, right shift to get the result.
++  // Otherwise, shift left.
++  if (exponent < significandBits)
++    return (fixint_t)(sign * (significand >> (significandBits - exponent)));
++  else
++    return (fixint_t)(sign * ((fixuint_t)significand << (exponent - significandBits)));
+ }
+diff --git a/libs/compiler-rt/lib/builtins/fp_fixuint_impl.inc b/libs/compiler-rt/lib/builtins/fp_fixuint_impl.inc
+index d68ccf2..cb2bf54 100644
+--- a/libs/compiler-rt/lib/builtins/fp_fixuint_impl.inc
++++ b/libs/compiler-rt/lib/builtins/fp_fixuint_impl.inc
+@@ -1,9 +1,8 @@
+ //===-- lib/fixdfsi.c - Double-precision -> integer conversion ----*- C -*-===//
+ //
+-//                     The LLVM Compiler Infrastructure
+-//
+-// This file is dual licensed under the MIT and the University of Illinois Open
+-// Source Licenses. See LICENSE.TXT for details.
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ //
+ //===----------------------------------------------------------------------===//
+ //
+@@ -15,25 +14,25 @@
+ #include "fp_lib.h"
+ 
+ static __inline fixuint_t __fixuint(fp_t a) {
+-    // Break a into sign, exponent, significand
+-    const rep_t aRep = toRep(a);
+-    const rep_t aAbs = aRep & absMask;
+-    const int sign = aRep & signBit ? -1 : 1;
+-    const int exponent = (aAbs >> significandBits) - exponentBias;
+-    const rep_t significand = (aAbs & significandMask) | implicitBit;
++  // Break a into sign, exponent, significand parts.
++  const rep_t aRep = toRep(a);
++  const rep_t aAbs = aRep & absMask;
++  const int sign = aRep & signBit ? -1 : 1;
++  const int exponent = (aAbs >> significandBits) - exponentBias;
++  const rep_t significand = (aAbs & significandMask) | implicitBit;
+ 
+-    // If either the value or the exponent is negative, the result is zero.
+-    if (sign == -1 || exponent < 0)
+-        return 0;
++  // If either the value or the exponent is negative, the result is zero.
++  if (sign == -1 || exponent < 0)
++    return 0;
+ 
+-    // If the value is too large for the integer type, saturate.
+-    if ((unsigned)exponent >= sizeof(fixuint_t) * CHAR_BIT)
+-        return ~(fixuint_t)0;
++  // If the value is too large for the integer type, saturate.
++  if ((unsigned)exponent >= sizeof(fixuint_t) * CHAR_BIT)
++    return ~(fixuint_t)0;
+ 
+-    // If 0 <= exponent < significandBits, right shift to get the result.
+-    // Otherwise, shift left.
+-    if (exponent < significandBits)
+-        return significand >> (significandBits - exponent);
+-    else
+-        return (fixuint_t)significand << (exponent - significandBits);
++  // If 0 <= exponent < significandBits, right shift to get the result.
++  // Otherwise, shift left.
++  if (exponent < significandBits)
++    return significand >> (significandBits - exponent);
++  else
++    return (fixuint_t)significand << (exponent - significandBits);
+ }
+diff --git a/libs/compiler-rt/lib/builtins/fp_lib.h b/libs/compiler-rt/lib/builtins/fp_lib.h
+index a0e19ab..caa2956 100644
+--- a/libs/compiler-rt/lib/builtins/fp_lib.h
++++ b/libs/compiler-rt/lib/builtins/fp_lib.h
+@@ -1,9 +1,8 @@
+ //===-- lib/fp_lib.h - Floating-point utilities -------------------*- C -*-===//
+ //
+-//                     The LLVM Compiler Infrastructure
+-//
+-// This file is dual licensed under the MIT and the University of Illinois Open
+-// Source Licenses. See LICENSE.TXT for details.
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ //
+ //===----------------------------------------------------------------------===//
+ //
+@@ -21,62 +20,44 @@
+ #ifndef FP_LIB_HEADER
+ #define FP_LIB_HEADER
+ 
+-#include <stdint.h>
+-#include <stdbool.h>
+-#include <limits.h>
+ #include "int_lib.h"
+ #include "int_math.h"
+-
+-// x86_64 FreeBSD prior v9.3 define fixed-width types incorrectly in
+-// 32-bit mode.
+-#if defined(__FreeBSD__) && defined(__i386__)
+-# include <sys/param.h>
+-# if __FreeBSD_version < 903000  // v9.3
+-#  define uint64_t unsigned long long
+-#  define int64_t long long
+-#  undef UINT64_C
+-#  define UINT64_C(c) (c ## ULL)
+-# endif
+-#endif
++#include "int_types.h"
++#include <limits.h>
++#include <stdbool.h>
++#include <stdint.h>
+ 
+ #if defined SINGLE_PRECISION
+ 
++typedef uint16_t half_rep_t;
+ typedef uint32_t rep_t;
++typedef uint64_t twice_rep_t;
+ typedef int32_t srep_t;
+ typedef float fp_t;
++#define HALF_REP_C UINT16_C
+ #define REP_C UINT32_C
+ #define significandBits 23
+ 
+-static __inline int rep_clz(rep_t a) {
+-    return __builtin_clz(a);
+-}
++static __inline int rep_clz(rep_t a) { return clzsi(a); }
+ 
+ // 32x32 --> 64 bit multiply
+ static __inline void wideMultiply(rep_t a, rep_t b, rep_t *hi, rep_t *lo) {
+-    const uint64_t product = (uint64_t)a*b;
+-    *hi = product >> 32;
+-    *lo = product;
++  const uint64_t product = (uint64_t)a * b;
++  *hi = (rep_t)(product >> 32);
++  *lo = (rep_t)product;
+ }
+-COMPILER_RT_ABI fp_t __addsf3(fp_t a, fp_t b);
+ 
+ #elif defined DOUBLE_PRECISION
+ 
++typedef uint32_t half_rep_t;
+ typedef uint64_t rep_t;
+ typedef int64_t srep_t;
+ typedef double fp_t;
++#define HALF_REP_C UINT32_C
+ #define REP_C UINT64_C
+ #define significandBits 52
+ 
+-static __inline int rep_clz(rep_t a) {
+-#if defined __LP64__
+-    return __builtin_clzl(a);
+-#else
+-    if (a & REP_C(0xffffffff00000000))
+-        return __builtin_clz(a >> 32);
+-    else
+-        return 32 + __builtin_clz(a & REP_C(0xffffffff));
+-#endif
+-}
++static inline int rep_clz(rep_t a) { return __builtin_clzll(a); }
+ 
+ #define loWord(a) (a & 0xffffffffU)
+ #define hiWord(a) (a >> 32)
+@@ -85,61 +66,64 @@ static __inline int rep_clz(rep_t a) {
+ // many 64-bit platforms have this operation, but they tend to have hardware
+ // floating-point, so we don't bother with a special case for them here.
+ static __inline void wideMultiply(rep_t a, rep_t b, rep_t *hi, rep_t *lo) {
+-    // Each of the component 32x32 -> 64 products
+-    const uint64_t plolo = loWord(a) * loWord(b);
+-    const uint64_t plohi = loWord(a) * hiWord(b);
+-    const uint64_t philo = hiWord(a) * loWord(b);
+-    const uint64_t phihi = hiWord(a) * hiWord(b);
+-    // Sum terms that contribute to lo in a way that allows us to get the carry
+-    const uint64_t r0 = loWord(plolo);
+-    const uint64_t r1 = hiWord(plolo) + loWord(plohi) + loWord(philo);
+-    *lo = r0 + (r1 << 32);
+-    // Sum terms contributing to hi with the carry from lo
+-    *hi = hiWord(plohi) + hiWord(philo) + hiWord(r1) + phihi;
++  // Each of the component 32x32 -> 64 products
++  const uint64_t plolo = loWord(a) * loWord(b);
++  const uint64_t plohi = loWord(a) * hiWord(b);
++  const uint64_t philo = hiWord(a) * loWord(b);
++  const uint64_t phihi = hiWord(a) * hiWord(b);
++  // Sum terms that contribute to lo in a way that allows us to get the carry
++  const uint64_t r0 = loWord(plolo);
++  const uint64_t r1 = hiWord(plolo) + loWord(plohi) + loWord(philo);
++  *lo = r0 + (r1 << 32);
++  // Sum terms contributing to hi with the carry from lo
++  *hi = hiWord(plohi) + hiWord(philo) + hiWord(r1) + phihi;
+ }
+ #undef loWord
+ #undef hiWord
+ 
+-COMPILER_RT_ABI fp_t __adddf3(fp_t a, fp_t b);
+-
+ #elif defined QUAD_PRECISION
+-#if __LDBL_MANT_DIG__ == 113
+-#define CRT_LDBL_128BIT
++#if defined(CRT_HAS_F128) && defined(CRT_HAS_128BIT)
++typedef uint64_t half_rep_t;
+ typedef __uint128_t rep_t;
+ typedef __int128_t srep_t;
+-typedef long double fp_t;
++typedef tf_float fp_t;
++#define HALF_REP_C UINT64_C
+ #define REP_C (__uint128_t)
++#if defined(CRT_HAS_IEEE_TF)
+ // Note: Since there is no explicit way to tell compiler the constant is a
+ // 128-bit integer, we let the constant be casted to 128-bit integer
+ #define significandBits 112
++#define TF_MANT_DIG (significandBits + 1)
+ 
+ static __inline int rep_clz(rep_t a) {
+-    const union
+-        {
+-             __uint128_t ll;
++  const union {
++    __uint128_t ll;
+ #if _YUGA_BIG_ENDIAN
+-             struct { uint64_t high, low; } s;
++    struct {
++      uint64_t high, low;
++    } s;
+ #else
+-             struct { uint64_t low, high; } s;
++    struct {
++      uint64_t low, high;
++    } s;
+ #endif
+-        } uu = { .ll = a };
++  } uu = {.ll = a};
+ 
+-    uint64_t word;
+-    uint64_t add;
++  uint64_t word;
++  uint64_t add;
+ 
+-    if (uu.s.high){
+-        word = uu.s.high;
+-        add = 0;
+-    }
+-    else{
+-        word = uu.s.low;
+-        add = 64;
+-    }
+-    return __builtin_clzll(word) + add;
++  if (uu.s.high) {
++    word = uu.s.high;
++    add = 0;
++  } else {
++    word = uu.s.low;
++    add = 64;
++  }
++  return __builtin_clzll(word) + add;
+ }
+ 
+-#define Word_LoMask   UINT64_C(0x00000000ffffffff)
+-#define Word_HiMask   UINT64_C(0xffffffff00000000)
++#define Word_LoMask UINT64_C(0x00000000ffffffff)
++#define Word_HiMask UINT64_C(0xffffffff00000000)
+ #define Word_FullMask UINT64_C(0xffffffffffffffff)
+ #define Word_1(a) (uint64_t)((a >> 96) & Word_LoMask)
+ #define Word_2(a) (uint64_t)((a >> 64) & Word_LoMask)
+@@ -151,55 +135,44 @@ static __inline int rep_clz(rep_t a) {
+ // floating-point, so we don't bother with a special case for them here.
+ static __inline void wideMultiply(rep_t a, rep_t b, rep_t *hi, rep_t *lo) {
+ 
+-    const uint64_t product11 = Word_1(a) * Word_1(b);
+-    const uint64_t product12 = Word_1(a) * Word_2(b);
+-    const uint64_t product13 = Word_1(a) * Word_3(b);
+-    const uint64_t product14 = Word_1(a) * Word_4(b);
+-    const uint64_t product21 = Word_2(a) * Word_1(b);
+-    const uint64_t product22 = Word_2(a) * Word_2(b);
+-    const uint64_t product23 = Word_2(a) * Word_3(b);
+-    const uint64_t product24 = Word_2(a) * Word_4(b);
+-    const uint64_t product31 = Word_3(a) * Word_1(b);
+-    const uint64_t product32 = Word_3(a) * Word_2(b);
+-    const uint64_t product33 = Word_3(a) * Word_3(b);
+-    const uint64_t product34 = Word_3(a) * Word_4(b);
+-    const uint64_t product41 = Word_4(a) * Word_1(b);
+-    const uint64_t product42 = Word_4(a) * Word_2(b);
+-    const uint64_t product43 = Word_4(a) * Word_3(b);
+-    const uint64_t product44 = Word_4(a) * Word_4(b);
+-
+-    const __uint128_t sum0 = (__uint128_t)product44;
+-    const __uint128_t sum1 = (__uint128_t)product34 +
+-                             (__uint128_t)product43;
+-    const __uint128_t sum2 = (__uint128_t)product24 +
+-                             (__uint128_t)product33 +
+-                             (__uint128_t)product42;
+-    const __uint128_t sum3 = (__uint128_t)product14 +
+-                             (__uint128_t)product23 +
+-                             (__uint128_t)product32 +
+-                             (__uint128_t)product41;
+-    const __uint128_t sum4 = (__uint128_t)product13 +
+-                             (__uint128_t)product22 +
+-                             (__uint128_t)product31;
+-    const __uint128_t sum5 = (__uint128_t)product12 +
+-                             (__uint128_t)product21;
+-    const __uint128_t sum6 = (__uint128_t)product11;
+-
+-    const __uint128_t r0 = (sum0 & Word_FullMask) +
+-                           ((sum1 & Word_LoMask) << 32);
+-    const __uint128_t r1 = (sum0 >> 64) +
+-                           ((sum1 >> 32) & Word_FullMask) +
+-                           (sum2 & Word_FullMask) +
+-                           ((sum3 << 32) & Word_HiMask);
+-
+-    *lo = r0 + (r1 << 64);
+-    *hi = (r1 >> 64) +
+-          (sum1 >> 96) +
+-          (sum2 >> 64) +
+-          (sum3 >> 32) +
+-          sum4 +
+-          (sum5 << 32) +
+-          (sum6 << 64);
++  const uint64_t product11 = Word_1(a) * Word_1(b);
++  const uint64_t product12 = Word_1(a) * Word_2(b);
++  const uint64_t product13 = Word_1(a) * Word_3(b);
++  const uint64_t product14 = Word_1(a) * Word_4(b);
++  const uint64_t product21 = Word_2(a) * Word_1(b);
++  const uint64_t product22 = Word_2(a) * Word_2(b);
++  const uint64_t product23 = Word_2(a) * Word_3(b);
++  const uint64_t product24 = Word_2(a) * Word_4(b);
++  const uint64_t product31 = Word_3(a) * Word_1(b);
++  const uint64_t product32 = Word_3(a) * Word_2(b);
++  const uint64_t product33 = Word_3(a) * Word_3(b);
++  const uint64_t product34 = Word_3(a) * Word_4(b);
++  const uint64_t product41 = Word_4(a) * Word_1(b);
++  const uint64_t product42 = Word_4(a) * Word_2(b);
++  const uint64_t product43 = Word_4(a) * Word_3(b);
++  const uint64_t product44 = Word_4(a) * Word_4(b);
++
++  const __uint128_t sum0 = (__uint128_t)product44;
++  const __uint128_t sum1 = (__uint128_t)product34 + (__uint128_t)product43;
++  const __uint128_t sum2 =
++      (__uint128_t)product24 + (__uint128_t)product33 + (__uint128_t)product42;
++  const __uint128_t sum3 = (__uint128_t)product14 + (__uint128_t)product23 +
++                           (__uint128_t)product32 + (__uint128_t)product41;
++  const __uint128_t sum4 =
++      (__uint128_t)product13 + (__uint128_t)product22 + (__uint128_t)product31;
++  const __uint128_t sum5 = (__uint128_t)product12 + (__uint128_t)product21;
++  const __uint128_t sum6 = (__uint128_t)product11;
++
++  const __uint128_t r0 = (sum0 & Word_FullMask) + ((sum1 & Word_LoMask) << 32);
++  const __uint128_t r1 = (sum0 >> 64) + ((sum1 >> 32) & Word_FullMask) +
++                         (sum2 & Word_FullMask) + ((sum3 << 32) & Word_HiMask);
++
++  *lo = r0 + (r1 << 64);
++  // The addition above can overflow, in which case `*lo` will be less than
++  // `r0`. Carry any overflow into `hi`.
++  const bool carry = *lo < r0;
++  *hi = (r1 >> 64) + (sum1 >> 96) + (sum2 >> 64) + (sum3 >> 32) + sum4 +
++        (sum5 << 32) + (sum6 << 64) + carry;
+ }
+ #undef Word_1
+ #undef Word_2
+@@ -208,63 +181,75 @@ static __inline void wideMultiply(rep_t a, rep_t b, rep_t *hi, rep_t *lo) {
+ #undef Word_HiMask
+ #undef Word_LoMask
+ #undef Word_FullMask
+-#endif // __LDBL_MANT_DIG__ == 113
++#endif // defined(CRT_HAS_IEEE_TF)
++#else
++typedef long double fp_t;
++#endif // defined(CRT_HAS_F128) && defined(CRT_HAS_128BIT)
+ #else
+ #error SINGLE_PRECISION, DOUBLE_PRECISION or QUAD_PRECISION must be defined.
+ #endif
+ 
+-#if defined(SINGLE_PRECISION) || defined(DOUBLE_PRECISION) || defined(CRT_LDBL_128BIT)
+-#define typeWidth       (sizeof(rep_t)*CHAR_BIT)
+-#define exponentBits    (typeWidth - significandBits - 1)
+-#define maxExponent     ((1 << exponentBits) - 1)
+-#define exponentBias    (maxExponent >> 1)
+-
+-#define implicitBit     (REP_C(1) << significandBits)
+-#define significandMask (implicitBit - 1U)
+-#define signBit         (REP_C(1) << (significandBits + exponentBits))
+-#define absMask         (signBit - 1U)
+-#define exponentMask    (absMask ^ significandMask)
+-#define oneRep          ((rep_t)exponentBias << significandBits)
+-#define infRep          exponentMask
+-#define quietBit        (implicitBit >> 1)
+-#define qnanRep         (exponentMask | quietBit)
++#if defined(SINGLE_PRECISION) || defined(DOUBLE_PRECISION) ||                  \
++    (defined(QUAD_PRECISION) && defined(CRT_HAS_TF_MODE))
++#define typeWidth (sizeof(rep_t) * CHAR_BIT)
+ 
+ static __inline rep_t toRep(fp_t x) {
+-    const union { fp_t f; rep_t i; } rep = {.f = x};
+-    return rep.i;
++  const union {
++    fp_t f;
++    rep_t i;
++  } rep = {.f = x};
++  return rep.i;
+ }
+ 
+ static __inline fp_t fromRep(rep_t x) {
+-    const union { fp_t f; rep_t i; } rep = {.i = x};
+-    return rep.f;
++  const union {
++    fp_t f;
++    rep_t i;
++  } rep = {.i = x};
++  return rep.f;
+ }
+ 
++#if !defined(QUAD_PRECISION) || defined(CRT_HAS_IEEE_TF)
++#define exponentBits (typeWidth - significandBits - 1)
++#define maxExponent ((1 << exponentBits) - 1)
++#define exponentBias (maxExponent >> 1)
++
++#define implicitBit (REP_C(1) << significandBits)
++#define significandMask (implicitBit - 1U)
++#define signBit (REP_C(1) << (significandBits + exponentBits))
++#define absMask (signBit - 1U)
++#define exponentMask (absMask ^ significandMask)
++#define oneRep ((rep_t)exponentBias << significandBits)
++#define infRep exponentMask
++#define quietBit (implicitBit >> 1)
++#define qnanRep (exponentMask | quietBit)
++
+ static __inline int normalize(rep_t *significand) {
+-    const int shift = rep_clz(*significand) - rep_clz(implicitBit);
+-    *significand <<= shift;
+-    return 1 - shift;
++  const int shift = rep_clz(*significand) - rep_clz(implicitBit);
++  *significand <<= shift;
++  return 1 - shift;
+ }
+ 
+-static __inline void wideLeftShift(rep_t *hi, rep_t *lo, int count) {
+-    *hi = *hi << count | *lo >> (typeWidth - count);
+-    *lo = *lo << count;
++static __inline void wideLeftShift(rep_t *hi, rep_t *lo, unsigned int count) {
++  *hi = *hi << count | *lo >> (typeWidth - count);
++  *lo = *lo << count;
+ }
+ 
+-static __inline void wideRightShiftWithSticky(rep_t *hi, rep_t *lo, unsigned int count) {
+-    if (count < typeWidth) {
+-        const bool sticky = *lo << (typeWidth - count);
+-        *lo = *hi << (typeWidth - count) | *lo >> count | sticky;
+-        *hi = *hi >> count;
+-    }
+-    else if (count < 2*typeWidth) {
+-        const bool sticky = *hi << (2*typeWidth - count) | *lo;
+-        *lo = *hi >> (count - typeWidth) | sticky;
+-        *hi = 0;
+-    } else {
+-        const bool sticky = *hi | *lo;
+-        *lo = sticky;
+-        *hi = 0;
+-    }
++static __inline void wideRightShiftWithSticky(rep_t *hi, rep_t *lo,
++                                              unsigned int count) {
++  if (count < typeWidth) {
++    const bool sticky = (*lo << (typeWidth - count)) != 0;
++    *lo = *hi << (typeWidth - count) | *lo >> count | sticky;
++    *hi = *hi >> count;
++  } else if (count < 2 * typeWidth) {
++    const bool sticky = *hi << (2 * typeWidth - count) | *lo;
++    *lo = *hi >> (count - typeWidth) | sticky;
++    *hi = 0;
++  } else {
++    const bool sticky = *hi | *lo;
++    *lo = sticky;
++    *hi = 0;
++  }
+ }
+ 
+ // Implements logb methods (logb, logbf, logbl) for IEEE-754. This avoids
+@@ -280,9 +265,9 @@ static __inline fp_t __compiler_rt_logbX(fp_t x) {
+   // 2) 0.0 returns -inf
+   if (exp == maxExponent) {
+     if (((rep & signBit) == 0) || (x != x)) {
+-      return x;  // NaN or +inf: return x
++      return x; // NaN or +inf: return x
+     } else {
+-      return -x;  // -inf: return -x
++      return -x; // -inf: return -x
+     }
+   } else if (x == 0.0) {
+     // 0.0: return -inf
+@@ -291,37 +276,132 @@ static __inline fp_t __compiler_rt_logbX(fp_t x) {
+ 
+   if (exp != 0) {
+     // Normal number
+-    return exp - exponentBias;  // Unbias exponent
++    return exp - exponentBias; // Unbias exponent
+   } else {
+     // Subnormal number; normalize and repeat
+     rep &= absMask;
+     const int shift = 1 - normalize(&rep);
+     exp = (rep & exponentMask) >> significandBits;
+-    return exp - exponentBias - shift;  // Unbias exponent
++    return exp - exponentBias - shift; // Unbias exponent
++  }
++}
++
++// Avoid using scalbn from libm. Unlike libc/libm scalbn, this function never
++// sets errno on underflow/overflow.
++static __inline fp_t __compiler_rt_scalbnX(fp_t x, int y) {
++  const rep_t rep = toRep(x);
++  int exp = (rep & exponentMask) >> significandBits;
++
++  if (x == 0.0 || exp == maxExponent)
++    return x; // +/- 0.0, NaN, or inf: return x
++
++  // Normalize subnormal input.
++  rep_t sig = rep & significandMask;
++  if (exp == 0) {
++    exp += normalize(&sig);
++    sig &= ~implicitBit; // clear the implicit bit again
++  }
++
++  if (__builtin_sadd_overflow(exp, y, &exp)) {
++    // Saturate the exponent, which will guarantee an underflow/overflow below.
++    exp = (y >= 0) ? INT_MAX : INT_MIN;
+   }
++
++  // Return this value: [+/-] 1.sig * 2 ** (exp - exponentBias).
++  const rep_t sign = rep & signBit;
++  if (exp >= maxExponent) {
++    // Overflow, which could produce infinity or the largest-magnitude value,
++    // depending on the rounding mode.
++    return fromRep(sign | ((rep_t)(maxExponent - 1) << significandBits)) * 2.0f;
++  } else if (exp <= 0) {
++    // Subnormal or underflow. Use floating-point multiply to handle truncation
++    // correctly.
++    fp_t tmp = fromRep(sign | (REP_C(1) << significandBits) | sig);
++    exp += exponentBias - 1;
++    if (exp < 1)
++      exp = 1;
++    tmp *= fromRep((rep_t)exp << significandBits);
++    return tmp;
++  } else
++    return fromRep(sign | ((rep_t)exp << significandBits) | sig);
++}
++
++#endif // !defined(QUAD_PRECISION) || defined(CRT_HAS_IEEE_TF)
++
++// Avoid using fmax from libm.
++static __inline fp_t __compiler_rt_fmaxX(fp_t x, fp_t y) {
++  // If either argument is NaN, return the other argument. If both are NaN,
++  // arbitrarily return the second one. Otherwise, if both arguments are +/-0,
++  // arbitrarily return the first one.
++  return (crt_isnan(x) || x < y) ? y : x;
+ }
++
+ #endif
+ 
+ #if defined(SINGLE_PRECISION)
++
+ static __inline fp_t __compiler_rt_logbf(fp_t x) {
+   return __compiler_rt_logbX(x);
+ }
++static __inline fp_t __compiler_rt_scalbnf(fp_t x, int y) {
++  return __compiler_rt_scalbnX(x, y);
++}
++
+ #elif defined(DOUBLE_PRECISION)
++
+ static __inline fp_t __compiler_rt_logb(fp_t x) {
+   return __compiler_rt_logbX(x);
+ }
+-#elif defined(QUAD_PRECISION)
+-  #if defined(CRT_LDBL_128BIT)
+-static __inline fp_t __compiler_rt_logbl(fp_t x) {
+-  return __compiler_rt_logbX(x);
++static __inline fp_t __compiler_rt_scalbn(fp_t x, int y) {
++  return __compiler_rt_scalbnX(x, y);
++}
++static __inline fp_t __compiler_rt_fmax(fp_t x, fp_t y) {
++#if defined(__aarch64__) || defined(__arm64ec__)
++  // Use __builtin_fmax which turns into an fmaxnm instruction on AArch64.
++  return __builtin_fmax(x, y);
++#else
++  // __builtin_fmax frequently turns into a libm call, so inline the function.
++  return __compiler_rt_fmaxX(x, y);
++#endif
+ }
+-  #else
++
++#elif defined(QUAD_PRECISION) && defined(CRT_HAS_TF_MODE)
+ // The generic implementation only works for ieee754 floating point. For other
+ // floating point types, continue to rely on the libm implementation for now.
+-static __inline long double __compiler_rt_logbl(long double x) {
++#if defined(CRT_HAS_IEEE_TF)
++static __inline tf_float __compiler_rt_logbtf(tf_float x) {
++  return __compiler_rt_logbX(x);
++}
++static __inline tf_float __compiler_rt_scalbntf(tf_float x, int y) {
++  return __compiler_rt_scalbnX(x, y);
++}
++static __inline tf_float __compiler_rt_fmaxtf(tf_float x, tf_float y) {
++  return __compiler_rt_fmaxX(x, y);
++}
++#define __compiler_rt_logbl __compiler_rt_logbtf
++#define __compiler_rt_scalbnl __compiler_rt_scalbntf
++#define __compiler_rt_fmaxl __compiler_rt_fmaxtf
++#define crt_fabstf crt_fabsf128
++#define crt_copysigntf crt_copysignf128
++#elif defined(CRT_LDBL_128BIT)
++static __inline tf_float __compiler_rt_logbtf(tf_float x) {
+   return crt_logbl(x);
+ }
+-  #endif
++static __inline tf_float __compiler_rt_scalbntf(tf_float x, int y) {
++  return crt_scalbnl(x, y);
++}
++static __inline tf_float __compiler_rt_fmaxtf(tf_float x, tf_float y) {
++  return crt_fmaxl(x, y);
++}
++#define __compiler_rt_logbl crt_logbl
++#define __compiler_rt_scalbnl crt_scalbnl
++#define __compiler_rt_fmaxl crt_fmaxl
++#define crt_fabstf crt_fabsl
++#define crt_copysigntf crt_copysignl
++#else
++#error Unsupported TF mode type
+ #endif
+ 
++#endif // *_PRECISION
++
+ #endif // FP_LIB_HEADER
+diff --git a/libs/compiler-rt/lib/builtins/fp_mode.c b/libs/compiler-rt/lib/builtins/fp_mode.c
+new file mode 100644
+index 0000000..5186547
+--- /dev/null
++++ b/libs/compiler-rt/lib/builtins/fp_mode.c
+@@ -0,0 +1,22 @@
++//===----- lib/fp_mode.c - Floaing-point environment mode utilities --C -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file provides a default implementation of fp_mode.h for architectures
++// that does not support or does not have an implementation of floating point
++// environment mode.
++//
++//===----------------------------------------------------------------------===//
++
++#include "fp_mode.h"
++
++// IEEE-754 default rounding (to nearest, ties to even).
++CRT_FE_ROUND_MODE __fe_getround(void) { return CRT_FE_TONEAREST; }
++
++int __fe_raise_inexact(void) {
++  return 0;
++}
+diff --git a/libs/compiler-rt/lib/builtins/fp_mode.h b/libs/compiler-rt/lib/builtins/fp_mode.h
+new file mode 100644
+index 0000000..5b4969a
+--- /dev/null
++++ b/libs/compiler-rt/lib/builtins/fp_mode.h
+@@ -0,0 +1,29 @@
++//===----- lib/fp_mode.h - Floaing-point environment mode utilities --C -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file is not part of the interface of this library.
++//
++// This file defines an interface for accessing hardware floating point
++// environment mode.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef FP_MODE_H
++#define FP_MODE_H
++
++typedef enum {
++  CRT_FE_TONEAREST,
++  CRT_FE_DOWNWARD,
++  CRT_FE_UPWARD,
++  CRT_FE_TOWARDZERO
++} CRT_FE_ROUND_MODE;
++
++CRT_FE_ROUND_MODE __fe_getround(void);
++int __fe_raise_inexact(void);
++
++#endif // FP_MODE_H
+diff --git a/libs/compiler-rt/lib/builtins/fp_mul_impl.inc b/libs/compiler-rt/lib/builtins/fp_mul_impl.inc
+new file mode 100644
+index 0000000..a93f2d7
+--- /dev/null
++++ b/libs/compiler-rt/lib/builtins/fp_mul_impl.inc
+@@ -0,0 +1,128 @@
++//===---- lib/fp_mul_impl.inc - floating point multiplication -----*- C -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file implements soft-float multiplication with the IEEE-754 default
++// rounding (to nearest, ties to even).
++//
++//===----------------------------------------------------------------------===//
++
++#include "fp_lib.h"
++
++static __inline fp_t __mulXf3__(fp_t a, fp_t b) {
++  const unsigned int aExponent = toRep(a) >> significandBits & maxExponent;
++  const unsigned int bExponent = toRep(b) >> significandBits & maxExponent;
++  const rep_t productSign = (toRep(a) ^ toRep(b)) & signBit;
++
++  rep_t aSignificand = toRep(a) & significandMask;
++  rep_t bSignificand = toRep(b) & significandMask;
++  int scale = 0;
++
++  // Detect if a or b is zero, denormal, infinity, or NaN.
++  if (aExponent - 1U >= maxExponent - 1U ||
++      bExponent - 1U >= maxExponent - 1U) {
++
++    const rep_t aAbs = toRep(a) & absMask;
++    const rep_t bAbs = toRep(b) & absMask;
++
++    // NaN * anything = qNaN
++    if (aAbs > infRep)
++      return fromRep(toRep(a) | quietBit);
++    // anything * NaN = qNaN
++    if (bAbs > infRep)
++      return fromRep(toRep(b) | quietBit);
++
++    if (aAbs == infRep) {
++      // infinity * non-zero = +/- infinity
++      if (bAbs)
++        return fromRep(aAbs | productSign);
++      // infinity * zero = NaN
++      else
++        return fromRep(qnanRep);
++    }
++
++    if (bAbs == infRep) {
++      // non-zero * infinity = +/- infinity
++      if (aAbs)
++        return fromRep(bAbs | productSign);
++      // zero * infinity = NaN
++      else
++        return fromRep(qnanRep);
++    }
++
++    // zero * anything = +/- zero
++    if (!aAbs)
++      return fromRep(productSign);
++    // anything * zero = +/- zero
++    if (!bAbs)
++      return fromRep(productSign);
++
++    // One or both of a or b is denormal.  The other (if applicable) is a
++    // normal number.  Renormalize one or both of a and b, and set scale to
++    // include the necessary exponent adjustment.
++    if (aAbs < implicitBit)
++      scale += normalize(&aSignificand);
++    if (bAbs < implicitBit)
++      scale += normalize(&bSignificand);
++  }
++
++  // Set the implicit significand bit.  If we fell through from the
++  // denormal path it was already set by normalize( ), but setting it twice
++  // won't hurt anything.
++  aSignificand |= implicitBit;
++  bSignificand |= implicitBit;
++
++  // Perform a basic multiplication on the significands.  One of them must be
++  // shifted beforehand to be aligned with the exponent.
++  rep_t productHi, productLo;
++  wideMultiply(aSignificand, bSignificand << exponentBits, &productHi,
++               &productLo);
++
++  int productExponent = aExponent + bExponent - exponentBias + scale;
++
++  // Normalize the significand and adjust the exponent if needed.
++  if (productHi & implicitBit)
++    productExponent++;
++  else
++    wideLeftShift(&productHi, &productLo, 1);
++
++  // If we have overflowed the type, return +/- infinity.
++  if (productExponent >= maxExponent)
++    return fromRep(infRep | productSign);
++
++  if (productExponent <= 0) {
++    // The result is denormal before rounding.
++    //
++    // If the result is so small that it just underflows to zero, return
++    // zero with the appropriate sign.  Mathematically, there is no need to
++    // handle this case separately, but we make it a special case to
++    // simplify the shift logic.
++    const unsigned int shift = REP_C(1) - (unsigned int)productExponent;
++    if (shift >= typeWidth)
++      return fromRep(productSign);
++
++    // Otherwise, shift the significand of the result so that the round
++    // bit is the high bit of productLo.
++    wideRightShiftWithSticky(&productHi, &productLo, shift);
++  } else {
++    // The result is normal before rounding.  Insert the exponent.
++    productHi &= significandMask;
++    productHi |= (rep_t)productExponent << significandBits;
++  }
++
++  // Insert the sign of the result.
++  productHi |= productSign;
++
++  // Perform the final rounding.  The final result may overflow to infinity,
++  // or underflow to zero, but those are the correct results in those cases.
++  // We use the default IEEE-754 round-to-nearest, ties-to-even rounding mode.
++  if (productLo > signBit)
++    productHi++;
++  if (productLo == signBit)
++    productHi += productHi & 1;
++  return fromRep(productHi);
++}
+diff --git a/libs/compiler-rt/lib/builtins/fp_trunc.h b/libs/compiler-rt/lib/builtins/fp_trunc.h
+new file mode 100644
+index 0000000..7010ed4
+--- /dev/null
++++ b/libs/compiler-rt/lib/builtins/fp_trunc.h
+@@ -0,0 +1,186 @@
++//=== lib/fp_trunc.h - high precision -> low precision conversion *- C -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// Set source and destination precision setting
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef FP_TRUNC_HEADER
++#define FP_TRUNC_HEADER
++
++#include "int_lib.h"
++
++#if defined SRC_SINGLE
++typedef float src_t;
++typedef uint32_t src_rep_t;
++#define SRC_REP_C UINT32_C
++static const int srcBits = sizeof(src_t) * CHAR_BIT;
++static const int srcSigFracBits = 23;
++// -1 accounts for the sign bit.
++// srcBits - srcSigFracBits - 1
++static const int srcExpBits = 8;
++
++#elif defined SRC_DOUBLE
++typedef double src_t;
++typedef uint64_t src_rep_t;
++#define SRC_REP_C UINT64_C
++static const int srcBits = sizeof(src_t) * CHAR_BIT;
++static const int srcSigFracBits = 52;
++// -1 accounts for the sign bit.
++// srcBits - srcSigFracBits - 1
++static const int srcExpBits = 11;
++
++#elif defined SRC_80
++typedef xf_float src_t;
++typedef __uint128_t src_rep_t;
++#define SRC_REP_C (__uint128_t)
++// sign bit, exponent and significand occupy the lower 80 bits.
++static const int srcBits = 80;
++static const int srcSigFracBits = 63;
++// -1 accounts for the sign bit.
++// -1 accounts for the explicitly stored integer bit.
++// srcBits - srcSigFracBits - 1 - 1
++static const int srcExpBits = 15;
++
++#elif defined SRC_QUAD
++typedef tf_float src_t;
++typedef __uint128_t src_rep_t;
++#define SRC_REP_C (__uint128_t)
++static const int srcBits = sizeof(src_t) * CHAR_BIT;
++static const int srcSigFracBits = 112;
++// -1 accounts for the sign bit.
++// srcBits - srcSigFracBits - 1
++static const int srcExpBits = 15;
++
++#else
++#error Source should be double precision or quad precision!
++#endif // end source precision
++
++#if defined DST_DOUBLE
++typedef double dst_t;
++typedef uint64_t dst_rep_t;
++#define DST_REP_C UINT64_C
++static const int dstBits = sizeof(dst_t) * CHAR_BIT;
++static const int dstSigFracBits = 52;
++// -1 accounts for the sign bit.
++// dstBits - dstSigFracBits - 1
++static const int dstExpBits = 11;
++
++#elif defined DST_80
++typedef xf_float dst_t;
++typedef __uint128_t dst_rep_t;
++#define DST_REP_C (__uint128_t)
++static const int dstBits = 80;
++static const int dstSigFracBits = 63;
++// -1 accounts for the sign bit.
++// -1 accounts for the explicitly stored integer bit.
++// dstBits - dstSigFracBits - 1 - 1
++static const int dstExpBits = 15;
++
++#elif defined DST_SINGLE
++typedef float dst_t;
++typedef uint32_t dst_rep_t;
++#define DST_REP_C UINT32_C
++static const int dstBits = sizeof(dst_t) * CHAR_BIT;
++static const int dstSigFracBits = 23;
++// -1 accounts for the sign bit.
++// dstBits - dstSigFracBits - 1
++static const int dstExpBits = 8;
++
++#elif defined DST_HALF
++#ifdef COMPILER_RT_HAS_FLOAT16
++typedef _Float16 dst_t;
++#else
++typedef uint16_t dst_t;
++#endif
++typedef uint16_t dst_rep_t;
++#define DST_REP_C UINT16_C
++static const int dstBits = sizeof(dst_t) * CHAR_BIT;
++static const int dstSigFracBits = 10;
++// -1 accounts for the sign bit.
++// dstBits - dstSigFracBits - 1
++static const int dstExpBits = 5;
++
++#elif defined DST_BFLOAT
++typedef __bf16 dst_t;
++typedef uint16_t dst_rep_t;
++#define DST_REP_C UINT16_C
++static const int dstBits = sizeof(dst_t) * CHAR_BIT;
++static const int dstSigFracBits = 7;
++// -1 accounts for the sign bit.
++// dstBits - dstSigFracBits - 1
++static const int dstExpBits = 8;
++
++#else
++#error Destination should be single precision or double precision!
++#endif // end destination precision
++
++// TODO: These helper routines should be placed into fp_lib.h
++// Currently they depend on macros/constants defined above.
++
++static inline src_rep_t extract_sign_from_src(src_rep_t x) {
++  const src_rep_t srcSignMask = SRC_REP_C(1) << (srcBits - 1);
++  return (x & srcSignMask) >> (srcBits - 1);
++}
++
++static inline src_rep_t extract_exp_from_src(src_rep_t x) {
++  const int srcSigBits = srcBits - 1 - srcExpBits;
++  const src_rep_t srcExpMask = ((SRC_REP_C(1) << srcExpBits) - 1) << srcSigBits;
++  return (x & srcExpMask) >> srcSigBits;
++}
++
++static inline src_rep_t extract_sig_frac_from_src(src_rep_t x) {
++  const src_rep_t srcSigFracMask = (SRC_REP_C(1) << srcSigFracBits) - 1;
++  return x & srcSigFracMask;
++}
++
++static inline dst_rep_t construct_dst_rep(dst_rep_t sign, dst_rep_t exp, dst_rep_t sigFrac) {
++  dst_rep_t result = (sign << (dstBits - 1)) | (exp << (dstBits - 1 - dstExpBits)) | sigFrac;
++  // Set the explicit integer bit in F80 if present.
++  if (dstBits == 80 && exp) {
++    result |= (DST_REP_C(1) << dstSigFracBits);
++  }
++  return result;
++}
++
++// End of specialization parameters.  Helper routines for conversion to and
++// from the representation of floating-point data as integer values follow.
++
++static inline src_rep_t srcToRep(src_t x) {
++  const union {
++    src_t f;
++    src_rep_t i;
++  } rep = {.f = x};
++  return rep.i;
++}
++
++static inline src_t srcFromRep(src_rep_t x) {
++  const union {
++    src_t f;
++    src_rep_t i;
++  } rep = {.i = x};
++  return rep.f;
++}
++
++static inline dst_rep_t dstToRep(dst_t x) {
++  const union {
++    dst_t f;
++    dst_rep_t i;
++  } rep = {.f = x};
++  return rep.i;
++}
++
++static inline dst_t dstFromRep(dst_rep_t x) {
++  const union {
++    dst_t f;
++    dst_rep_t i;
++  } rep = {.i = x};
++  return rep.f;
++}
++
++#endif // FP_TRUNC_HEADER
+diff --git a/libs/compiler-rt/lib/builtins/fp_trunc_impl.inc b/libs/compiler-rt/lib/builtins/fp_trunc_impl.inc
+new file mode 100644
+index 0000000..f684924
+--- /dev/null
++++ b/libs/compiler-rt/lib/builtins/fp_trunc_impl.inc
+@@ -0,0 +1,155 @@
++//= lib/fp_trunc_impl.inc - high precision -> low precision conversion *-*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file implements a fairly generic conversion from a wider to a narrower
++// IEEE-754 floating-point type in the default (round to nearest, ties to even)
++// rounding mode.  The constants and types defined following the includes below
++// parameterize the conversion.
++//
++// This routine can be trivially adapted to support conversions to
++// half-precision or from quad-precision. It does not support types that don't
++// use the usual IEEE-754 interchange formats; specifically, some work would be
++// needed to adapt it to (for example) the Intel 80-bit format or PowerPC
++// double-double format.
++//
++// Note please, however, that this implementation is only intended to support
++// *narrowing* operations; if you need to convert to a *wider* floating-point
++// type (e.g. float -> double), then this routine will not do what you want it
++// to.
++//
++// It also requires that integer types at least as large as both formats
++// are available on the target platform; this may pose a problem when trying
++// to add support for quad on some 32-bit systems, for example.
++//
++// Finally, the following assumptions are made:
++//
++// 1. Floating-point types and integer types have the same endianness on the
++//    target platform.
++//
++// 2. Quiet NaNs, if supported, are indicated by the leading bit of the
++//    significand field being set.
++//
++//===----------------------------------------------------------------------===//
++
++#include "fp_trunc.h"
++
++// The destination type may use a usual IEEE-754 interchange format or Intel
++// 80-bit format. In particular, for the destination type dstSigFracBits may be
++// not equal to dstSigBits. The source type is assumed to be one of IEEE-754
++// standard types.
++static __inline dst_t __truncXfYf2__(src_t a) {
++  // Various constants whose values follow from the type parameters.
++  // Any reasonable optimizer will fold and propagate all of these.
++  const int srcInfExp = (1 << srcExpBits) - 1;
++  const int srcExpBias = srcInfExp >> 1;
++
++  const src_rep_t srcMinNormal = SRC_REP_C(1) << srcSigFracBits;
++  const src_rep_t roundMask =
++      (SRC_REP_C(1) << (srcSigFracBits - dstSigFracBits)) - 1;
++  const src_rep_t halfway = SRC_REP_C(1)
++                            << (srcSigFracBits - dstSigFracBits - 1);
++  const src_rep_t srcQNaN = SRC_REP_C(1) << (srcSigFracBits - 1);
++  const src_rep_t srcNaNCode = srcQNaN - 1;
++
++  const int dstInfExp = (1 << dstExpBits) - 1;
++  const int dstExpBias = dstInfExp >> 1;
++  const int overflowExponent = srcExpBias + dstInfExp - dstExpBias;
++
++  const dst_rep_t dstQNaN = DST_REP_C(1) << (dstSigFracBits - 1);
++  const dst_rep_t dstNaNCode = dstQNaN - 1;
++
++  const src_rep_t aRep = srcToRep(a);
++  const src_rep_t srcSign = extract_sign_from_src(aRep);
++  const src_rep_t srcExp = extract_exp_from_src(aRep);
++  const src_rep_t srcSigFrac = extract_sig_frac_from_src(aRep);
++
++  dst_rep_t dstSign = srcSign;
++  dst_rep_t dstExp;
++  dst_rep_t dstSigFrac;
++
++  // Same size exponents and a's significand tail is 0.
++  // The significand can be truncated and the exponent can be copied over.
++  const int sigFracTailBits = srcSigFracBits - dstSigFracBits;
++  if (srcExpBits == dstExpBits &&
++      ((aRep >> sigFracTailBits) << sigFracTailBits) == aRep) {
++    dstExp = srcExp;
++    dstSigFrac = (dst_rep_t)(srcSigFrac >> sigFracTailBits);
++    return dstFromRep(construct_dst_rep(dstSign, dstExp, dstSigFrac));
++  }
++
++  const int dstExpCandidate = ((int)srcExp - srcExpBias) + dstExpBias;
++  if (dstExpCandidate >= 1 && dstExpCandidate < dstInfExp) {
++    // The exponent of a is within the range of normal numbers in the
++    // destination format. We can convert by simply right-shifting with
++    // rounding and adjusting the exponent.
++    dstExp = dstExpCandidate;
++    dstSigFrac = (dst_rep_t)(srcSigFrac >> sigFracTailBits);
++
++    const src_rep_t roundBits = srcSigFrac & roundMask;
++    // Round to nearest.
++    if (roundBits > halfway)
++      dstSigFrac++;
++    // Tie to even.
++    else if (roundBits == halfway)
++      dstSigFrac += dstSigFrac & 1;
++
++    // Rounding has changed the exponent.
++    if (dstSigFrac >= (DST_REP_C(1) << dstSigFracBits)) {
++      dstExp += 1;
++      dstSigFrac ^= (DST_REP_C(1) << dstSigFracBits);
++    }
++  } else if (srcExp == srcInfExp && srcSigFrac) {
++    // a is NaN.
++    // Conjure the result by beginning with infinity, setting the qNaN
++    // bit and inserting the (truncated) trailing NaN field.
++    dstExp = dstInfExp;
++    dstSigFrac = dstQNaN;
++    dstSigFrac |= ((srcSigFrac & srcNaNCode) >> sigFracTailBits) & dstNaNCode;
++  } else if ((int)srcExp >= overflowExponent) {
++    dstExp = dstInfExp;
++    dstSigFrac = 0;
++  } else {
++    // a underflows on conversion to the destination type or is an exact
++    // zero.  The result may be a denormal or zero.  Extract the exponent
++    // to get the shift amount for the denormalization.
++    src_rep_t significand = srcSigFrac;
++    int shift = srcExpBias - dstExpBias - srcExp;
++
++    if (srcExp) {
++      // Set the implicit integer bit if the source is a normal number.
++      significand |= srcMinNormal;
++      shift += 1;
++    }
++
++    // Right shift by the denormalization amount with sticky.
++    if (shift > srcSigFracBits) {
++      dstExp = 0;
++      dstSigFrac = 0;
++    } else {
++      dstExp = 0;
++      const bool sticky = shift && ((significand << (srcBits - shift)) != 0);
++      src_rep_t denormalizedSignificand = significand >> shift | sticky;
++      dstSigFrac = denormalizedSignificand >> sigFracTailBits;
++      const src_rep_t roundBits = denormalizedSignificand & roundMask;
++      // Round to nearest
++      if (roundBits > halfway)
++        dstSigFrac++;
++      // Ties to even
++      else if (roundBits == halfway)
++        dstSigFrac += dstSigFrac & 1;
++
++      // Rounding has changed the exponent.
++      if (dstSigFrac >= (DST_REP_C(1) << dstSigFracBits)) {
++        dstExp += 1;
++        dstSigFrac ^= (DST_REP_C(1) << dstSigFracBits);
++      }
++    }
++  }
++
++  return dstFromRep(construct_dst_rep(dstSign, dstExp, dstSigFrac));
++}
+diff --git a/libs/compiler-rt/lib/builtins/int_endianness.h b/libs/compiler-rt/lib/builtins/int_endianness.h
+index e2586c5..291c6b5 100644
+--- a/libs/compiler-rt/lib/builtins/int_endianness.h
++++ b/libs/compiler-rt/lib/builtins/int_endianness.h
+@@ -1,51 +1,49 @@
+-/* ===-- int_endianness.h - configuration header for compiler-rt ------------===
+- *
+- *		       The LLVM Compiler Infrastructure
+- *
+- * This file is dual licensed under the MIT and the University of Illinois Open
+- * Source Licenses. See LICENSE.TXT for details.
+- *
+- * ===----------------------------------------------------------------------===
+- *
+- * This file is a configuration header for compiler-rt.
+- * This file is not part of the interface of this library.
+- *
+- * ===----------------------------------------------------------------------===
+- */
++//===-- int_endianness.h - configuration header for compiler-rt -----------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file is a configuration header for compiler-rt.
++// This file is not part of the interface of this library.
++//
++//===----------------------------------------------------------------------===//
+ 
+ #ifndef INT_ENDIANNESS_H
+ #define INT_ENDIANNESS_H
+ 
+-#if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && \
++#if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) &&                \
+     defined(__ORDER_LITTLE_ENDIAN__)
+ 
+-/* Clang and GCC provide built-in endianness definitions. */
++// Clang and GCC provide built-in endianness definitions.
+ #if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+ #define _YUGA_LITTLE_ENDIAN 0
+-#define _YUGA_BIG_ENDIAN    1
++#define _YUGA_BIG_ENDIAN 1
+ #elif __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+ #define _YUGA_LITTLE_ENDIAN 1
+-#define _YUGA_BIG_ENDIAN    0
+-#endif /* __BYTE_ORDER__ */
++#define _YUGA_BIG_ENDIAN 0
++#endif // __BYTE_ORDER__
+ 
+-#else /* Compilers other than Clang or GCC. */
++#else // Compilers other than Clang or GCC.
+ 
+ #if defined(__SVR4) && defined(__sun)
+ #include <sys/byteorder.h>
+ 
+ #if defined(_BIG_ENDIAN)
+ #define _YUGA_LITTLE_ENDIAN 0
+-#define _YUGA_BIG_ENDIAN    1
++#define _YUGA_BIG_ENDIAN 1
+ #elif defined(_LITTLE_ENDIAN)
+ #define _YUGA_LITTLE_ENDIAN 1
+-#define _YUGA_BIG_ENDIAN    0
+-#else /* !_LITTLE_ENDIAN */
++#define _YUGA_BIG_ENDIAN 0
++#else // !_LITTLE_ENDIAN
+ #error "unknown endianness"
+-#endif /* !_LITTLE_ENDIAN */
++#endif // !_LITTLE_ENDIAN
+ 
+-#endif /* Solaris and AuroraUX. */
++#endif // Solaris
+ 
+-/* .. */
++// ..
+ 
+ #if defined(__FreeBSD__) || defined(__NetBSD__) || defined(__DragonFly__) ||   \
+     defined(__minix)
+@@ -53,64 +51,64 @@
+ 
+ #if _BYTE_ORDER == _BIG_ENDIAN
+ #define _YUGA_LITTLE_ENDIAN 0
+-#define _YUGA_BIG_ENDIAN    1
++#define _YUGA_BIG_ENDIAN 1
+ #elif _BYTE_ORDER == _LITTLE_ENDIAN
+ #define _YUGA_LITTLE_ENDIAN 1
+-#define _YUGA_BIG_ENDIAN    0
+-#endif /* _BYTE_ORDER */
++#define _YUGA_BIG_ENDIAN 0
++#endif // _BYTE_ORDER
+ 
+-#endif /* *BSD */
++#endif // *BSD
+ 
+ #if defined(__OpenBSD__)
+ #include <machine/endian.h>
+ 
+ #if _BYTE_ORDER == _BIG_ENDIAN
+ #define _YUGA_LITTLE_ENDIAN 0
+-#define _YUGA_BIG_ENDIAN    1
++#define _YUGA_BIG_ENDIAN 1
+ #elif _BYTE_ORDER == _LITTLE_ENDIAN
+ #define _YUGA_LITTLE_ENDIAN 1
+-#define _YUGA_BIG_ENDIAN    0
+-#endif /* _BYTE_ORDER */
++#define _YUGA_BIG_ENDIAN 0
++#endif // _BYTE_ORDER
+ 
+-#endif /* OpenBSD */
++#endif // OpenBSD
+ 
+-/* .. */
++// ..
+ 
+-/* Mac OSX has __BIG_ENDIAN__ or __LITTLE_ENDIAN__ automatically set by the
+- * compiler (at least with GCC) */
+-#if defined(__APPLE__) || defined(__ellcc__ )
++// Mac OSX has __BIG_ENDIAN__ or __LITTLE_ENDIAN__ automatically set by the
++// compiler (at least with GCC)
++#if defined(__APPLE__) || defined(__ellcc__)
+ 
+ #ifdef __BIG_ENDIAN__
+ #if __BIG_ENDIAN__
+ #define _YUGA_LITTLE_ENDIAN 0
+-#define _YUGA_BIG_ENDIAN    1
++#define _YUGA_BIG_ENDIAN 1
+ #endif
+-#endif /* __BIG_ENDIAN__ */
++#endif // __BIG_ENDIAN__
+ 
+ #ifdef __LITTLE_ENDIAN__
+ #if __LITTLE_ENDIAN__
+ #define _YUGA_LITTLE_ENDIAN 1
+-#define _YUGA_BIG_ENDIAN    0
++#define _YUGA_BIG_ENDIAN 0
+ #endif
+-#endif /* __LITTLE_ENDIAN__ */
++#endif // __LITTLE_ENDIAN__
+ 
+-#endif /* Mac OSX */
++#endif // Mac OSX
+ 
+-/* .. */
++// ..
+ 
+ #if defined(_WIN32)
+ 
+ #define _YUGA_LITTLE_ENDIAN 1
+-#define _YUGA_BIG_ENDIAN    0
++#define _YUGA_BIG_ENDIAN 0
+ 
+-#endif /* Windows */
++#endif // Windows
+ 
+-#endif /* Clang or GCC. */
++#endif // Clang or GCC.
+ 
+-/* . */
++// .
+ 
+ #if !defined(_YUGA_LITTLE_ENDIAN) || !defined(_YUGA_BIG_ENDIAN)
+ #error Unable to determine endian
+-#endif /* Check we found an endianness correctly. */
++#endif // Check we found an endianness correctly.
+ 
+-#endif /* INT_ENDIANNESS_H */
++#endif // INT_ENDIANNESS_H
+diff --git a/libs/compiler-rt/lib/builtins/int_lib.h b/libs/compiler-rt/lib/builtins/int_lib.h
+index fe8a3bd..629c306 100644
+--- a/libs/compiler-rt/lib/builtins/int_lib.h
++++ b/libs/compiler-rt/lib/builtins/int_lib.h
+@@ -1,44 +1,33 @@
+-/* ===-- int_lib.h - configuration header for compiler-rt  -----------------===
+- *
+- *                     The LLVM Compiler Infrastructure
+- *
+- * This file is dual licensed under the MIT and the University of Illinois Open
+- * Source Licenses. See LICENSE.TXT for details.
+- *
+- * ===----------------------------------------------------------------------===
+- *
+- * This file is a configuration header for compiler-rt.
+- * This file is not part of the interface of this library.
+- *
+- * ===----------------------------------------------------------------------===
+- */
++//===-- int_lib.h - configuration header for compiler-rt  -----------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file is a configuration header for compiler-rt.
++// This file is not part of the interface of this library.
++//
++//===----------------------------------------------------------------------===//
+ 
+ #ifndef INT_LIB_H
+ #define INT_LIB_H
+ 
+-/* Assumption: Signed integral is 2's complement. */
+-/* Assumption: Right shift of signed negative is arithmetic shift. */
+-/* Assumption: Endianness is little or big (not mixed). */
++// Assumption: Signed integral is 2's complement.
++// Assumption: Right shift of signed negative is arithmetic shift.
++// Assumption: Endianness is little or big (not mixed).
+ 
+-#if defined(__ELF__)
+-#define FNALIAS(alias_name, original_name) \
+-  void alias_name() __attribute__((__alias__(#original_name)))
+-#define COMPILER_RT_ALIAS(aliasee) __attribute__((__alias__(#aliasee)))
+-#else
+-#define FNALIAS(alias, name) _Pragma("GCC error(\"alias unsupported on this file format\")")
+-#define COMPILER_RT_ALIAS(aliasee) _Pragma("GCC error(\"alias unsupported on this file format\")")
+-#endif
+-
+-/* ABI macro definitions */
++// ABI macro definitions
+ 
+ #if __ARM_EABI__
+-# ifdef COMPILER_RT_ARMHF_TARGET
+-#   define COMPILER_RT_ABI
+-# else
+-#   define COMPILER_RT_ABI __attribute__((__pcs__("aapcs")))
+-# endif
++#ifdef COMPILER_RT_ARMHF_TARGET
++#define COMPILER_RT_ABI
++#else
++#define COMPILER_RT_ABI __attribute__((__pcs__("aapcs")))
++#endif
+ #else
+-# define COMPILER_RT_ABI
++#define COMPILER_RT_ABI
+ #endif
+ 
+ #define AEABI_RTABI __attribute__((__pcs__("aapcs")))
+@@ -55,54 +44,89 @@
+ #define UNUSED __attribute__((unused))
+ #endif
+ 
+-#if defined(__NetBSD__) && (defined(_KERNEL) || defined(_STANDALONE))
+-/*
+- * Kernel and boot environment can't use normal headers,
+- * so use the equivalent system headers.
+- */
+-#  include <machine/limits.h>
+-#  include <sys/stdint.h>
+-#  include <sys/types.h>
++#define STR(a) #a
++#define XSTR(a) STR(a)
++#define SYMBOL_NAME(name) XSTR(__USER_LABEL_PREFIX__) #name
++
++#if defined(__ELF__) || defined(__MINGW32__) || defined(__wasm__) ||           \
++    defined(_AIX) || defined(__CYGWIN__)
++#define COMPILER_RT_ALIAS(name, aliasname) \
++  COMPILER_RT_ABI __typeof(name) aliasname __attribute__((__alias__(#name)));
++#elif defined(__APPLE__)
++#if defined(VISIBILITY_HIDDEN)
++#define COMPILER_RT_ALIAS_VISIBILITY(name) \
++  __asm__(".private_extern " SYMBOL_NAME(name));
++#else
++#define COMPILER_RT_ALIAS_VISIBILITY(name)
++#endif
++#define COMPILER_RT_ALIAS(name, aliasname) \
++  __asm__(".globl " SYMBOL_NAME(aliasname)); \
++  COMPILER_RT_ALIAS_VISIBILITY(aliasname) \
++  __asm__(SYMBOL_NAME(aliasname) " = " SYMBOL_NAME(name)); \
++  COMPILER_RT_ABI __typeof(name) aliasname;
++#elif defined(_WIN32) || defined(__UEFI__) || defined(__SPIRV__)
++#define COMPILER_RT_ALIAS(name, aliasname)
+ #else
+-/* Include the standard compiler builtin headers we use functionality from. */
+-#  include <limits.h>
+-#  include <stdint.h>
+-#  include <stdbool.h>
+-#  include <float.h>
++#error Unsupported target
+ #endif
+ 
+-/* Include the commonly used internal type definitions. */
++#if (defined(__FreeBSD__) || defined(__NetBSD__)) &&                           \
++    (defined(_KERNEL) || defined(_STANDALONE))
++//
++// Kernel and boot environment can't use normal headers,
++// so use the equivalent system headers.
++// NB: FreeBSD (and OpenBSD) deprecate machine/limits.h in
++// favour of sys/limits.h, so prefer the former, but fall
++// back on the latter if not available since NetBSD only has
++// the latter.
++//
++#if defined(__has_include) && __has_include(<sys/limits.h>)
++#include <sys/limits.h>
++#else
++#include <machine/limits.h>
++#endif
++#include <sys/stdint.h>
++#include <sys/types.h>
++#else
++// Include the standard compiler builtin headers we use functionality from.
++#include <float.h>
++#include <limits.h>
++#include <stdbool.h>
++#include <stdint.h>
++#endif
++
++// Include the commonly used internal type definitions.
+ #include "int_types.h"
+ 
+-/* Include internal utility function declarations. */
++// Include internal utility function declarations.
+ #include "int_util.h"
+ 
+-COMPILER_RT_ABI si_int __paritysi2(si_int a);
+-COMPILER_RT_ABI si_int __paritydi2(di_int a);
++COMPILER_RT_ABI int __paritysi2(si_int a);
++COMPILER_RT_ABI int __paritydi2(di_int a);
+ 
+ COMPILER_RT_ABI di_int __divdi3(di_int a, di_int b);
+ COMPILER_RT_ABI si_int __divsi3(si_int a, si_int b);
+ COMPILER_RT_ABI su_int __udivsi3(su_int n, su_int d);
+ 
+-COMPILER_RT_ABI su_int __udivmodsi4(su_int a, su_int b, su_int* rem);
+-COMPILER_RT_ABI du_int __udivmoddi4(du_int a, du_int b, du_int* rem);
++COMPILER_RT_ABI su_int __udivmodsi4(su_int a, su_int b, su_int *rem);
++COMPILER_RT_ABI du_int __udivmoddi4(du_int a, du_int b, du_int *rem);
+ #ifdef CRT_HAS_128BIT
+-COMPILER_RT_ABI si_int __clzti2(ti_int a);
+-COMPILER_RT_ABI tu_int __udivmodti4(tu_int a, tu_int b, tu_int* rem);
++COMPILER_RT_ABI int __clzti2(ti_int a);
++COMPILER_RT_ABI tu_int __udivmodti4(tu_int a, tu_int b, tu_int *rem);
+ #endif
+ 
+-/* Definitions for builtins unavailable on MSVC */
++// Definitions for builtins unavailable on MSVC
+ #if defined(_MSC_VER) && !defined(__clang__)
+ #include <intrin.h>
+ 
+-uint32_t __inline __builtin_ctz(uint32_t value) {
++static int __inline __builtin_ctz(uint32_t value) {
+   unsigned long trailing_zero = 0;
+   if (_BitScanForward(&trailing_zero, value))
+     return trailing_zero;
+   return 32;
+ }
+ 
+-uint32_t __inline __builtin_clz(uint32_t value) {
++static int __inline __builtin_clz(uint32_t value) {
+   unsigned long leading_zero = 0;
+   if (_BitScanReverse(&leading_zero, value))
+     return 31 - leading_zero;
+@@ -110,14 +134,14 @@ uint32_t __inline __builtin_clz(uint32_t value) {
+ }
+ 
+ #if defined(_M_ARM) || defined(_M_X64)
+-uint32_t __inline __builtin_clzll(uint64_t value) {
++static int __inline __builtin_clzll(uint64_t value) {
+   unsigned long leading_zero = 0;
+   if (_BitScanReverse64(&leading_zero, value))
+     return 63 - leading_zero;
+   return 64;
+ }
+ #else
+-uint32_t __inline __builtin_clzll(uint64_t value) {
++static int __inline __builtin_clzll(uint64_t value) {
+   if (value == 0)
+     return 64;
+   uint32_t msh = (uint32_t)(value >> 32);
+@@ -129,6 +153,19 @@ uint32_t __inline __builtin_clzll(uint64_t value) {
+ #endif
+ 
+ #define __builtin_clzl __builtin_clzll
+-#endif /* defined(_MSC_VER) && !defined(__clang__) */
+ 
+-#endif /* INT_LIB_H */
++static bool __inline __builtin_sadd_overflow(int x, int y, int *result) {
++  if ((x < 0) != (y < 0)) {
++    *result = x + y;
++    return false;
++  }
++  int tmp = (unsigned int)x + (unsigned int)y;
++  if ((tmp < 0) != (x < 0))
++    return true;
++  *result = tmp;
++  return false;
++}
++
++#endif // defined(_MSC_VER) && !defined(__clang__)
++
++#endif // INT_LIB_H
+diff --git a/libs/compiler-rt/lib/builtins/int_math.h b/libs/compiler-rt/lib/builtins/int_math.h
+index aa3d072..c9c6bc8 100644
+--- a/libs/compiler-rt/lib/builtins/int_math.h
++++ b/libs/compiler-rt/lib/builtins/int_math.h
+@@ -1,65 +1,65 @@
+-/* ===-- int_math.h - internal math inlines ---------------------------------===
+- *
+- *                     The LLVM Compiler Infrastructure
+- *
+- * This file is dual licensed under the MIT and the University of Illinois Open
+- * Source Licenses. See LICENSE.TXT for details.
+- *
+- * ===-----------------------------------------------------------------------===
+- *
+- * This file is not part of the interface of this library.
+- *
+- * This file defines substitutes for the libm functions used in some of the
+- * compiler-rt implementations, defined in such a way that there is not a direct
+- * dependency on libm or math.h. Instead, we use the compiler builtin versions
+- * where available. This reduces our dependencies on the system SDK by foisting
+- * the responsibility onto the compiler.
+- *
+- * ===-----------------------------------------------------------------------===
+- */
++//===-- int_math.h - internal math inlines --------------------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file is not part of the interface of this library.
++//
++// This file defines substitutes for the libm functions used in some of the
++// compiler-rt implementations, defined in such a way that there is not a direct
++// dependency on libm or math.h. Instead, we use the compiler builtin versions
++// where available. This reduces our dependencies on the system SDK by foisting
++// the responsibility onto the compiler.
++//
++//===----------------------------------------------------------------------===//
+ 
+ #ifndef INT_MATH_H
+ #define INT_MATH_H
+ 
+ #ifndef __has_builtin
+-#  define  __has_builtin(x) 0
++#define __has_builtin(x) 0
+ #endif
+ 
+ #if defined(_MSC_VER) && !defined(__clang__)
+ #include <math.h>
+ #include <stdlib.h>
+-#include <ymath.h>
+ #endif
+ 
+ #if defined(_MSC_VER) && !defined(__clang__)
+ #define CRT_INFINITY INFINITY
+ #else
++#if defined(DOUBLE_PRECISION)
++#define CRT_INFINITY __builtin_huge_val()
++#else
+ #define CRT_INFINITY __builtin_huge_valf()
+ #endif
++#endif
+ 
+ #if defined(_MSC_VER) && !defined(__clang__)
+ #define crt_isfinite(x) _finite((x))
+ #define crt_isinf(x) !_finite((x))
+ #define crt_isnan(x) _isnan((x))
+ #else
+-/* Define crt_isfinite in terms of the builtin if available, otherwise provide
+- * an alternate version in terms of our other functions. This supports some
+- * versions of GCC which didn't have __builtin_isfinite.
+- */
++// Define crt_isfinite in terms of the builtin if available, otherwise provide
++// an alternate version in terms of our other functions. This supports some
++// versions of GCC which didn't have __builtin_isfinite.
+ #if __has_builtin(__builtin_isfinite)
+-#  define crt_isfinite(x) __builtin_isfinite((x))
++#define crt_isfinite(x) __builtin_isfinite((x))
+ #elif defined(__GNUC__)
+-#  define crt_isfinite(x) \
+-  __extension__(({ \
+-      __typeof((x)) x_ = (x); \
+-      !crt_isinf(x_) && !crt_isnan(x_); \
+-    }))
++#define crt_isfinite(x)                                                        \
++  __extension__(({                                                             \
++    __typeof((x)) x_ = (x);                                                    \
++    !crt_isinf(x_) && !crt_isnan(x_);                                          \
++  }))
+ #else
+-#  error "Do not know how to check for infinity"
+-#endif /* __has_builtin(__builtin_isfinite) */
++#error "Do not know how to check for infinity"
++#endif // __has_builtin(__builtin_isfinite)
+ #define crt_isinf(x) __builtin_isinf((x))
+ #define crt_isnan(x) __builtin_isnan((x))
+-#endif /* _MSC_VER */
++#endif // _MSC_VER
+ 
+ #if defined(_MSC_VER) && !defined(__clang__)
+ #define crt_copysign(x, y) copysign((x), (y))
+@@ -69,6 +69,14 @@
+ #define crt_copysign(x, y) __builtin_copysign((x), (y))
+ #define crt_copysignf(x, y) __builtin_copysignf((x), (y))
+ #define crt_copysignl(x, y) __builtin_copysignl((x), (y))
++// We define __has_builtin to always return 0 for GCC versions below 10,
++// but __builtin_copysignf128 is available since version 7.
++#if __has_builtin(__builtin_copysignf128) ||                                   \
++    (defined(__GNUC__) && __GNUC__ >= 7)
++#define crt_copysignf128(x, y) __builtin_copysignf128((x), (y))
++#elif __has_builtin(__builtin_copysignq)
++#define crt_copysignf128(x, y) __builtin_copysignq((x), (y))
++#endif
+ #endif
+ 
+ #if defined(_MSC_VER) && !defined(__clang__)
+@@ -79,15 +87,18 @@
+ #define crt_fabs(x) __builtin_fabs((x))
+ #define crt_fabsf(x) __builtin_fabsf((x))
+ #define crt_fabsl(x) __builtin_fabsl((x))
++// We define __has_builtin to always return 0 for GCC versions below 10,
++// but __builtin_fabsf128 is available since version 7.
++#if __has_builtin(__builtin_fabsf128) || (defined(__GNUC__) && __GNUC__ >= 7)
++#define crt_fabsf128(x) __builtin_fabsf128((x))
++#elif __has_builtin(__builtin_fabsq)
++#define crt_fabsf128(x) __builtin_fabsq((x))
++#endif
+ #endif
+ 
+ #if defined(_MSC_VER) && !defined(__clang__)
+-#define crt_fmax(x, y) __max((x), (y))
+-#define crt_fmaxf(x, y) __max((x), (y))
+ #define crt_fmaxl(x, y) __max((x), (y))
+ #else
+-#define crt_fmax(x, y) __builtin_fmax((x), (y))
+-#define crt_fmaxf(x, y) __builtin_fmaxf((x), (y))
+ #define crt_fmaxl(x, y) __builtin_fmaxl((x), (y))
+ #endif
+ 
+@@ -98,13 +109,9 @@
+ #endif
+ 
+ #if defined(_MSC_VER) && !defined(__clang__)
+-#define crt_scalbn(x, y) scalbn((x), (y))
+-#define crt_scalbnf(x, y) scalbnf((x), (y))
+ #define crt_scalbnl(x, y) scalbnl((x), (y))
+ #else
+-#define crt_scalbn(x, y) __builtin_scalbn((x), (y))
+-#define crt_scalbnf(x, y) __builtin_scalbnf((x), (y))
+ #define crt_scalbnl(x, y) __builtin_scalbnl((x), (y))
+ #endif
+ 
+-#endif /* INT_MATH_H */
++#endif // INT_MATH_H
+diff --git a/libs/compiler-rt/lib/builtins/int_to_fp.h b/libs/compiler-rt/lib/builtins/int_to_fp.h
+new file mode 100644
+index 0000000..2c1218f
+--- /dev/null
++++ b/libs/compiler-rt/lib/builtins/int_to_fp.h
+@@ -0,0 +1,82 @@
++//===-- int_to_fp.h - integer to floating point conversion ----------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// Set source and destination defines in order to use a correctly
++// parameterised floatXiYf implementation.
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef INT_TO_FP_H
++#define INT_TO_FP_H
++
++#include "int_lib.h"
++
++#if defined SRC_I64
++typedef int64_t src_t;
++typedef uint64_t usrc_t;
++static __inline int clzSrcT(usrc_t x) { return __builtin_clzll(x); }
++
++#elif defined SRC_U64
++typedef uint64_t src_t;
++typedef uint64_t usrc_t;
++static __inline int clzSrcT(usrc_t x) { return __builtin_clzll(x); }
++
++#elif defined SRC_I128
++typedef __int128_t src_t;
++typedef __uint128_t usrc_t;
++static __inline int clzSrcT(usrc_t x) { return __clzti2(x); }
++
++#elif defined SRC_U128
++typedef __uint128_t src_t;
++typedef __uint128_t usrc_t;
++static __inline int clzSrcT(usrc_t x) { return __clzti2(x); }
++
++#else
++#error Source should be a handled integer type.
++#endif
++
++#if defined DST_SINGLE
++typedef float dst_t;
++typedef uint32_t dst_rep_t;
++#define DST_REP_C UINT32_C
++
++enum {
++  dstSigBits = 23,
++};
++
++#elif defined DST_DOUBLE
++typedef double dst_t;
++typedef uint64_t dst_rep_t;
++#define DST_REP_C UINT64_C
++
++enum {
++  dstSigBits = 52,
++};
++
++#elif defined DST_QUAD
++typedef tf_float dst_t;
++typedef __uint128_t dst_rep_t;
++#define DST_REP_C (__uint128_t)
++
++enum {
++  dstSigBits = 112,
++};
++
++#else
++#error Destination should be a handled floating point type
++#endif
++
++static __inline dst_t dstFromRep(dst_rep_t x) {
++  const union {
++    dst_t f;
++    dst_rep_t i;
++  } rep = {.i = x};
++  return rep.f;
++}
++
++#endif // INT_TO_FP_H
+diff --git a/libs/compiler-rt/lib/builtins/int_to_fp_impl.inc b/libs/compiler-rt/lib/builtins/int_to_fp_impl.inc
+new file mode 100644
+index 0000000..11736ed
+--- /dev/null
++++ b/libs/compiler-rt/lib/builtins/int_to_fp_impl.inc
+@@ -0,0 +1,72 @@
++//===-- int_to_fp_impl.inc - integer to floating point conversion ---------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file implements a generic conversion from an integer type to an
++// IEEE-754 floating point type, allowing a common implementation to be shared
++// without copy and paste.
++//
++//===----------------------------------------------------------------------===//
++
++#include "int_to_fp.h"
++
++static __inline dst_t __floatXiYf__(src_t a) {
++  if (a == 0)
++    return 0.0;
++
++  enum {
++    dstMantDig = dstSigBits + 1,
++    srcBits = sizeof(src_t) * CHAR_BIT,
++    srcIsSigned = ((src_t)-1) < 0,
++  };
++
++  const src_t s = srcIsSigned ? a >> (srcBits - 1) : 0;
++
++  a = (usrc_t)(a ^ s) - s;
++  int sd = srcBits - clzSrcT(a);         // number of significant digits
++  int e = sd - 1;                        // exponent
++  if (sd > dstMantDig) {
++    //  start:  0000000000000000000001xxxxxxxxxxxxxxxxxxxxxxPQxxxxxxxxxxxxxxxxxx
++    //  finish: 000000000000000000000000000000000000001xxxxxxxxxxxxxxxxxxxxxxPQR
++    //                                                12345678901234567890123456
++    //  1 = msb 1 bit
++    //  P = bit dstMantDig-1 bits to the right of 1
++    //  Q = bit dstMantDig bits to the right of 1
++    //  R = "or" of all bits to the right of Q
++    if (sd == dstMantDig + 1) {
++      a <<= 1;
++    } else if (sd == dstMantDig + 2) {
++      // Do nothing.
++    } else {
++      a = ((usrc_t)a >> (sd - (dstMantDig + 2))) |
++          ((a & ((usrc_t)(-1) >> ((srcBits + dstMantDig + 2) - sd))) != 0);
++    }
++    // finish:
++    a |= (a & 4) != 0; // Or P into R
++    ++a;               // round - this step may add a significant bit
++    a >>= 2;           // dump Q and R
++    // `a` is now rounded to dstMantDig or dstMantDig+1 bits
++    if (a & ((usrc_t)1 << dstMantDig)) {
++      a >>= 1;
++      ++e;
++    }
++    // `a` is now rounded to dstMantDig bits
++  } else {
++    a <<= (dstMantDig - sd);
++    // `a` is now rounded to dstMantDig bits
++  }
++  const int dstBits = sizeof(dst_t) * CHAR_BIT;
++  const dst_rep_t dstSignMask = DST_REP_C(1) << (dstBits - 1);
++  const int dstExpBits = dstBits - dstSigBits - 1;
++  const int dstExpBias = (1 << (dstExpBits - 1)) - 1;
++  const dst_rep_t dstSignificandMask = (DST_REP_C(1) << dstSigBits) - 1;
++  // Combine sign, exponent, and mantissa.
++  const dst_rep_t result = ((dst_rep_t)s & dstSignMask) |
++                           ((dst_rep_t)(e + dstExpBias) << dstSigBits) |
++                           ((dst_rep_t)(a) & dstSignificandMask);
++  return dstFromRep(result);
++}
+diff --git a/libs/compiler-rt/lib/builtins/int_types.h b/libs/compiler-rt/lib/builtins/int_types.h
+index 640fb50..6411507 100644
+--- a/libs/compiler-rt/lib/builtins/int_types.h
++++ b/libs/compiler-rt/lib/builtins/int_types.h
+@@ -1,184 +1,281 @@
+-/* ===-- int_lib.h - configuration header for compiler-rt  -----------------===
+- *
+- *                     The LLVM Compiler Infrastructure
+- *
+- * This file is dual licensed under the MIT and the University of Illinois Open
+- * Source Licenses. See LICENSE.TXT for details.
+- *
+- * ===----------------------------------------------------------------------===
+- *
+- * This file is not part of the interface of this library.
+- *
+- * This file defines various standard types, most importantly a number of unions
+- * used to access parts of larger types.
+- *
+- * ===----------------------------------------------------------------------===
+- */
++//===-- int_lib.h - configuration header for compiler-rt  -----------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file is not part of the interface of this library.
++//
++// This file defines various standard types, most importantly a number of unions
++// used to access parts of larger types.
++//
++//===----------------------------------------------------------------------===//
+ 
+ #ifndef INT_TYPES_H
+ #define INT_TYPES_H
+ 
+ #include "int_endianness.h"
+ 
+-/* si_int is defined in Linux sysroot's asm-generic/siginfo.h */
++// si_int is defined in Linux sysroot's asm-generic/siginfo.h
+ #ifdef si_int
+ #undef si_int
+ #endif
+-typedef      int si_int;
+-typedef unsigned su_int;
++typedef int32_t si_int;
++typedef uint32_t su_int;
++#if UINT_MAX == 0xFFFFFFFF
++#define clzsi __builtin_clz
++#define ctzsi __builtin_ctz
++#elif ULONG_MAX == 0xFFFFFFFF
++#define clzsi __builtin_clzl
++#define ctzsi __builtin_ctzl
++#else
++#error could not determine appropriate clzsi macro for this system
++#endif
+ 
+-typedef          long long di_int;
+-typedef unsigned long long du_int;
++typedef int64_t di_int;
++typedef uint64_t du_int;
+ 
+-typedef union
+-{
+-    di_int all;
+-    struct
+-    {
++typedef union {
++  di_int all;
++  struct {
+ #if _YUGA_LITTLE_ENDIAN
+-        su_int low;
+-        si_int high;
++    su_int low;
++    si_int high;
+ #else
+-        si_int high;
+-        su_int low;
+-#endif /* _YUGA_LITTLE_ENDIAN */
+-    }s;
++    si_int high;
++    su_int low;
++#endif // _YUGA_LITTLE_ENDIAN
++  } s;
+ } dwords;
+ 
+-typedef union
+-{
+-    du_int all;
+-    struct
+-    {
++typedef union {
++  du_int all;
++  struct {
+ #if _YUGA_LITTLE_ENDIAN
+-        su_int low;
+-        su_int high;
++    su_int low;
++    su_int high;
+ #else
+-        su_int high;
+-        su_int low;
+-#endif /* _YUGA_LITTLE_ENDIAN */
+-    }s;
++    su_int high;
++    su_int low;
++#endif // _YUGA_LITTLE_ENDIAN
++  } s;
+ } udwords;
+ 
+ #if defined(__LP64__) || defined(__wasm__) || defined(__mips64) ||             \
+-    defined(__riscv) || defined(_WIN64)
++    defined(__SIZEOF_INT128__) || defined(_WIN64)
+ #define CRT_HAS_128BIT
+ #endif
+ 
+-/* MSVC doesn't have a working 128bit integer type. Users should really compile
+- * compiler-rt with clang, but if they happen to be doing a standalone build for
+- * asan or something else, disable the 128 bit parts so things sort of work.
+- */
++// MSVC doesn't have a working 128bit integer type. Users should really compile
++// compiler-rt with clang, but if they happen to be doing a standalone build for
++// asan or something else, disable the 128 bit parts so things sort of work.
+ #if defined(_MSC_VER) && !defined(__clang__)
+ #undef CRT_HAS_128BIT
+ #endif
+ 
++// The core SPIR-V specification does not support 128-bit integers.
++#if defined(__SPIRV__)
++#undef CRT_HAS_128BIT
++#endif
++
+ #ifdef CRT_HAS_128BIT
+-typedef int      ti_int __attribute__ ((mode (TI)));
+-typedef unsigned tu_int __attribute__ ((mode (TI)));
+-
+-typedef union
+-{
+-    ti_int all;
+-    struct
+-    {
++typedef int ti_int __attribute__((mode(TI)));
++typedef unsigned tu_int __attribute__((mode(TI)));
++
++typedef union {
++  ti_int all;
++  struct {
+ #if _YUGA_LITTLE_ENDIAN
+-        du_int low;
+-        di_int high;
++    du_int low;
++    di_int high;
+ #else
+-        di_int high;
+-        du_int low;
+-#endif /* _YUGA_LITTLE_ENDIAN */
+-    }s;
++    di_int high;
++    du_int low;
++#endif // _YUGA_LITTLE_ENDIAN
++  } s;
+ } twords;
+ 
+-typedef union
+-{
+-    tu_int all;
+-    struct
+-    {
++typedef union {
++  tu_int all;
++  struct {
+ #if _YUGA_LITTLE_ENDIAN
+-        du_int low;
+-        du_int high;
++    du_int low;
++    du_int high;
+ #else
+-        du_int high;
+-        du_int low;
+-#endif /* _YUGA_LITTLE_ENDIAN */
+-    }s;
++    du_int high;
++    du_int low;
++#endif // _YUGA_LITTLE_ENDIAN
++  } s;
+ } utwords;
+ 
+ static __inline ti_int make_ti(di_int h, di_int l) {
+-    twords r;
+-    r.s.high = h;
+-    r.s.low = l;
+-    return r.all;
++  twords r;
++  r.s.high = (du_int)h;
++  r.s.low = (du_int)l;
++  return r.all;
+ }
+ 
+ static __inline tu_int make_tu(du_int h, du_int l) {
+-    utwords r;
+-    r.s.high = h;
+-    r.s.low = l;
+-    return r.all;
++  utwords r;
++  r.s.high = h;
++  r.s.low = l;
++  return r.all;
+ }
+ 
+-#endif /* CRT_HAS_128BIT */
++#endif // CRT_HAS_128BIT
+ 
+-typedef union
+-{
+-    su_int u;
+-    float f;
++// FreeBSD's boot environment does not support using floating-point and poisons
++// the float and double keywords.
++#if defined(__FreeBSD__) && defined(_STANDALONE)
++#define CRT_HAS_FLOATING_POINT 0
++#else
++#define CRT_HAS_FLOATING_POINT 1
++#endif
++
++#if CRT_HAS_FLOATING_POINT
++typedef union {
++  su_int u;
++  float f;
+ } float_bits;
+ 
+-typedef union
+-{
+-    udwords u;
+-    double  f;
++typedef union {
++  udwords u;
++  double f;
+ } double_bits;
+ 
+-typedef struct
+-{
++typedef struct {
+ #if _YUGA_LITTLE_ENDIAN
+-    udwords low;
+-    udwords high;
++  udwords low;
++  udwords high;
+ #else
+-    udwords high;
+-    udwords low;
+-#endif /* _YUGA_LITTLE_ENDIAN */
++  udwords high;
++  udwords low;
++#endif // _YUGA_LITTLE_ENDIAN
+ } uqwords;
+ 
+-/* Check if the target supports 80 bit extended precision long doubles.
+- * Notably, on x86 Windows, MSVC only provides a 64-bit long double, but GCC
+- * still makes it 80 bits. Clang will match whatever compiler it is trying to
+- * be compatible with.
+- */
+-#if ((defined(__i386__) || defined(__x86_64__)) && !defined(_MSC_VER)) || \
+-    defined(__m68k__) || defined(__ia64__)
++// Check if the target supports 80 bit extended precision long doubles.
++// Notably, on x86 Windows, MSVC only provides a 64-bit long double, but GCC
++// still makes it 80 bits. Clang will match whatever compiler it is trying to
++// be compatible with. On 32-bit x86 Android, long double is 64 bits, while on
++// x86_64 Android, long double is 128 bits.
++#if (defined(__i386__) || defined(__x86_64__)) &&                              \
++    !(defined(_MSC_VER) || defined(__ANDROID__))
++#define HAS_80_BIT_LONG_DOUBLE 1
++#elif defined(__m68k__) || defined(__ia64__)
+ #define HAS_80_BIT_LONG_DOUBLE 1
+ #else
+ #define HAS_80_BIT_LONG_DOUBLE 0
+ #endif
+ 
+-typedef union
+-{
+-    uqwords     u;
+-    long double f;
+-} long_double_bits;
++#if HAS_80_BIT_LONG_DOUBLE
++typedef long double xf_float;
++typedef union {
++  uqwords u;
++  xf_float f;
++} xf_bits;
++#endif
++
++#ifdef __powerpc64__
++// From https://gcc.gnu.org/wiki/Ieee128PowerPC:
++// PowerPC64 uses the following suffixes:
++// IFmode: IBM extended double
++// KFmode: IEEE 128-bit floating point
++// TFmode: Matches the default for long double. With -mabi=ieeelongdouble,
++//         it is IEEE 128-bit, with -mabi=ibmlongdouble IBM extended double
++// Since compiler-rt only implements the tf set of libcalls, we use long double
++// for the tf_float typedef.
++typedef long double tf_float;
++#define CRT_LDBL_128BIT
++#define CRT_HAS_F128
++#if __LDBL_MANT_DIG__ == 113 && !defined(__LONG_DOUBLE_IBM128__)
++#define CRT_HAS_IEEE_TF
++#define CRT_LDBL_IEEE_F128
++#endif
++#define TF_C(x) x##L
++#elif __LDBL_MANT_DIG__ == 113 ||                                              \
++    (__FLT_RADIX__ == 16 && __LDBL_MANT_DIG__ == 28)
++// Use long double instead of __float128 if it matches the IEEE 128-bit format
++// or the IBM hexadecimal format.
++#define CRT_LDBL_128BIT
++#define CRT_HAS_F128
++#if __LDBL_MANT_DIG__ == 113
++#define CRT_HAS_IEEE_TF
++#define CRT_LDBL_IEEE_F128
++#endif
++typedef long double tf_float;
++#define TF_C(x) x##L
++#elif defined(__FLOAT128__) || defined(__SIZEOF_FLOAT128__)
++#define CRT_HAS___FLOAT128_KEYWORD
++#define CRT_HAS_F128
++// NB: we assume the __float128 type uses IEEE representation.
++#define CRT_HAS_IEEE_TF
++typedef __float128 tf_float;
++#define TF_C(x) x##Q
++#endif
++
++#ifdef CRT_HAS_F128
++typedef union {
++  uqwords u;
++  tf_float f;
++} tf_bits;
++#endif
++
++// __(u)int128_t is currently needed to compile the *tf builtins as we would
++// otherwise need to manually expand the bit manipulation on two 64-bit value.
++#if defined(CRT_HAS_128BIT) && defined(CRT_HAS_F128)
++#define CRT_HAS_TF_MODE
++#endif
+ 
+-#if __STDC_VERSION__ >= 199901L
++#if __STDC_VERSION__ >= 199901L && !defined(_MSC_VER)
+ typedef float _Complex Fcomplex;
+ typedef double _Complex Dcomplex;
+ typedef long double _Complex Lcomplex;
++#if defined(CRT_LDBL_128BIT)
++typedef Lcomplex Qcomplex;
++#define CRT_HAS_NATIVE_COMPLEX_F128
++#elif defined(CRT_HAS___FLOAT128_KEYWORD)
++#if defined(__clang_major__) && __clang_major__ > 10
++// Clang prior to 11 did not support __float128 _Complex.
++typedef __float128 _Complex Qcomplex;
++#define CRT_HAS_NATIVE_COMPLEX_F128
++#elif defined(__GNUC__) && __GNUC__ >= 7
++// GCC does not allow __float128 _Complex, but accepts _Float128 _Complex.
++typedef _Float128 _Complex Qcomplex;
++#define CRT_HAS_NATIVE_COMPLEX_F128
++#endif
++#endif
+ 
+ #define COMPLEX_REAL(x) __real__(x)
+ #define COMPLEX_IMAGINARY(x) __imag__(x)
+ #else
+-typedef struct { float real, imaginary; } Fcomplex;
++typedef struct {
++  float real, imaginary;
++} Fcomplex;
+ 
+-typedef struct { double real, imaginary; } Dcomplex;
++typedef struct {
++  double real, imaginary;
++} Dcomplex;
+ 
+-typedef struct { long double real, imaginary; } Lcomplex;
++typedef struct {
++  long double real, imaginary;
++} Lcomplex;
+ 
+ #define COMPLEX_REAL(x) (x).real
+ #define COMPLEX_IMAGINARY(x) (x).imaginary
+ #endif
+-#endif /* INT_TYPES_H */
++
++#ifdef CRT_HAS_NATIVE_COMPLEX_F128
++#define COMPLEXTF_REAL(x) __real__(x)
++#define COMPLEXTF_IMAGINARY(x) __imag__(x)
++#elif defined(CRT_HAS_F128)
++typedef struct {
++  tf_float real, imaginary;
++} Qcomplex;
++#define COMPLEXTF_REAL(x) (x).real
++#define COMPLEXTF_IMAGINARY(x) (x).imaginary
++#endif
++
++#endif // CRT_HAS_FLOATING_POINT
++#endif // INT_TYPES_H
+diff --git a/libs/compiler-rt/lib/builtins/int_util.h b/libs/compiler-rt/lib/builtins/int_util.h
+index c3c8738..c372c2e 100644
+--- a/libs/compiler-rt/lib/builtins/int_util.h
++++ b/libs/compiler-rt/lib/builtins/int_util.h
+@@ -1,25 +1,23 @@
+-/* ===-- int_util.h - internal utility functions ----------------------------===
+- *
+- *                     The LLVM Compiler Infrastructure
+- *
+- * This file is dual licensed under the MIT and the University of Illinois Open
+- * Source Licenses. See LICENSE.TXT for details.
+- *
+- * ===-----------------------------------------------------------------------===
+- *
+- * This file is not part of the interface of this library.
+- *
+- * This file defines non-inline utilities which are available for use in the
+- * library. The function definitions themselves are all contained in int_util.c
+- * which will always be compiled into any compiler-rt library.
+- *
+- * ===-----------------------------------------------------------------------===
+- */
++//===-- int_util.h - internal utility functions ---------------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file is not part of the interface of this library.
++//
++// This file defines non-inline utilities which are available for use in the
++// library. The function definitions themselves are all contained in int_util.c
++// which will always be compiled into any compiler-rt library.
++//
++//===----------------------------------------------------------------------===//
+ 
+ #ifndef INT_UTIL_H
+ #define INT_UTIL_H
+ 
+-/** \brief Trigger a program abort (or panic for kernel code). */
++/// \brief Trigger a program abort (or panic for kernel code).
+ #define compilerrt_abort() __compilerrt_abort_impl(__FILE__, __LINE__, __func__)
+ 
+ NORETURN void __compilerrt_abort_impl(const char *file, int line,
+@@ -30,4 +28,20 @@ NORETURN void __compilerrt_abort_impl(const char *file, int line,
+ #define COMPILE_TIME_ASSERT2(expr, cnt)                                        \
+   typedef char ct_assert_##cnt[(expr) ? 1 : -1] UNUSED
+ 
+-#endif /* INT_UTIL_H */
++// Force unrolling the code specified to be repeated N times.
++#define REPEAT_0_TIMES(code_to_repeat) /* do nothing */
++#define REPEAT_1_TIMES(code_to_repeat) code_to_repeat
++#define REPEAT_2_TIMES(code_to_repeat)                                         \
++  REPEAT_1_TIMES(code_to_repeat)                                               \
++  code_to_repeat
++#define REPEAT_3_TIMES(code_to_repeat)                                         \
++  REPEAT_2_TIMES(code_to_repeat)                                               \
++  code_to_repeat
++#define REPEAT_4_TIMES(code_to_repeat)                                         \
++  REPEAT_3_TIMES(code_to_repeat)                                               \
++  code_to_repeat
++
++#define REPEAT_N_TIMES_(N, code_to_repeat) REPEAT_##N##_TIMES(code_to_repeat)
++#define REPEAT_N_TIMES(N, code_to_repeat) REPEAT_N_TIMES_(N, code_to_repeat)
++
++#endif // INT_UTIL_H
+diff --git a/libs/compiler-rt/lib/builtins/multf3.c b/libs/compiler-rt/lib/builtins/multf3.c
+new file mode 100644
+index 0000000..8fd7368
+--- /dev/null
++++ b/libs/compiler-rt/lib/builtins/multf3.c
+@@ -0,0 +1,22 @@
++//===-- lib/multf3.c - Quad-precision multiplication --------------*- C -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file implements quad-precision soft-float multiplication
++// with the IEEE-754 default rounding (to nearest, ties to even).
++//
++//===----------------------------------------------------------------------===//
++
++#define QUAD_PRECISION
++#include "fp_lib.h"
++
++#if defined(CRT_HAS_TF_MODE)
++#include "fp_mul_impl.inc"
++
++COMPILER_RT_ABI fp_t __multf3(fp_t a, fp_t b) { return __mulXf3__(a, b); }
++
++#endif
+diff --git a/libs/compiler-rt/lib/builtins/powitf2.c b/libs/compiler-rt/lib/builtins/powitf2.c
+new file mode 100644
+index 0000000..e02db40
+--- /dev/null
++++ b/libs/compiler-rt/lib/builtins/powitf2.c
+@@ -0,0 +1,34 @@
++//===-- powitf2.cpp - Implement __powitf2 ---------------------------------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file implements __powitf2 for the compiler_rt library.
++//
++//===----------------------------------------------------------------------===//
++
++#define QUAD_PRECISION
++#include "fp_lib.h"
++
++#if defined(CRT_HAS_TF_MODE)
++
++// Returns: a ^ b
++
++COMPILER_RT_ABI fp_t __powitf2(fp_t a, int b) {
++  const int recip = b < 0;
++  fp_t r = 1;
++  while (1) {
++    if (b & 1)
++      r *= a;
++    b /= 2;
++    if (b == 0)
++      break;
++    a *= a;
++  }
++  return recip ? 1 / r : r;
++}
++
++#endif
+diff --git a/libs/compiler-rt/lib/builtins/subtf3.c b/libs/compiler-rt/lib/builtins/subtf3.c
+new file mode 100644
+index 0000000..e1b1022
+--- /dev/null
++++ b/libs/compiler-rt/lib/builtins/subtf3.c
+@@ -0,0 +1,24 @@
++//===-- lib/subtf3.c - Quad-precision subtraction -----------------*- C -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file implements quad-precision soft-float subtraction.
++//
++//===----------------------------------------------------------------------===//
++
++#define QUAD_PRECISION
++#include "fp_lib.h"
++
++#if defined(CRT_HAS_TF_MODE)
++COMPILER_RT_ABI fp_t __addtf3(fp_t a, fp_t b);
++
++// Subtraction; flip the sign bit of b and add.
++COMPILER_RT_ABI fp_t __subtf3(fp_t a, fp_t b) {
++  return __addtf3(a, fromRep(toRep(b) ^ signBit));
++}
++
++#endif
+diff --git a/libs/compiler-rt/lib/builtins/trunctfdf2.c b/libs/compiler-rt/lib/builtins/trunctfdf2.c
+new file mode 100644
+index 0000000..a5bdded
+--- /dev/null
++++ b/libs/compiler-rt/lib/builtins/trunctfdf2.c
+@@ -0,0 +1,19 @@
++//===-- lib/truncdfsf2.c - quad -> double conversion --------------*- C -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#define QUAD_PRECISION
++#include "fp_lib.h"
++
++#if defined(CRT_HAS_TF_MODE)
++#define SRC_QUAD
++#define DST_DOUBLE
++#include "fp_trunc_impl.inc"
++
++COMPILER_RT_ABI dst_t __trunctfdf2(src_t a) { return __truncXfYf2__(a); }
++
++#endif
+diff --git a/libs/compiler-rt/lib/builtins/trunctfsf2.c b/libs/compiler-rt/lib/builtins/trunctfsf2.c
+new file mode 100644
+index 0000000..b65b5af
+--- /dev/null
++++ b/libs/compiler-rt/lib/builtins/trunctfsf2.c
+@@ -0,0 +1,19 @@
++//===-- lib/trunctfsf2.c - quad -> single conversion --------------*- C -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#define QUAD_PRECISION
++#include "fp_lib.h"
++
++#if defined(CRT_HAS_TF_MODE)
++#define SRC_QUAD
++#define DST_SINGLE
++#include "fp_trunc_impl.inc"
++
++COMPILER_RT_ABI dst_t __trunctfsf2(src_t a) { return __truncXfYf2__(a); }
++
++#endif
+-- 
+2.47.3
+

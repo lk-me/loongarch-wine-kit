@@ -1,0 +1,391 @@
+From 966980135581d656cabc191431f9f682ac7010b8 Mon Sep 17 00:00:00 2001
+From: ChenghaoLiu <linkmecry@gmail.com>
+Date: Thu, 5 Nov 2026 18:37:47 +0800
+Subject: [PATCH 09/11] [LoongArch] Add unwind metadata to hand-written asm
+ frames
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+手写汇编函数没有展开信息时，异常穿过该帧只能走叶子分支，RtlVirtualUnwind2
+无法回退栈和返回地址，call_seh_handlers 会原地自旋。为 ntdll 的上下文捕获、
+SEH 分发和线程启动函数补 .seh_proc/.seh_stackalloc/.seh_savereg，并让
+RtlVirtualUnwind2 在 flags 置位时导出语言 handler，同时补上 loongarch64
+缺失的 NdrClientCall2 等 RPC 桩。
+---
+ dlls/ntdll/signal_loongarch64.c | 66 ++++++++++++++++++++++++----
+ dlls/ntdll/unwind.c             | 20 ++++++++-
+ dlls/rpcrt4/ndr_stubless.c      | 76 ++++++++++++++++++++++++++++++++-
+ 3 files changed, 151 insertions(+), 11 deletions(-)
+
+diff --git a/dlls/ntdll/signal_loongarch64.c b/dlls/ntdll/signal_loongarch64.c
+index 265325f..3dde592 100644
+--- a/dlls/ntdll/signal_loongarch64.c
++++ b/dlls/ntdll/signal_loongarch64.c
+@@ -68,10 +68,13 @@ __ASM_GLOBAL_FUNC( __chkstk, "jr $ra" )
+  *		RtlCaptureContext (NTDLL.@)
+  */
+ __ASM_GLOBAL_FUNC( RtlCaptureContext,
++                    ".seh_proc \"RtlCaptureContext\"\n\t"
+                     /* 先保存会被自己用到的 $a0/$t0，再逐个保存其它寄存器 */
+                     "addi.d $sp, $sp, -16\n\t"
++                    ".seh_stackalloc 16\n\t"
+                     "st.d $a0, $sp, 0\n\t"
+                     "st.d $t0, $sp, 8\n\t"
++                    ".seh_endprologue\n\t"
+                     "move $t0, $a0\n\t"                   /* t0 = context */
+                     "st.d $zero, $t0, 0x08\n\t"           /* context->Gpr[0] */
+                     "st.d $ra,   $t0, 0x10\n\t"           /* context->Gpr[1] */
+@@ -165,7 +168,8 @@ __ASM_GLOBAL_FUNC( RtlCaptureContext,
+                     "ld.d $a0, $sp, 0\n\t"
+                     "ld.d $t0, $sp, 8\n\t"
+                     "addi.d $sp, $sp, 16\n\t"
+-                    "jr $ra" )
++                    "jr $ra\n\t"
++                    ".seh_endproc" )
+ 
+ 
+ /**********************************************************************
+@@ -233,15 +237,20 @@ EXCEPTION_DISPOSITION WINAPI unwind_exception_handler( EXCEPTION_RECORD *record,
+ DWORD WINAPI call_unwind_handler( EXCEPTION_RECORD *rec, ULONG_PTR frame,
+                                   CONTEXT *context, void *dispatch, PEXCEPTION_ROUTINE handler );
+ __ASM_GLOBAL_FUNC( call_unwind_handler,
++                   ".seh_proc \"call_unwind_handler\"\n\t"
+                    "addi.d $sp, $sp, -32\n\t"
++                   ".seh_stackalloc 32\n\t"
+                    "st.d $fp, $sp, 0\n\t"
+                    "st.d $ra, $sp, 8\n\t"
++                   ".seh_savereg $ra, 8\n\t"
+                    "st.d $a3, $sp, 16\n\t"    /* frame[-2] = dispatch */
++                   ".seh_endprologue\n\t"
+                    "jirl $ra, $a4, 0\n\t"
+                    "ld.d $fp, $sp, 0\n\t"
+                    "ld.d $ra, $sp, 8\n\t"
+                    "addi.d $sp, $sp, 32\n\t"
+-                   "jr $ra" )
++                   "jr $ra\n\t"
++                   ".seh_endproc" )
+ 
+ 
+ /***********************************************************************
+@@ -250,14 +259,19 @@ __ASM_GLOBAL_FUNC( call_unwind_handler,
+ DWORD WINAPI call_seh_handler( EXCEPTION_RECORD *rec, ULONG_PTR frame,
+                                CONTEXT *context, void *dispatch, PEXCEPTION_ROUTINE handler );
+ __ASM_GLOBAL_FUNC( call_seh_handler,
++                   ".seh_proc \"call_seh_handler\"\n\t"
+                    "addi.d $sp, $sp, -16\n\t"
++                   ".seh_stackalloc 16\n\t"
+                    "st.d $fp, $sp, 0\n\t"
+                    "st.d $ra, $sp, 8\n\t"
++                   ".seh_savereg $ra, 8\n\t"
++                   ".seh_endprologue\n\t"
+                    "jirl $ra, $a4, 0\n\t"
+                    "ld.d $fp, $sp, 0\n\t"
+                    "ld.d $ra, $sp, 8\n\t"
+                    "addi.d $sp, $sp, 16\n\t"
+-                   "jr $ra" )
++                   "jr $ra\n\t"
++                   ".seh_endproc" )
+ 
+ 
+ /**********************************************************************
+@@ -427,10 +441,15 @@ void WINAPI DECLSPEC_NORETURN consolidate_callback( CONTEXT *context,
+                                                     void *(CALLBACK *callback)(EXCEPTION_RECORD *),
+                                                     EXCEPTION_RECORD *rec );
+ __ASM_GLOBAL_FUNC( consolidate_callback,
++                   ".seh_proc \"consolidate_callback\"\n\t"
+                    "addi.d $sp, $sp, -16\n\t"
++                   ".seh_stackalloc 16\n\t"
+                    "st.d $fp, $sp, 0\n\t"
+                    "st.d $ra, $sp, 8\n\t"
++                   ".seh_savereg $ra, 8\n\t"
+                    "addi.d $sp, $sp, -0x240\n\t"  /* sizeof(CONTEXT) */
++                   ".seh_stackalloc 0x240\n\t"
++                   ".seh_endprologue\n\t"
+                    "move $t3, $sp\n\t"
+                    "li.w $t2, 0x24\n\t"           /* 0x240 / 16 */
+                    "1:\tld.d $t0, $a0, 0\n\t"
+@@ -442,7 +461,8 @@ __ASM_GLOBAL_FUNC( consolidate_callback,
+                    "addi.d $t2, $t2, -1\n\t"
+                    "bnez $t2, 1b\n\t"
+                    "move $a0, $a2\n\t"
+-                   "b invoke_callback" )
++                   "b invoke_callback\n\t"
++                   ".seh_endproc" )
+ __ASM_GLOBAL_FUNC( invoke_callback,
+                    "jirl $ra, $a1, 0\n\t"
+                    "st.d $a0, $sp, 0x108\n\t"     /* context->Pc */
+@@ -705,18 +725,32 @@ ULONG WINAPI RtlWalkFrameChain( void **buffer, ULONG count, ULONG flags )
+  *		__C_ExecuteExceptionFilter
+  */
+ __ASM_GLOBAL_FUNC( __C_ExecuteExceptionFilter,
++                   ".seh_proc \"__C_ExecuteExceptionFilter\"\n\t"
+                    "addi.d $sp, $sp, -0x60\n\t"
++                   ".seh_stackalloc 0x60\n\t"
+                    "st.d $fp, $sp, 0\n\t"
++                   ".seh_savereg $fp, 0\n\t"
+                    "st.d $ra, $sp, 8\n\t"
++                   ".seh_savereg $ra, 8\n\t"
+                    "st.d $s0, $sp, 0x10\n\t"
++                   ".seh_savereg $s0, 0x10\n\t"
+                    "st.d $s1, $sp, 0x18\n\t"
++                   ".seh_savereg $s1, 0x18\n\t"
+                    "st.d $s2, $sp, 0x20\n\t"
++                   ".seh_savereg $s2, 0x20\n\t"
+                    "st.d $s3, $sp, 0x28\n\t"
++                   ".seh_savereg $s3, 0x28\n\t"
+                    "st.d $s4, $sp, 0x30\n\t"
++                   ".seh_savereg $s4, 0x30\n\t"
+                    "st.d $s5, $sp, 0x38\n\t"
++                   ".seh_savereg $s5, 0x38\n\t"
+                    "st.d $s6, $sp, 0x40\n\t"
++                   ".seh_savereg $s6, 0x40\n\t"
+                    "st.d $s7, $sp, 0x48\n\t"
++                   ".seh_savereg $s7, 0x48\n\t"
+                    "st.d $s8, $sp, 0x50\n\t"
++                   ".seh_savereg $s8, 0x50\n\t"
++                   ".seh_endprologue\n\t"
+                    "ld.d $fp, $a3, 0\n\t"     /* $fp = frame */
+                    "ld.d $s0, $a3, 0x08\n\t"
+                    "ld.d $s1, $a3, 0x10\n\t"
+@@ -741,17 +775,22 @@ __ASM_GLOBAL_FUNC( __C_ExecuteExceptionFilter,
+                    "ld.d $fp, $sp, 0\n\t"
+                    "ld.d $ra, $sp, 8\n\t"
+                    "addi.d $sp, $sp, 0x60\n\t"
+-                   "jr $ra" )
++                   "jr $ra\n\t"
++                   ".seh_endproc" )
+ 
+ 
+ /***********************************************************************
+  *		RtlRaiseException (NTDLL.@)
+  */
+ __ASM_GLOBAL_FUNC( RtlRaiseException,
++                   ".seh_proc \"RtlRaiseException\"\n\t"
+                    "addi.d $sp, $sp, -0x260\n\t"  /* 0x240 (context) + 0x20 */
++                   ".seh_stackalloc 0x260\n\t"
+                    "st.d $fp, $sp, 0\n\t"
+                    "st.d $ra, $sp, 8\n\t"
++                   ".seh_savereg $ra, 8\n\t"
+                    "st.d $a0, $sp, 0x10\n\t"
++                   ".seh_endprologue\n\t"
+                    "addi.d $a0, $sp, 0x20\n\t"
+                    "bl RtlCaptureContext\n\t"
+                    "addi.d $a1, $sp, 0x20\n\t"    /* context pointer */
+@@ -778,7 +817,8 @@ __ASM_GLOBAL_FUNC( RtlRaiseException,
+                    "li.d $a2, 1\n\t"
+                    "bl NtRaiseException\n\t"
+                    "bl RtlRaiseStatus\n\t"
+-                   "break 0x7000" )
++                   "break 0x7000\n\t"
++                   ".seh_endproc" )
+ 
+ 
+ /***********************************************************************
+@@ -837,9 +877,13 @@ void __cdecl NTDLL_longjmp( _JUMP_BUFFER *buf, int retval )
+  *           RtlUserThreadStart (NTDLL.@)
+  */
+ __ASM_GLOBAL_FUNC( RtlUserThreadStart,
++                   ".seh_proc \"RtlUserThreadStart\"\n\t"
+                    "addi.d $sp, $sp, -16\n\t"
++                   ".seh_stackalloc 16\n\t"
+                    "st.d $fp, $sp, 0\n\t"
+                    "st.d $ra, $sp, 8\n\t"
++                   ".seh_savereg $ra, 8\n\t"
++                   ".seh_endprologue\n\t"
+                    "pcalau12i $t0, %pc_hi20(pBaseThreadInitThunk)\n\t"
+                    "addi.d $t0, $t0, %pc_lo12(pBaseThreadInitThunk)\n\t"
+                    "ld.d $t0, $t0, 0\n\t"
+@@ -847,7 +891,8 @@ __ASM_GLOBAL_FUNC( RtlUserThreadStart,
+                    "move $a1, $a0\n\t"
+                    "move $a0, $zero\n\t"
+                    "jirl $ra, $t0, 0\n\t"
+-                   "break 0x7000" )
++                   "break 0x7000\n\t"
++                   ".seh_endproc" )
+ 
+ /******************************************************************
+  *		LdrInitializeThunk (NTDLL.@)
+@@ -871,9 +916,13 @@ __ASM_GLOBAL_FUNC( process_breakpoint,
+  *		DbgUiRemoteBreakin   (NTDLL.@)
+  */
+ __ASM_GLOBAL_FUNC( DbgUiRemoteBreakin,
++                   ".seh_proc \"DbgUiRemoteBreakin\"\n\t"
+                    "addi.d $sp, $sp, -16\n\t"
++                   ".seh_stackalloc 16\n\t"
+                    "st.d $fp, $sp, 0\n\t"
+                    "st.d $ra, $sp, 8\n\t"
++                   ".seh_savereg $ra, 8\n\t"
++                   ".seh_endprologue\n\t"
+                    "ld.d $a0, $r21, 0x60\n\t"       /* NtCurrentTeb()->Peb */
+                    "ld.bu $a0, $a0, 0x02\n\t"        /* peb->BeingDebugged */
+                    "beqz $a0, 1f\n\t"
+@@ -882,7 +931,8 @@ __ASM_GLOBAL_FUNC( DbgUiRemoteBreakin,
+                    "bl RtlExitUserThread\n\t"
+                    "DbgUiRemoteBreakin_handler:\n\t"
+                    "move $sp, $a1\n\t"               /* frame */
+-                   "b 1b" )
++                   "b 1b\n\t"
++                   ".seh_endproc" )
+ 
+ /**********************************************************************
+  *              DbgBreakPoint   (NTDLL.@)
+diff --git a/dlls/ntdll/unwind.c b/dlls/ntdll/unwind.c
+index 63b2ba7..550bca7 100644
+--- a/dlls/ntdll/unwind.c
++++ b/dlls/ntdll/unwind.c
+@@ -1670,6 +1670,10 @@ BOOLEAN CDECL RtlAddFunctionTable( RUNTIME_FUNCTION *table, DWORD count, ULONG_P
+ #define LOA_UNW_FLAG_CHAININFO 0x04
+ #define LOA_MAX_CHAIN          8
+ 
++/* flags 的 bit0/bit1 与 UNW_FLAG_EHANDLER/UNW_FLAG_UHANDLER 一致：
++ * 置位时，展开码与 epilogue 区间之后紧跟一个 4 字节 handler RVA，
++ * handler data 从该 RVA 之后开始，链式 RUNTIME_FUNCTION 再排在 handler data 之后。 */
++
+ struct loongarch_unwind_info
+ {
+     BYTE version : 3;
+@@ -1813,6 +1817,19 @@ NTSTATUS WINAPI RtlVirtualUnwind2( ULONG type, ULONG_PTR base, ULONG_PTR pc,
+                 }
+             }
+ 
++            /* 语言 handler：type 为 UNW_FLAG_EHANDLER/UNW_FLAG_UHANDLER 时才返回，
++               链式展开时保留最内层带 handler 的记录。 */
++            if (info->flags & type)
++            {
++                ULONG *handler = codes + info->count + 2 * info->epilog_count;
++
++                if (!*handler_ret)
++                {
++                    *handler_ret = (PEXCEPTION_ROUTINE)(base + *handler);
++                    *handler_data = handler + 1;
++                }
++            }
++
+             /* 链式展开信息：先应用本条记录，再继续应用父记录的展开码。 */
+             if (!(info->flags & LOA_UNW_FLAG_CHAININFO))
+                 break;
+@@ -1821,7 +1838,8 @@ NTSTATUS WINAPI RtlVirtualUnwind2( ULONG type, ULONG_PTR base, ULONG_PTR pc,
+                 ERR( "too many chained unwind records at %p\n", info );
+                 return STATUS_BAD_FUNCTION_TABLE;
+             }
+-            func = (RUNTIME_FUNCTION *)(codes + info->count + 2 * info->epilog_count);
++            func = (RUNTIME_FUNCTION *)(codes + info->count + 2 * info->epilog_count +
++                                        ((info->flags & (UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER)) ? 1 : 0));
+         }
+         context->Gpr[3] = sp;
+     }
+diff --git a/dlls/rpcrt4/ndr_stubless.c b/dlls/rpcrt4/ndr_stubless.c
+index ec09fef..2c3fa2e 100644
+--- a/dlls/rpcrt4/ndr_stubless.c
++++ b/dlls/rpcrt4/ndr_stubless.c
+@@ -1055,9 +1055,34 @@ __ASM_GLOBAL_FUNC( NdrClientCall2,
+                    __ASM_CFI(".cfi_def_cfa %esp,4\n\t")
+                    __ASM_CFI(".cfi_same_value %ebp\n\t")
+                    "ret" )
++#elif defined(__loongarch__)
++/* a2-a7 保存到 sp+0x10，正好接在调用者的栈参数区之前。
++ * 这是手写汇编，必须自带展开信息，否则异常穿过这一帧时栈无法回退。 */
++__ASM_GLOBAL_FUNC( NdrClientCall2,
++                   ".seh_proc \"NdrClientCall2\"\n\t"
++                   "addi.d $sp, $sp, -0x40\n\t"
++                   ".seh_stackalloc 0x40\n\t"
++                   "st.d $ra, $sp, 0\n\t"
++                   ".seh_savereg $ra, 0\n\t"
++                   "st.d $a2, $sp, 0x10\n\t"
++                   "st.d $a3, $sp, 0x18\n\t"
++                   "st.d $a4, $sp, 0x20\n\t"
++                   "st.d $a5, $sp, 0x28\n\t"
++                   "st.d $a6, $sp, 0x30\n\t"
++                   "st.d $a7, $sp, 0x38\n\t"
++                   ".seh_endprologue\n\t"
++                   "addi.d $a2, $sp, 0x10\n\t"      /* stack */
++                   "move $a3, $zero\n\t"             /* fpu_stack */
++                   "bl NdrpClientCall2\n\t"
++                   "ld.d $ra, $sp, 0\n\t"
++                   "addi.d $sp, $sp, 0x40\n\t"
++                   ".seh_startepilogue\n\t"
++                   "jr $ra\n\t"
++                   ".seh_endepilogue\n\t"
++                   ".seh_endproc" )
+ #endif
+ 
+-#if defined(__aarch64__) || defined(__arm__)
++#if defined(__aarch64__) || defined(__arm__) || defined(__loongarch__)
+ static void **args_regs_to_stack( void **regs, void **fpu_regs, const NDR_PROC_PARTIAL_OIF_HEADER *header )
+ {
+     static const unsigned int nb_gpregs = sizeof(void *); /* 4 gpregs on arm32, 8 on arm64 */
+@@ -1889,6 +1914,22 @@ __ASM_GLOBAL_FUNC( NdrAsyncClientCall,
+                    __ASM_CFI(".cfi_def_cfa %esp,4\n\t")
+                    __ASM_CFI(".cfi_same_value %ebp\n\t")
+                    "ret" )
++#elif defined(__loongarch__)
++__ASM_GLOBAL_FUNC( NdrAsyncClientCall,
++                   "addi.d $sp, $sp, -0x40\n\t"
++                   "st.d $ra, $sp, 0\n\t"
++                   "st.d $a2, $sp, 0x10\n\t"
++                   "st.d $a3, $sp, 0x18\n\t"
++                   "st.d $a4, $sp, 0x20\n\t"
++                   "st.d $a5, $sp, 0x28\n\t"
++                   "st.d $a6, $sp, 0x30\n\t"
++                   "st.d $a7, $sp, 0x38\n\t"
++                   "addi.d $a2, $sp, 0x10\n\t"      /* stack */
++                   "move $a3, $zero\n\t"             /* fpu_stack */
++                   "bl ndr_async_client_call\n\t"
++                   "ld.d $ra, $sp, 0\n\t"
++                   "addi.d $sp, $sp, 0x40\n\t"
++                   "jr $ra" )
+ #endif
+ 
+ RPCRTAPI LONG RPC_ENTRY NdrAsyncStubCall(struct IRpcStubBuffer* pThis,
+@@ -2235,6 +2276,21 @@ __ASM_GLOBAL_FUNC( NdrClientCall3,
+                    "addq $0x28,%rsp\n\t"
+                    __ASM_CFI(".cfi_adjust_cfa_offset -0x28\n\t")
+                    "ret" )
++#elif defined(__loongarch__)
++/* info/proc/retval 占 a0-a2，用户参数从 a3 开始。 */
++__ASM_GLOBAL_FUNC( NdrClientCall3,
++                   "addi.d $sp, $sp, -0x40\n\t"
++                   "st.d $ra, $sp, 0\n\t"
++                   "st.d $a3, $sp, 0x18\n\t"
++                   "st.d $a4, $sp, 0x20\n\t"
++                   "st.d $a5, $sp, 0x28\n\t"
++                   "st.d $a6, $sp, 0x30\n\t"
++                   "st.d $a7, $sp, 0x38\n\t"
++                   "addi.d $a3, $sp, 0x18\n\t"      /* stack */
++                   "bl ndr64_client_call\n\t"
++                   "ld.d $ra, $sp, 0\n\t"
++                   "addi.d $sp, $sp, 0x40\n\t"
++                   "jr $ra" )
+ #endif
+ 
+ LONG_PTR CDECL ndr64_async_client_call( MIDL_STUBLESS_PROXY_INFO *info,
+@@ -2303,8 +2359,24 @@ __ASM_GLOBAL_FUNC( Ndr64AsyncClientCall,
+                    "movq %r9,0x48(%rsp)\n\t"
+                    "leaq 0x48(%rsp),%r9\n\t" /* stack */
+                    "movq $0,0x20(%rsp)\n\t"  /* fpu_stack */
+-                   "call " __ASM_NAME("ndr64_async_client_call") "\n\t"
++                   "call " __ASM_NAME("ndr_async_client_call") "\n\t"
+                    "addq $0x28,%rsp\n\t"
+                    __ASM_CFI(".cfi_adjust_cfa_offset -0x28\n\t")
+                    "ret" )
++#elif defined(__loongarch__)
++/* info/proc/retval 占 a0-a2，用户参数从 a3 开始。 */
++__ASM_GLOBAL_FUNC( Ndr64AsyncClientCall,
++                   "addi.d $sp, $sp, -0x40\n\t"
++                   "st.d $ra, $sp, 0\n\t"
++                   "st.d $a3, $sp, 0x18\n\t"
++                   "st.d $a4, $sp, 0x20\n\t"
++                   "st.d $a5, $sp, 0x28\n\t"
++                   "st.d $a6, $sp, 0x30\n\t"
++                   "st.d $a7, $sp, 0x38\n\t"
++                   "addi.d $a3, $sp, 0x18\n\t"      /* stack */
++                   "move $a4, $zero\n\t"             /* fpu_stack */
++                   "bl ndr64_async_client_call\n\t"
++                   "ld.d $ra, $sp, 0\n\t"
++                   "addi.d $sp, $sp, 0x40\n\t"
++                   "jr $ra" )
+ #endif
+-- 
+2.47.3
+

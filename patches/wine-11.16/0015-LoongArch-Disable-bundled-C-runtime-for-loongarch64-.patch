@@ -1,0 +1,50 @@
+From 16e4564dacac8ac689703bd7df8e9630aafc6126 Mon Sep 17 00:00:00 2001
+From: k <k@l>
+Date: Fri, 6 Nov 2026 17:49:17 +0800
+Subject: [PATCH 15/20] [LoongArch] Disable bundled C++ runtime for loongarch64
+ PE
+
+---
+ configure    | 6 ++++++
+ configure.ac | 8 ++++++++
+ 2 files changed, 14 insertions(+)
+
+diff --git a/configure b/configure
+index e6de352..673199a 100755
+--- a/configure
++++ b/configure
+@@ -8824,6 +8824,12 @@ else case e in #(
+ esac
+ fi
+ 
++    if test "$wine_arch" = loongarch64
++then :
++  enable_cplusplus=no
++        enable_cppabi=no
++fi
++
+     { as_ac_var=`printf '%s\n' "ac_cv_${wine_arch}_cflags_-fno-strict-aliasing" | sed "$as_sed_sh"`
+ { printf '%s\n' "$as_me:${as_lineno-$LINENO}: checking whether $CC supports -fno-strict-aliasing" >&5
+ printf %s "checking whether $CC supports -fno-strict-aliasing... " >&6; }
+diff --git a/configure.ac b/configure.ac
+index 8667598..87fec00 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -592,6 +592,14 @@ Please install mingw-w64, clang/llvm-dlltool/lld, or llvm-mingw.])
+                  *mingw*|*-windows-gnu) enable_cppabi="$enable_cppabi,$wine_arch" ;;
+                esac])
+ 
++    dnl The bundled C++ runtime needs an MSVC-compatible size_t (unsigned __int64)
++    dnl and C++ exception support, neither of which the LoongArch PE target has.
++    if test "$wine_arch" = loongarch64
++    then
++        enable_cplusplus=no
++        enable_cppabi=no
++    fi
++
+     WINE_TRY_PE_CFLAGS([-fno-strict-aliasing])
+     dnl clang needs to be told to fail on unknown options
+     WINE_TRY_PE_CFLAGS([-Werror=unknown-warning-option],[CFLAGS="$CFLAGS -Werror=unknown-warning-option"])
+-- 
+2.47.3
+

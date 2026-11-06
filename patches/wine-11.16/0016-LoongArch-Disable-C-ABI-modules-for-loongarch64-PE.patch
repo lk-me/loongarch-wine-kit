@@ -1,0 +1,50 @@
+From 710ca6037c08a4f46415a09feb6e83b9b0899ab4 Mon Sep 17 00:00:00 2001
+From: k <k@l>
+Date: Fri, 6 Nov 2026 18:23:43 +0800
+Subject: [PATCH 16/20] [LoongArch] Disable C++ ABI modules for loongarch64 PE
+
+---
+ configure    | 7 +++++++
+ configure.ac | 8 ++++++++
+ 2 files changed, 15 insertions(+)
+
+diff --git a/configure b/configure
+index 673199a..235c42c 100755
+--- a/configure
++++ b/configure
+@@ -8828,6 +8828,13 @@ fi
+ then :
+   enable_cplusplus=no
+         enable_cppabi=no
++  enable_vcruntime140=no
++  enable_vcruntime140_1=no
++  enable_msvcp140=no
++  enable_msvcp140_1=no
++  enable_msvcp140_2=no
++  enable_msvcp140_atomic_wait=no
++  enable_concrt140=no
+ fi
+ 
+     { as_ac_var=`printf '%s\n' "ac_cv_${wine_arch}_cflags_-fno-strict-aliasing" | sed "$as_sed_sh"`
+diff --git a/configure.ac b/configure.ac
+index 87fec00..1be139b 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -598,6 +598,14 @@ Please install mingw-w64, clang/llvm-dlltool/lld, or llvm-mingw.])
+     then
+         enable_cplusplus=no
+         enable_cppabi=no
++        dnl 以下模块依赖 MSVC 风格的 C++ ABI，LoongArch PE 目标暂不支持
++        enable_vcruntime140=no
++        enable_vcruntime140_1=no
++        enable_msvcp140=no
++        enable_msvcp140_1=no
++        enable_msvcp140_2=no
++        enable_msvcp140_atomic_wait=no
++        enable_concrt140=no
+     fi
+ 
+     WINE_TRY_PE_CFLAGS([-fno-strict-aliasing])
+-- 
+2.47.3
+

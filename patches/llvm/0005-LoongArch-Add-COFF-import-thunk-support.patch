@@ -1,0 +1,162 @@
+From 49cab36f53263610a8ad72b07425bcfd4bffc893 Mon Sep 17 00:00:00 2001
+From: ChenghaoLiu <linkmecry@gmail.com>
+Date: Tue, 3 Nov 2026 12:14:18 +0800
+Subject: [PATCH 05/13] [LoongArch] Add COFF import thunk support
+
+Generate pcalau12i/addi.d/ld.d/jirl import thunks for LOONGARCH64 call
+targets, so calls and branches to imported functions link correctly.
+Round PAGEBASE_REL21 to the nearest page since the paired 12-bit
+immediate is sign-extended. Also write and read LoongArch64 import
+libraries and report COFF objects as 64-bit.
+---
+ lld/COFF/Chunks.cpp                | 14 +++++++++++++-
+ lld/COFF/Chunks.h                  | 18 ++++++++++++++++++
+ lld/COFF/Config.h                  |  1 +
+ lld/COFF/InputFiles.cpp            |  2 ++
+ llvm/lib/Object/COFFImportFile.cpp |  4 ++++
+ llvm/lib/Object/COFFObjectFile.cpp |  7 ++++++-
+ 6 files changed, 44 insertions(+), 2 deletions(-)
+
+diff --git a/lld/COFF/Chunks.cpp b/lld/COFF/Chunks.cpp
+index 76c66a4c3..88dfe6ba8 100644
+--- a/lld/COFF/Chunks.cpp
++++ b/lld/COFF/Chunks.cpp
+@@ -415,7 +415,8 @@ static void applyLoongArchAddr(uint8_t *off, uint64_t s, uint64_t p, int shift)
+   uint32_t orig = read32le(off);
+   int64_t imm = SignExtend64<20>((orig >> 5) & 0xFFFFF);
+   s += imm << shift;
+-  imm = (s >> shift) - (p >> shift);
++  // Round to the nearest page, as the paired 12-bit immediate is sign-extended.
++  imm = ((s + (1 << (shift - 1))) >> shift) - (p >> shift);
+   uint32_t mask = 0xFFFFF << 5;
+   write32le(off, (orig & ~mask) | ((imm & 0xFFFFF) << 5));
+ }
+@@ -976,6 +977,17 @@ void ImportThunkChunkARM64::writeTo(uint8_t *buf) const {
+   applyArm64Ldr(buf + 4, off);
+ }
+ 
++void ImportThunkChunkLoongArch64::writeTo(uint8_t *buf) const {
++  int64_t s = impSymbol->getRVA();
++  memcpy(buf, importThunkLoongArch64, sizeof(importThunkLoongArch64));
++  // pcalau12i: page offset to the nearest page of the target, since the
++  // 12-bit immediate of addi.d is sign-extended.
++  int64_t hi20 = ((s + 0x800) >> 12) - (rva >> 12);
++  int64_t lo12 = s & 0xfff;
++  write32le(buf, read32le(buf) | ((hi20 & 0xfffff) << 5));
++  write32le(buf + 4, read32le(buf + 4) | ((lo12 & 0xfff) << 10));
++}
++
+ // A Thumb2, PIC, non-interworking range extension thunk.
+ const uint8_t armThunk[] = {
+     0x40, 0xf2, 0x00, 0x0c, // P:  movw ip,:lower16:S - (P + (L1-P) + 4)
+diff --git a/lld/COFF/Chunks.h b/lld/COFF/Chunks.h
+index 32010e256..9ba0f0235 100644
+--- a/lld/COFF/Chunks.h
++++ b/lld/COFF/Chunks.h
+@@ -560,6 +560,13 @@ static const uint8_t importThunkARM64[] = {
+     0x00, 0x02, 0x1f, 0xd6, // br   x16
+ };
+ 
++static const uint8_t importThunkLoongArch64[] = {
++    0x0c, 0x00, 0x00, 0x1a, // pcalau12i $t0, #0
++    0x8c, 0x01, 0xc0, 0x02, // addi.d $t0, $t0, #0
++    0x8c, 0x01, 0xc0, 0x28, // ld.d $t0, $t0, 0
++    0x80, 0x01, 0x00, 0x4c, // jirl $zero, $t0, 0
++};
++
+ static const uint8_t importThunkARM64EC[] = {
+     0x0b, 0x00, 0x00, 0x90, // adrp x11, 0x0
+     0x6b, 0x01, 0x40, 0xf9, // ldr  x11, [x11]
+@@ -630,6 +637,17 @@ private:
+   MachineTypes machine;
+ };
+ 
++class ImportThunkChunkLoongArch64 : public ImportThunkChunk {
++public:
++  explicit ImportThunkChunkLoongArch64(COFFLinkerContext &ctx, Defined *s)
++      : ImportThunkChunk(ctx, s) {
++    setAlignment(4);
++  }
++  size_t getSize() const override { return sizeof(importThunkLoongArch64); }
++  void writeTo(uint8_t *buf) const override;
++  MachineTypes getMachine() const override { return LOONGARCH64; }
++};
++
+ // ARM64EC __impchk_* thunk implementation.
+ // Performs an indirect call to an imported function pointer
+ // using the __icall_helper_arm64ec helper function.
+diff --git a/lld/COFF/Config.h b/lld/COFF/Config.h
+index 2c42d08e0..ab92b3b23 100644
+--- a/lld/COFF/Config.h
++++ b/lld/COFF/Config.h
+@@ -44,6 +44,7 @@ static const auto ARM64EC = llvm::COFF::IMAGE_FILE_MACHINE_ARM64EC;
+ static const auto ARM64X = llvm::COFF::IMAGE_FILE_MACHINE_ARM64X;
+ static const auto ARMNT = llvm::COFF::IMAGE_FILE_MACHINE_ARMNT;
+ static const auto I386 = llvm::COFF::IMAGE_FILE_MACHINE_I386;
++static const auto LOONGARCH64 = llvm::COFF::IMAGE_FILE_MACHINE_LOONGARCH64;
+ 
+ enum class ExportSource {
+   Unset,
+diff --git a/lld/COFF/InputFiles.cpp b/lld/COFF/InputFiles.cpp
+index fd4858581..44da0ba44 100644
+--- a/lld/COFF/InputFiles.cpp
++++ b/lld/COFF/InputFiles.cpp
+@@ -1252,6 +1252,8 @@ ImportThunkChunk *ImportFile::makeImportThunk() {
+     return make<ImportThunkChunkARM64>(symtab.ctx, impSym, ARM64);
+   case ARMNT:
+     return make<ImportThunkChunkARM>(symtab.ctx, impSym);
++  case LOONGARCH64:
++    return make<ImportThunkChunkLoongArch64>(symtab.ctx, impSym);
+   }
+   llvm_unreachable("unknown machine type");
+ }
+diff --git a/llvm/lib/Object/COFFImportFile.cpp b/llvm/lib/Object/COFFImportFile.cpp
+index 5ef5ea310..fc74492a7 100644
+--- a/llvm/lib/Object/COFFImportFile.cpp
++++ b/llvm/lib/Object/COFFImportFile.cpp
+@@ -49,6 +49,8 @@ StringRef COFFImportFile::getFileFormatName() const {
+     return "COFF-import-file-ARM64EC";
+   case COFF::IMAGE_FILE_MACHINE_ARM64X:
+     return "COFF-import-file-ARM64X";
++  case COFF::IMAGE_FILE_MACHINE_LOONGARCH64:
++    return "COFF-import-file-loongarch64";
+   default:
+     return "COFF-import-file-<unknown arch>";
+   }
+@@ -135,6 +137,8 @@ static uint16_t getImgRelRelocation(MachineTypes Machine) {
+     return IMAGE_REL_I386_DIR32NB;
+   case IMAGE_FILE_MACHINE_R4000:
+     return IMAGE_REL_MIPS_REFWORDNB;
++  case IMAGE_FILE_MACHINE_LOONGARCH64:
++    return IMAGE_REL_LOONGARCH64_ADDR32NB;
+   }
+ }
+ 
+diff --git a/llvm/lib/Object/COFFObjectFile.cpp b/llvm/lib/Object/COFFObjectFile.cpp
+index 08458f834..521fbc417 100644
+--- a/llvm/lib/Object/COFFObjectFile.cpp
++++ b/llvm/lib/Object/COFFObjectFile.cpp
+@@ -1115,7 +1115,10 @@ dynamic_reloc_iterator COFFObjectFile::dynamic_reloc_end() const {
+ }
+ 
+ uint8_t COFFObjectFile::getBytesInAddress() const {
+-  return getArch() == Triple::x86_64 || getArch() == Triple::aarch64 ? 8 : 4;
++  return getArch() == Triple::x86_64 || getArch() == Triple::aarch64 ||
++                 getArch() == Triple::loongarch64
++             ? 8
++             : 4;
+ }
+ 
+ StringRef COFFObjectFile::getFileFormatName() const {
+@@ -1134,6 +1137,8 @@ StringRef COFFObjectFile::getFileFormatName() const {
+     return "COFF-ARM64X";
+   case COFF::IMAGE_FILE_MACHINE_R4000:
+     return "COFF-MIPS";
++  case COFF::IMAGE_FILE_MACHINE_LOONGARCH64:
++    return "COFF-LoongArch64";
+   default:
+     return "COFF-<unknown arch>";
+   }
+-- 
+2.47.3
+

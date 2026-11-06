@@ -1,0 +1,294 @@
+From c46b5a5ad6f47bfe86c8b3dead4565ad114fd5d7 Mon Sep 17 00:00:00 2001
+From: ChenghaoLiu <linkmecry@gmail.com>
+Date: Thu, 5 Nov 2026 18:37:42 +0800
+Subject: [PATCH 13/13] [LoongArch] Emit PE unwind info for all non-leaf frames
+
+Scan the prologue for multiple stack allocations, general register saves
+and frame-pointer setup, and skip the non-volatile FPR saves that the
+unwinder does not decode. Save $ra whenever the function makes calls, so
+noreturn frames still get a .pdata entry instead of falling back to the
+leaf path. Add the .seh_savereg directive for hand-written assembly.
+---
+ .../AsmParser/LoongArchAsmParser.cpp          |  36 ++++
+ .../Target/LoongArch/LoongArchAsmPrinter.cpp  | 160 +++++++++++++-----
+ .../LoongArch/LoongArchFrameLowering.cpp      |   7 +
+ 3 files changed, 156 insertions(+), 47 deletions(-)
+
+diff --git a/llvm/lib/Target/LoongArch/AsmParser/LoongArchAsmParser.cpp b/llvm/lib/Target/LoongArch/AsmParser/LoongArchAsmParser.cpp
+index 8041cbc0e..bd72c95b6 100644
+--- a/llvm/lib/Target/LoongArch/AsmParser/LoongArchAsmParser.cpp
++++ b/llvm/lib/Target/LoongArch/AsmParser/LoongArchAsmParser.cpp
+@@ -97,6 +97,7 @@ class LoongArchAsmParser : public MCTargetAsmParser {
+   bool parseDirectiveOption();
+   bool parseDirectiveDtpRelWord();
+   bool parseDirectiveDtpRelDWord();
++  bool parseDirectiveSEHSaveReg();
+ 
+   void setFeatureBits(uint64_t Feature, StringRef FeatureString) {
+     if (!(getSTI().hasFeature(Feature))) {
+@@ -2095,6 +2096,38 @@ bool LoongArchAsmParser::parseDirectiveDtpRelDWord() {
+   return parseEOL();
+ }
+ 
++/// 解析 ".seh_savereg $reg, offset"：把非易失寄存器的保存位置记录到 PE 展开
++/// 信息里。通用 COFF 解析器只为 x86/ARM 提供该指令，LoongArch 需要单独实现，
++/// 供 Wine 手写汇编的手工展开信息使用。
++bool LoongArchAsmParser::parseDirectiveSEHSaveReg() {
++  MCAsmParser &Parser = getParser();
++  MCRegister Reg = LoongArch::NoRegister;
++  SMLoc StartLoc, EndLoc;
++  int64_t Val;
++  SMLoc Loc = Parser.getTok().getLoc();
++
++  if (!tryParseRegister(Reg, StartLoc, EndLoc).isSuccess())
++    return Error(StartLoc, "expected a register");
++  if (!getLoongArchMCRegisterClass(LoongArch::GPRRegClassID).contains(Reg))
++    return Error(StartLoc, "expected a general purpose register");
++  if (getLexer().isNot(AsmToken::Comma))
++    return TokError("expected comma before offset");
++  Parser.Lex();
++  if (Parser.parseAbsoluteExpression(Val))
++    return true;
++  if (getLexer().isNot(AsmToken::EndOfStatement))
++    return TokError("expected end of directive");
++  Parser.Lex();
++
++  if (Val < 0 || Val > 0x7ffff)
++    return Error(Loc, "invalid register save offset");
++  if (getContext().getRegisterInfo()->getSEHRegNum(Reg) < 0)
++    return Error(StartLoc, "register cannot be encoded in unwind info");
++
++  getStreamer().emitWinCFISaveReg(Reg, Val, Loc);
++  return false;
++}
++
+ ParseStatus LoongArchAsmParser::parseDirective(AsmToken DirectiveID) {
+   if (DirectiveID.getString() == ".option")
+     return parseDirectiveOption();
+@@ -2105,6 +2138,9 @@ ParseStatus LoongArchAsmParser::parseDirective(AsmToken DirectiveID) {
+   if (DirectiveID.getString() == ".dtpreldword")
+     return parseDirectiveDtpRelDWord();
+ 
++  if (DirectiveID.getString() == ".seh_savereg")
++    return parseDirectiveSEHSaveReg();
++
+   return ParseStatus::NoMatch;
+ }
+ 
+diff --git a/llvm/lib/Target/LoongArch/LoongArchAsmPrinter.cpp b/llvm/lib/Target/LoongArch/LoongArchAsmPrinter.cpp
+index a2fc1dc99..cfda53d09 100644
+--- a/llvm/lib/Target/LoongArch/LoongArchAsmPrinter.cpp
++++ b/llvm/lib/Target/LoongArch/LoongArchAsmPrinter.cpp
+@@ -18,6 +18,7 @@
+ #include "MCTargetDesc/LoongArchMCAsmInfo.h"
+ #include "MCTargetDesc/LoongArchMCTargetDesc.h"
+ #include "TargetInfo/LoongArchTargetInfo.h"
++#include "llvm/ADT/STLExtras.h"
+ #include "llvm/CodeGen/AsmPrinter.h"
+ #include "llvm/CodeGen/MachineJumpTableInfo.h"
+ #include "llvm/CodeGen/MachineModuleInfoImpls.h"
+@@ -68,71 +69,136 @@ struct LoongArchUnwindOp {
+ 
+ } // namespace
+ 
++/// 判断 MI 是否为 "$sp = $sp - N"（N 为 8 的倍数）。
++static bool isStackAlloc(const MachineInstr &MI, uint64_t &Size) {
++  unsigned Opc = MI.getOpcode();
++  if (Opc != LoongArch::ADDI_D && Opc != LoongArch::ADDI_W)
++    return false;
++  if (MI.getNumOperands() != 3 || !MI.getOperand(0).isReg() ||
++      !MI.getOperand(1).isReg() || !MI.getOperand(2).isImm())
++    return false;
++  if (MI.getOperand(0).getReg() != LoongArch::R3 ||
++      MI.getOperand(1).getReg() != LoongArch::R3)
++    return false;
++  int64_t Imm = MI.getOperand(2).getImm();
++  if (Imm >= 0 || (Imm & 7))
++    return false;
++  Size = uint64_t(-Imm);
++  return true;
++}
++
++/// 判断 MI 是否为 "st.d $reg, $sp, off" 形式的寄存器保存。
++static bool isStackSave(const MachineInstr &MI, Register &Reg, uint64_t &Off) {
++  if (MI.getOpcode() != LoongArch::ST_D)
++    return false;
++  if (MI.getNumOperands() != 3 || !MI.getOperand(0).isReg() ||
++      !MI.getOperand(1).isReg() || !MI.getOperand(2).isImm())
++    return false;
++  if (MI.getOperand(1).getReg() != LoongArch::R3)
++    return false;
++  int64_t Imm = MI.getOperand(2).getImm();
++  if (Imm < 0)
++    return false;
++  Reg = MI.getOperand(0).getReg();
++  Off = uint64_t(Imm);
++  return true;
++}
++
++/// 判断 MI 是否为 "fst.d $fN, $sp, off" 形式的浮点寄存器保存。Wine 的展开器
++/// 只按展开码恢复通用寄存器，浮点非易失寄存器由 virtual_unwind 直接沿用当前
++/// 值，因此这类保存不产生展开码，扫描 prologue 时只需记为已识别。
++static bool isFprSave(const MachineInstr &MI, Register &Reg) {
++  if (MI.getOpcode() != LoongArch::FST_D || MI.getNumOperands() != 3 ||
++      !MI.getOperand(0).isReg() || !MI.getOperand(1).isReg() ||
++      !MI.getOperand(2).isImm())
++    return false;
++  if (MI.getOperand(1).getReg() != LoongArch::R3)
++    return false;
++  Reg = MI.getOperand(0).getReg();
++  return true;
++}
++
++/// 判断 MI 是否为 "$fp = $sp (+ N)" 的栈帧建立指令。它不改变 $sp，对展开
++/// 描述没有影响，因此可以跳过并继续扫描 prologue。
++static bool isFramePointerSetup(const MachineInstr &MI) {
++  if (MI.getNumOperands() < 2 || !MI.getOperand(0).isReg() ||
++      !MI.getOperand(1).isReg())
++    return false;
++  if (MI.getOperand(0).getReg() != LoongArch::R22 ||
++      MI.getOperand(1).getReg() != LoongArch::R3)
++    return false;
++  switch (MI.getOpcode()) {
++  case LoongArch::ADDI_D:
++  case LoongArch::ADDI_W:
++    return MI.getNumOperands() == 3 && MI.getOperand(2).isImm();
++  case LoongArch::OR:  // move $fp, $sp 即 or $fp, $sp, $zero
++    return MI.getNumOperands() == 3 && MI.getOperand(2).isReg() &&
++           MI.getOperand(2).getReg() == LoongArch::R0;
++  default:
++    return false;
++  }
++}
++
+ /// 从 prologue 推导展开码。
+ ///
+-/// $sp 的调整量从入口块开头的 addi.d/addi.w 读取（只支持“单条指令一次分配”，
+-/// 遇到分块分配、栈探测或栈重对齐返回 false）。被保存的寄存器则直接取自
+-/// MachineFrameInfo 的被调用者保存信息：PEI 插入的 st.d 并不带 FrameSetup
+-/// 标志，靠指令流解析无法可靠区分它们与函数体内普通栈槽的写内存操作。
++/// 展开码必须按 prologue 的真实顺序记录（解码时逆序执行），否则多段 $sp 分配
++/// （帧 + 出参区）之间的保存指令会读错偏移。$sp 分配与 st.d 保存都从入口块的
++/// 指令流读取；PEI 插入的 st.d 不带 FrameSetup 标志，因此用 MachineFrameInfo
++/// 给出的“需要保存的寄存器集合”来识别它们，遇到其它指令即认为 prologue 结束。
++/// 浮点非易失寄存器（$fs0-$fs7）的保存不产生展开码，只跳过不记录。
++/// 分配总量必须与 StackSize 一致，通用寄存器也必须全部被识别到，否则返回
++/// false（该函数不生成展开条目，退化为原来的行为）。
+ static bool collectLoongArchUnwindOps(const MachineFunction &MF,
+                                       SmallVectorImpl<LoongArchUnwindOp> &Ops) {
+   const MachineFrameInfo &MFI = MF.getFrameInfo();
+   uint64_t StackSize = MFI.getStackSize();
+ 
+-  // 1) 解析 $sp 的分配（正常情况下是 prologue 的第一条指令）。
+-  bool SawAlloc = false;
+-  uint64_t AllocSize = 0;
++  SmallVector<Register, 8> Expected;
++  for (const CalleeSavedInfo &CS : MFI.getCalleeSavedInfo()) {
++    if (CS.isSpilledToReg())
++      return false;
++    Register Reg = CS.getReg();
++    if (!Reg.isPhysical())
++      return false;
++    Expected.push_back(Reg);
++  }
++
++  uint64_t TotalAlloc = 0;
++  SmallVector<Register, 8> Seen;
+   for (const MachineInstr &MI : MF.front()) {
+     if (MI.isMetaInstruction())  // 跳过 .cfi_* 等不产生指令的伪指令
+       continue;
+-    unsigned Opc = MI.getOpcode();
+-    if (Opc != LoongArch::ADDI_D && Opc != LoongArch::ADDI_W)
+-      break;
+-    if (MI.getNumOperands() != 3 || !MI.getOperand(0).isReg() ||
+-        !MI.getOperand(1).isReg() || !MI.getOperand(2).isImm())
+-      return false;
+-    Register Dst = MI.getOperand(0).getReg();
+-    Register Src = MI.getOperand(1).getReg();
+-    int64_t Imm = MI.getOperand(2).getImm();
+-    if (Dst == LoongArch::R3 && Src == LoongArch::R3) {
+-      // $sp = $sp - N，只允许一次且必须是 8 的倍数。
+-      if (SawAlloc || Imm >= 0 || (Imm & 7))
+-        return false;
+-      SawAlloc = true;
+-      AllocSize = uint64_t(-Imm);
++    if (isFramePointerSetup(MI))
++      continue;
++    Register Reg;
++    if (isFprSave(MI, Reg) && is_contained(Expected, Reg) &&
++        !is_contained(Seen, Reg)) {
++      Seen.push_back(Reg);  // 不生成展开码，但算作已识别
+       continue;
+     }
+-    // $fp = $sp + N 之类的初始化不影响 $sp，忽略。
+-    if (Src == LoongArch::R3)
++    uint64_t Size;
++    if (isStackAlloc(MI, Size)) {
++      Ops.push_back({true, 0, Size});
++      TotalAlloc += Size;
+       continue;
+-    return false;
++    }
++    uint64_t Off;
++    if (isStackSave(MI, Reg, Off) && is_contained(Expected, Reg) &&
++        !is_contained(Seen, Reg)) {
++      Ops.push_back({false, Reg, Off});
++      Seen.push_back(Reg);
++      continue;
++    }
++    break;  // prologue 结束
+   }
+ 
+-  if (AllocSize != StackSize)
++  if (TotalAlloc != StackSize)
+     return false;
+-
+-  // 2) 被调用者保存的寄存器：偏移是相对“分配后”的 $sp，解码时用当时的
+-  //    $sp 直接读即可，因此按 PEI 的保存顺序记录。
+-  for (const CalleeSavedInfo &CS : MFI.getCalleeSavedInfo()) {
+-    if (CS.isSpilledToReg())
+-      return false;
+-    Register Reg = CS.getReg();
+-    if (!Reg.isPhysical())
+-      return false;
+-    // getObjectOffset 是相对调用者 CFA 的负偏移，而 prologue 的 st.d 用的是
+-    // 分配完栈之后的 $sp，因此实际立即数 = StackSize + ObjectOffset。
+-    int64_t Off = int64_t(StackSize) + MFI.getObjectOffset(CS.getFrameIdx());
+-    if (Off < 0 || (Off & 7) || Off >= int64_t(StackSize))
+-      return false;
+-    Ops.push_back({false, Reg, uint64_t(Off)});
+-  }
+-
+-  if (AllocSize == 0 && Ops.empty())
++  if (Seen.size() != Expected.size())
++    return false;
++  if (Ops.empty())
+     return false;  // 真正的叶子函数不生成展开条目
+ 
+-  if (AllocSize)
+-    Ops.insert(Ops.begin(), {true, 0, AllocSize});
+-
+   return true;
+ }
+ 
+diff --git a/llvm/lib/Target/LoongArch/LoongArchFrameLowering.cpp b/llvm/lib/Target/LoongArch/LoongArchFrameLowering.cpp
+index 971b2a977..be9ab08e3 100644
+--- a/llvm/lib/Target/LoongArch/LoongArchFrameLowering.cpp
++++ b/llvm/lib/Target/LoongArch/LoongArchFrameLowering.cpp
+@@ -580,6 +580,13 @@ void LoongArchFrameLowering::determineCalleeSaves(MachineFunction &MF,
+   // Mark BP as used if function has dedicated base pointer.
+   if (hasBP(MF))
+     SavedRegs.set(LoongArchABI::getBPReg());
++
++  // 只要函数里存在调用，就必须把 $ra 落到栈上。函数被标记 noreturn（例如
++  // Wine 的 unwind_frame）时 $ra 在返回点没有使用者，默认不会被保存，但这样
++  // 的帧一旦出现在异常展开链上，展开器无法恢复返回地址，只能停在 leaf 分支
++  // 原地循环。保存 $ra 让这类帧也能被正常展开。
++  if (MF.getFrameInfo().hasCalls())
++    SavedRegs.set(LoongArch::R1);
+ }
+ 
+ // Do not preserve stack space within prologue for outgoing variables if the
+-- 
+2.47.3
+

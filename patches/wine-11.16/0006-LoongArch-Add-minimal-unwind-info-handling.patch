@@ -1,0 +1,129 @@
+From c3090ffb3bf2110879874f4abf07f256eca3f7e7 Mon Sep 17 00:00:00 2001
+From: ChenghaoLiu <linkmecry@gmail.com>
+Date: Fri, 6 Nov 2026 17:24:28 +0800
+Subject: [PATCH 06/20] [LoongArch] Add minimal unwind info handling
+
+---
+ dlls/ntdll/unwind.c | 86 ++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 78 insertions(+), 8 deletions(-)
+
+diff --git a/dlls/ntdll/unwind.c b/dlls/ntdll/unwind.c
+index ea80fa2..9686217 100644
+--- a/dlls/ntdll/unwind.c
++++ b/dlls/ntdll/unwind.c
+@@ -1669,11 +1669,48 @@ BOOLEAN CDECL RtlAddFunctionTable( RUNTIME_FUNCTION *table, DWORD count, ULONG_P
+ /***********************************************************************
+  * LoongArch64 support
+  *
+- * Temporary stubs: LoongArch COFF has no .seh_* directives yet, the real
+- * .pdata/.xdata based unwinding is implemented in stage 4.5.
++ * Minimal implementation: only leaf functions without a frame and with no
++ * unwind codes are handled so far, i.e. the return address is still live in
++ * $ra and the stack pointer is unchanged at the point of the exception.
+  */
+ #ifdef __loongarch__
+ 
++struct loongarch_unwind_info
++{
++    BYTE version : 3;
++    BYTE flags : 5;
++    BYTE count;
++    BYTE frame_reg;
++    BYTE frame_offset;
++};
++
++static RUNTIME_FUNCTION *find_loongarch_function( ULONG_PTR pc, ULONG_PTR base,
++                                                  RUNTIME_FUNCTION *func, ULONG count )
++{
++    int min = 0;
++    int max = count - 1;
++
++    while (min <= max)
++    {
++        int pos = (min + max) / 2;
++
++        if (pc < base + func[pos].BeginAddress) max = pos - 1;
++        else if (pc >= base + func[pos].EndAddress) min = pos + 1;
++        else
++        {
++            func += pos;
++            while (func->UnwindInfoAddress & 1)  /* follow chained entry */
++                func = (RUNTIME_FUNCTION *)(base + (func->UnwindInfoAddress & ~1));
++            return func;
++        }
++    }
++    return NULL;
++}
++
++
++/**********************************************************************
++ *              RtlVirtualUnwind2   (NTDLL.@)
++ */
+ NTSTATUS WINAPI RtlVirtualUnwind2( ULONG type, ULONG_PTR base, ULONG_PTR pc,
+                                    RUNTIME_FUNCTION *func, CONTEXT *context,
+                                    BOOLEAN *mach_frame_unwound, void **handler_data,
+@@ -1681,14 +1718,41 @@ NTSTATUS WINAPI RtlVirtualUnwind2( ULONG type, ULONG_PTR base, ULONG_PTR pc,
+                                    ULONG_PTR *limit_low, ULONG_PTR *limit_high,
+                                    PEXCEPTION_ROUTINE *handler_ret, ULONG flags )
+ {
++    struct loongarch_unwind_info *info;
++
++    TRACE( "type %lx base %Ix pc %Ix sp %Ix\n", type, base, pc, context->Gpr[3] );
++    if (limit_low || limit_high) FIXME( "limits not supported\n" );
++
+     if (mach_frame_unwound) *mach_frame_unwound = TRUE;
+-    if (frame_ret) *frame_ret = context->Gpr[3];
+-    if (handler_ret) *handler_ret = NULL;
+-    if (handler_data) *handler_data = NULL;
+-    context->Pc = 0;
+-    return STATUS_UNSUCCESSFUL;
++    *handler_data = NULL;
++    *handler_ret = NULL;
++    *frame_ret = context->Gpr[3];
++
++    if (func)
++    {
++        info = (struct loongarch_unwind_info *)(base + func->UnwindInfoAddress);
++        if (info->version != 1)
++        {
++            FIXME( "unknown unwind info version %u at %p\n", info->version, info );
++            return STATUS_BAD_FUNCTION_TABLE;
++        }
++        if (info->count || info->frame_reg)
++        {
++            FIXME( "unwind codes not supported yet (count %u frame %u)\n", info->count, info->frame_reg );
++            return STATUS_BAD_FUNCTION_TABLE;
++        }
++    }
++
++    if (!context->Gpr[1]) return STATUS_BAD_FUNCTION_TABLE;  /* invalid leaf function */
++    context->Pc = context->Gpr[1];
++    context->ContextFlags |= CONTEXT_LOONGARCH64_UNWOUND_TO_CALL;
++    return STATUS_SUCCESS;
+ }
+ 
++
++/***********************************************************************
++ *            RtlVirtualUnwind  (NTDLL.@)
++ */
+ PEXCEPTION_ROUTINE WINAPI RtlVirtualUnwind( ULONG type, ULONG_PTR base, ULONG_PTR pc,
+                                             RUNTIME_FUNCTION *func, CONTEXT *context,
+                                             void **handler_data, ULONG_PTR *frame_ret,
+@@ -1714,7 +1778,13 @@ EXCEPTION_DISPOSITION WINAPI __C_specific_handler( EXCEPTION_RECORD *rec, void *
+ PRUNTIME_FUNCTION WINAPI RtlLookupFunctionEntry( ULONG_PTR pc, ULONG_PTR *base,
+                                                  UNWIND_HISTORY_TABLE *table )
+ {
+-    FIXME( "not implemented for %p\n", (void *)pc );
++    RUNTIME_FUNCTION *func;
++    ULONG size;
++
++    if ((func = RtlLookupFunctionTable( pc, base, &size )) && size)
++        return find_loongarch_function( pc, *base, func, size / sizeof(*func) );
++
++    *base = 0;
+     return NULL;
+ }
+ 
+-- 
+2.47.3
+

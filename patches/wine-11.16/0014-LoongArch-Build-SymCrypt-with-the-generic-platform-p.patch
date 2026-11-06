@@ -1,0 +1,26 @@
+From 7ce8aefe5d4cce1df0334a3152681073c92de853 Mon Sep 17 00:00:00 2001
+From: k <k@l>
+Date: Fri, 6 Nov 2026 17:49:17 +0800
+Subject: [PATCH 14/20] [LoongArch] Build SymCrypt with the generic platform
+ path
+
+---
+ libs/symcrypt/inc/symcrypt_internal.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/libs/symcrypt/inc/symcrypt_internal.h b/libs/symcrypt/inc/symcrypt_internal.h
+index 6896baf..e425d48 100644
+--- a/libs/symcrypt/inc/symcrypt_internal.h
++++ b/libs/symcrypt/inc/symcrypt_internal.h
+@@ -160,7 +160,7 @@
+ #define SYMCRYPT_CALL
+ #define SYMCRYPT_ALIGN_VALUE    8
+ 
+-#elif defined( SYMCRYPT_IGNORE_PLATFORM )
++#elif defined( SYMCRYPT_IGNORE_PLATFORM ) || defined( __loongarch__ )
+ 
+ #undef  SYMCRYPT_CPU_UNKNOWN
+ #define SYMCRYPT_CPU_UNKNOWN    1
+-- 
+2.47.3
+

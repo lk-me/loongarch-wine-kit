@@ -1,0 +1,289 @@
+From bf8943e46beac73522c113f95c58af603f3947fa Mon Sep 17 00:00:00 2001
+From: ChenghaoLiu <linkmecry@gmail.com>
+Date: Thu, 5 Nov 2026 18:37:38 +0800
+Subject: [PATCH 10/13] [LoongArch] Support implicit COFF addends and CALL36
+ relocations
+
+COFF has no addend field, so keep the addend in the instruction immediate
+and teach lld to interpret it for page-relative relocations. Also apply
+the pcaddu18i+jirl call pair as one 36-bit CALL36 fixup and use the ".L"
+internal symbol prefix so exports starting with "L" are not dropped.
+---
+ lld/COFF/Chunks.cpp                           | 60 ++++++++++++++++---
+ lld/COFF/Chunks.h                             |  3 +-
+ llvm/include/llvm/BinaryFormat/COFF.h         |  4 ++
+ llvm/lib/MC/WinCOFFObjectWriter.cpp           | 18 ++++++
+ .../LoongArch/LoongArchISelLowering.cpp       |  5 +-
+ .../MCTargetDesc/LoongArchAsmBackend.cpp      | 28 ++++++++-
+ .../MCTargetDesc/LoongArchMCAsmInfo.cpp       |  4 ++
+ .../LoongArchWinCOFFObjectWriter.cpp          |  5 +-
+ 8 files changed, 115 insertions(+), 12 deletions(-)
+
+diff --git a/lld/COFF/Chunks.cpp b/lld/COFF/Chunks.cpp
+index 88dfe6ba8..e6686f3bc 100644
+--- a/lld/COFF/Chunks.cpp
++++ b/lld/COFF/Chunks.cpp
+@@ -411,12 +411,16 @@ void SectionChunk::applyRelMIPS(uint8_t *off, uint16_t type, OutputSection *os,
+ // Interpret the existing immediate in a pcalau12i as a page-granularity
+ // addend, then update it with the page offset from the current instruction
+ // to the target (PAGEBASE_REL21). The 20-bit immediate lives in bits [24:5].
+-static void applyLoongArchAddr(uint8_t *off, uint64_t s, uint64_t p, int shift) {
++// LowAddend carries the sub-page part of the addend from the paired
++// PAGEOFFSET instruction, if it could be determined.
++static void applyLoongArchAddr(uint8_t *off, uint64_t s, int64_t lowAddend,
++                               uint64_t p, int shift) {
+   uint32_t orig = read32le(off);
+   int64_t imm = SignExtend64<20>((orig >> 5) & 0xFFFFF);
+   s += imm << shift;
+   // Round to the nearest page, as the paired 12-bit immediate is sign-extended.
+-  imm = ((s + (1 << (shift - 1))) >> shift) - (p >> shift);
++  imm = ((int64_t(s) + lowAddend + (1 << (shift - 1))) >> shift) -
++        int64_t(p >> shift);
+   uint32_t mask = 0xFFFFF << 5;
+   write32le(off, (orig & ~mask) | ((imm & 0xFFFFF) << 5));
+ }
+@@ -440,9 +444,27 @@ static void applyLoongArchBranch26(uint8_t *off, int64_t v) {
+   write32le(off, (orig & ~0x3FFFFFF) | encoded);
+ }
+ 
++// Patch an adjacent pcaddu18i + jirl pair as one 36-bit PC-relative call
++// (CALL36). The upper bits live in the pcaddu18i 20-bit immediate (bits
++// [24:5]) and the lower bits in the jirl 16-bit immediate (bits [25:10]).
++static void applyLoongArchCall36(uint8_t *off, int64_t v) {
++  if ((v + 0x20000) != SignExtend64(v + 0x20000, 38))
++    error("relocation out of range");
++  if (v & 3)
++    error("misaligned call offset");
++  // jirl sign-extends its immediate, so round the upper half accordingly.
++  uint32_t hi20 = (uint32_t)((v + (1 << 17)) >> 18) & 0xFFFFF;
++  uint32_t lo16 = (uint32_t)(v >> 2) & 0xFFFF;
++  uint32_t orig = read32le(off);
++  write32le(off, (orig & ~(0xFFFFF << 5)) | (hi20 << 5));
++  orig = read32le(off + 4);
++  write32le(off + 4, (orig & ~(0xFFFF << 10)) | (lo16 << 10));
++}
++
+ void SectionChunk::applyRelLoongArch64(uint8_t *off, uint16_t type,
+                                        OutputSection *os, uint64_t s,
+-                                       uint64_t p, uint64_t imageBase) const {
++                                       uint64_t p, uint64_t imageBase,
++                                       int64_t pairedLowAddend) const {
+   switch (type) {
+   case IMAGE_REL_LOONGARCH64_ABSOLUTE:
+     break;
+@@ -459,15 +481,22 @@ void SectionChunk::applyRelLoongArch64(uint8_t *off, uint16_t type,
+     add32(off, s - p - 4);
+     break;
+   case IMAGE_REL_LOONGARCH64_PAGEBASE_REL21:
+-    applyLoongArchAddr(off, s, p, 12);
++    applyLoongArchAddr(off, s, pairedLowAddend, p, 12);
+     break;
+   case IMAGE_REL_LOONGARCH64_PAGEOFFSET_12A:
+-  case IMAGE_REL_LOONGARCH64_PAGEOFFSET_12L:
+-    applyLoongArchImm(off, s & 0xfff);
++  case IMAGE_REL_LOONGARCH64_PAGEOFFSET_12L: {
++    // COFF 没有 addend 字段，汇编器把符号地址的常量偏移留在指令立即数里，
++    // 这里需要把它一起算进去（同节符号已由带偏移的标签符号携带，其立即数为 0）。
++    uint32_t orig = read32le(off);
++    applyLoongArchImm(off, (s + ((orig >> 10) & 0xfff)) & 0xfff);
+     break;
++  }
+   case IMAGE_REL_LOONGARCH64_BRANCH26:
+     applyLoongArchBranch26(off, s - p);
+     break;
++  case IMAGE_REL_LOONGARCH64_CALL36:
++    applyLoongArchCall36(off, s - p);
++    break;
+   case IMAGE_REL_LOONGARCH64_SECTION:
+     applySecIdx(off, os, file->symtab.ctx.outputSections.size());
+     break;
+@@ -581,9 +610,24 @@ void SectionChunk::applyRelocation(uint8_t *off,
+   case Triple::mipsel:
+     applyRelMIPS(off, rel.Type, os, s, p, imageBase);
+     break;
+-  case Triple::loongarch64:
+-    applyRelLoongArch64(off, rel.Type, os, s, p, imageBase);
++  case Triple::loongarch64: {
++    // PAGEBASE_REL21 的页号四舍五入需要知道紧随其后的 PAGEOFFSET 指令所带的
++    // 低 12 位 addend（COFF 无 addend 字段，汇编器把它留在指令立即数里）。
++    int64_t pairedLowAddend = 0;
++    if (rel.Type == IMAGE_REL_LOONGARCH64_PAGEBASE_REL21) {
++      for (const coff_relocation &r : getRelocs()) {
++        if (r.VirtualAddress != rel.VirtualAddress + 4 ||
++            r.SymbolTableIndex != rel.SymbolTableIndex)
++          continue;
++        if (r.Type == IMAGE_REL_LOONGARCH64_PAGEOFFSET_12A ||
++            r.Type == IMAGE_REL_LOONGARCH64_PAGEOFFSET_12L)
++          pairedLowAddend = SignExtend64<12>((read32le(off + 4) >> 10) & 0xfff);
++        break;
++      }
++    }
++    applyRelLoongArch64(off, rel.Type, os, s, p, imageBase, pairedLowAddend);
+     break;
++  }
+   default:
+     llvm_unreachable("unknown machine type");
+   }
+diff --git a/lld/COFF/Chunks.h b/lld/COFF/Chunks.h
+index 9ba0f0235..356bc99d7 100644
+--- a/lld/COFF/Chunks.h
++++ b/lld/COFF/Chunks.h
+@@ -286,7 +286,8 @@ public:
+   void applyRelMIPS(uint8_t *off, uint16_t type, OutputSection *os, uint64_t s,
+                     uint64_t p, uint64_t imageBase) const;
+   void applyRelLoongArch64(uint8_t *off, uint16_t type, OutputSection *os,
+-                           uint64_t s, uint64_t p, uint64_t imageBase) const;
++                           uint64_t s, uint64_t p, uint64_t imageBase,
++                           int64_t pairedLowAddend) const;
+ 
+   void getRuntimePseudoRelocs(std::vector<RuntimePseudoReloc> &res);
+ 
+diff --git a/llvm/include/llvm/BinaryFormat/COFF.h b/llvm/include/llvm/BinaryFormat/COFF.h
+index ad30ad684..2f6237860 100644
+--- a/llvm/include/llvm/BinaryFormat/COFF.h
++++ b/llvm/include/llvm/BinaryFormat/COFF.h
+@@ -439,6 +439,10 @@ enum RelocationTypesLoongArch64 : unsigned {
+   IMAGE_REL_LOONGARCH64_TOKEN = 0x000C,
+   IMAGE_REL_LOONGARCH64_SECTION = 0x000D,
+   IMAGE_REL_LOONGARCH64_ADDR64 = 0x000E,
++  // 36-bit PC-relative call, applied to an adjacent pcaddu18i + jirl pair.
++  // Not part of Microsoft's PE/COFF specification; used by this toolchain to
++  // support the LoongArch medium code model call sequence.
++  IMAGE_REL_LOONGARCH64_CALL36 = 0x000F,
+   IMAGE_REL_LOONGARCH64_REL32 = 0x0011,
+ };
+ 
+diff --git a/llvm/lib/MC/WinCOFFObjectWriter.cpp b/llvm/lib/MC/WinCOFFObjectWriter.cpp
+index d00b598ac..9035581e0 100644
+--- a/llvm/lib/MC/WinCOFFObjectWriter.cpp
++++ b/llvm/lib/MC/WinCOFFObjectWriter.cpp
+@@ -936,6 +936,15 @@ void WinCOFFWriter::recordRelocation(const MCFragment &F, const MCFixup &Fixup,
+ 
+   bool NeedsSecRelSymbol = false;
+   bool UseSectionSymbol = A.isTemporary() && !SymbolMap.lookup(&A);
++
++  // LoongArch 的寻址重定位（%pc_hi20/%pc_lo12 等）以字面量重定位类型表示，
++  // 而 COFF 是 REL 式重定位，没有 RELA 的 addend 字段。对同节符号，用一个
++  // 带偏移的标签符号承载这份 addend（立即数保持 0）；未定义的外部符号无法
++  // 这样表达，改由 LoongArchAsmBackend::applyFixup 把 addend 编码进指令立即数，
++  // 链接器再按隐式 addend 解释。
++  bool NeedsLoongArchOffsetSymbol =
++      Header.Machine == COFF::IMAGE_FILE_MACHINE_LOONGARCH64 &&
++      A.isInSection() && Asm->getSymbolOffset(A) + FixedValue != 0;
+   uint64_t SecRelSymbolOffset = 0;
+   if (IsArm64SecRel12 && A.isInSection()) {
+     uint64_t SecRelFixedValue = FixedValue;
+@@ -953,6 +962,15 @@ void WinCOFFWriter::recordRelocation(const MCFragment &F, const MCFixup &Fixup,
+     }
+     Reloc.Symb = getOrCreateSecRelSymbol(A, SecRelSymbolOffset);
+     FixedValue = 0;
++  } else if (NeedsLoongArchOffsetSymbol) {
++    uint64_t Offset = Asm->getSymbolOffset(A) + FixedValue;
++    if (!isUInt<32>(Offset)) {
++      getContext().reportError(Fixup.getLoc(),
++                               "relocation addend out of range");
++      return;
++    }
++    Reloc.Symb = getOrCreateSecRelSymbol(A, Offset);
++    FixedValue = 0;
+   } else if (UseSectionSymbol) {
+     MCSection *TargetSection = &A.getSection();
+     assert(
+diff --git a/llvm/lib/Target/LoongArch/LoongArchISelLowering.cpp b/llvm/lib/Target/LoongArch/LoongArchISelLowering.cpp
+index 97181fc0c..98ca3aa03 100644
+--- a/llvm/lib/Target/LoongArch/LoongArchISelLowering.cpp
++++ b/llvm/lib/Target/LoongArch/LoongArchISelLowering.cpp
+@@ -4633,7 +4633,10 @@ SDValue LoongArchTargetLowering::lowerGlobalAddress(SDValue Op,
+       CM = *GCM;
+   }
+ 
+-  return getAddr(N, DAG, CM, GV->isDSOLocal());
++  /* COFF 目标没有 GOT，外部符号也必须按 PCALA 取址，否则会生成
++   * GOT_PC_HI20/GOT_PC_LO12 之类的重定位而 WinCOFFObjectWriter 无法写出。 */
++  return getAddr(N, DAG, CM, GV->isDSOLocal() ||
++                                  DAG.getTarget().getTargetTriple().isOSBinFormatCOFF());
+ }
+ 
+ SDValue LoongArchTargetLowering::getStaticTLSAddr(GlobalAddressSDNode *N,
+diff --git a/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchAsmBackend.cpp b/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchAsmBackend.cpp
+index 2d2d52819..70f2c8a86 100644
+--- a/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchAsmBackend.cpp
++++ b/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchAsmBackend.cpp
+@@ -20,6 +20,7 @@
+ #include "llvm/MC/MCExpr.h"
+ #include "llvm/MC/MCSection.h"
+ #include "llvm/MC/MCValue.h"
++#include "llvm/Support/Endian.h"
+ #include "llvm/Support/EndianStream.h"
+ #include "llvm/Support/LEB128.h"
+ #include "llvm/Support/MathExtras.h"
+@@ -150,8 +151,33 @@ void LoongArchAsmBackend::applyFixup(const MCFragment &F, const MCFixup &Fixup,
+     return; // Doesn't change encoding.
+ 
+   auto Kind = Fixup.getKind();
+-  if (mc::isRelocation(Kind))
++  if (mc::isRelocation(Kind)) {
++    // COFF 是 REL 式重定位，对象文件里没有 addend 字段；链接器（lld）对
++    // pcalau12i / 页内偏移这两类重定位按“隐式 addend”解释指令立即数。
++    // 因此把符号地址上的常量偏移编码进指令：pcalau12i 存页号部分，
++    // 12 位偏移指令存页内部分。未定义的外部符号无法像同节符号那样用
++    // 带偏移的标签符号表达，只能走这条路径。
++    if (STI.getTargetTriple().isOSBinFormatCOFF()) {
++      uint32_t Orig = support::endian::read32le(Data);
++      switch (Kind) {
++      case ELF::R_LARCH_PCALA_HI20:
++      case ELF::R_LARCH_PCADD_HI20: {
++        uint32_t Imm = uint32_t(Value >> 12) & 0xFFFFF;
++        support::endian::write32le(Data, (Orig & ~(0xFFFFFu << 5)) | (Imm << 5));
++        break;
++      }
++      case ELF::R_LARCH_PCALA_LO12:
++      case ELF::R_LARCH_PCADD_LO12: {
++        uint32_t Imm = uint32_t(Value) & 0xFFF;
++        support::endian::write32le(Data, (Orig & ~(0xFFFu << 10)) | (Imm << 10));
++        break;
++      }
++      default:
++        break;
++      }
++    }
+     return;
++  }
+   MCFixupKindInfo Info = getFixupKindInfo(Kind);
+   MCContext &Ctx = getContext();
+ 
+diff --git a/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchMCAsmInfo.cpp b/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchMCAsmInfo.cpp
+index 254d99ece..b5ca926cc 100644
+--- a/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchMCAsmInfo.cpp
++++ b/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchMCAsmInfo.cpp
+@@ -263,6 +263,10 @@ LoongArchMCAsmInfoGNUCOFF::LoongArchMCAsmInfoGNUCOFF(
+   ZeroDirective = "\t.space\t";
+   CommentString = "#";
+   SupportsDebugInformation = true;
++  // 与 AArch64 的 GNU COFF 保持一致：默认的 "L" 前缀会把 LdrAccessResource
++  // 这类以大写 L 开头的导出名误判为汇编器临时符号，使 winebuild 生成的
++  // ".globl LdrAccessResource" 报 "non-local symbol required"。
++  InternalSymbolPrefix = ".L";
+   // LoongArch PE 使用自定义的 SEH 展开表（见 MCWin64EH 中的
+   // LoongArchUnwindEmitter）。Itanium 只表示“非 x86 风格的 .seh_* 编码”，
+   // 从而让 MCStreamer 允许发射 .seh_* 并生成 .pdata/.xdata。
+diff --git a/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchWinCOFFObjectWriter.cpp b/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchWinCOFFObjectWriter.cpp
+index 80acc0b31..df5bbcdb2 100644
+--- a/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchWinCOFFObjectWriter.cpp
++++ b/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchWinCOFFObjectWriter.cpp
+@@ -141,8 +141,11 @@ unsigned LoongArchWinCOFFObjectWriter::getRelocType(
+     return COFF::IMAGE_REL_LOONGARCH64_PAGEOFFSET_12L;
+ 
+   case ELF::R_LARCH_CALL30:
+-  case ELF::R_LARCH_CALL36:
+     return COFF::IMAGE_REL_LOONGARCH64_BRANCH26;
++  // LA64 的媒介代码模型用 pcaddu18i + jirl 两条连续指令做远调用，
++  // 必须整体修补，不能用单条 26 位分支重定位。
++  case ELF::R_LARCH_CALL36:
++    return COFF::IMAGE_REL_LOONGARCH64_CALL36;
+ 
+   // GOT / TLS 类重定位需要真正的 PE 链接器与运行时支持，暂报错占位。
+   case ELF::R_LARCH_GOT_PC_HI20:
+-- 
+2.47.3
+

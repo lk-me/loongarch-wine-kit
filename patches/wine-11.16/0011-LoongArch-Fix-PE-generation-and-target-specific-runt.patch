@@ -1,0 +1,1215 @@
+From e528228122d56cc832dbebd1f89936fa471a9fc9 Mon Sep 17 00:00:00 2001
+From: k <k@l>
+Date: Fri, 6 Nov 2026 17:27:17 +0800
+Subject: [PATCH 11/20] [LoongArch] Fix PE generation and target-specific
+ runtime issues
+
+---
+ configure                            |   9 +-
+ configure.ac                         |  12 +-
+ dlls/crtdll/Makefile.in              |   1 +
+ dlls/dbghelp/Makefile.in             |   1 +
+ dlls/dbghelp/cpu_loongarch64.c       | 212 +++++++++++++++++++++++++++
+ dlls/dbghelp/dbghelp.c               |   6 +-
+ dlls/gdi32/dc.c                      |   2 +
+ dlls/localspl/provider.c             |   7 +-
+ dlls/msvcr100/Makefile.in            |   1 +
+ dlls/msvcr110/Makefile.in            |   1 +
+ dlls/msvcr120/Makefile.in            |   1 +
+ dlls/msvcr70/Makefile.in             |   1 +
+ dlls/msvcr71/Makefile.in             |   1 +
+ dlls/msvcr80/Makefile.in             |   1 +
+ dlls/msvcr90/Makefile.in             |   1 +
+ dlls/msvcrtd/Makefile.in             |   1 +
+ dlls/ntdll/sync.c                    |  26 ++++
+ dlls/ntdll/unix/signal_loongarch64.c |  90 ++++++------
+ dlls/ntdll/unix/virtual.c            |   4 +-
+ dlls/rpcrt4/ndr_typelib.c            |   8 +-
+ dlls/rpcrt4/thunks.c                 |  95 +++++++++++-
+ dlls/setupapi/devinst.c              |   2 +
+ dlls/setupapi/dirid.c                |   2 +
+ dlls/vcomp/fork.c                    |  42 +++++-
+ dlls/winspool.drv/info.c             |   5 +-
+ include/wine/asm.h                   |   7 +-
+ libs/png/Makefile.in                 |   2 +-
+ server/object.h                      |   3 +-
+ server/registry.c                    |   2 +
+ tools/winebuild/build.h              |   1 +
+ tools/winebuild/import.c             |  18 ++-
+ tools/winebuild/spec32.c             |   8 +-
+ tools/winebuild/utils.c              |  15 ++
+ 33 files changed, 503 insertions(+), 85 deletions(-)
+ create mode 100644 dlls/dbghelp/cpu_loongarch64.c
+
+diff --git a/configure b/configure
+index 11dfd06..e6de352 100755
+--- a/configure
++++ b/configure
+@@ -21242,10 +21242,9 @@ WINELOADER_PROGRAMS="wine"
+ 
+ case $host_os in
+   linux*)
+-    if test $HOST_ARCH != unknown
+-    then
+-      wine_use_preloader=yes
+-    fi
++        case $HOST_ARCH in
++      aarch64|arm|i386|x86_64) wine_use_preloader=yes ;;
++    esac
+     ;;
+ esac
+ 
+@@ -22369,6 +22368,8 @@ enable_wineboot=${enable_wineboot:-$HOST_ARCH}
+ enable_winemenubuilder=${enable_winemenubuilder:-$HOST_ARCH}
+ enable_wuauserv=${enable_wuauserv:-$HOST_ARCH}
+ 
++enable_winedbg=${enable_winedbg:-i386,x86_64,arm,aarch64}
++
+ enable_cmd=${enable_cmd:-yes}
+ enable_dllhost=${enable_dllhost:-yes}
+ enable_dpnsvr=${enable_dpnsvr:-i386,x86_64,arm64ec}
+diff --git a/configure.ac b/configure.ac
+index bcbb0f3..8667598 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -2102,10 +2102,11 @@ AC_SUBST(WINELOADER_PROGRAMS,"wine")
+ 
+ case $host_os in
+   linux*)
+-    if test $HOST_ARCH != unknown
+-    then
+-      wine_use_preloader=yes
+-    fi
++    dnl the preloader needs an architecture-specific _start implementation;
++    dnl only enable it for the architectures that provide one
++    case $HOST_ARCH in
++      aarch64|arm|i386|x86_64) wine_use_preloader=yes ;;
++    esac
+     ;;
+ esac
+ 
+@@ -2437,6 +2438,9 @@ enable_wineboot=${enable_wineboot:-$HOST_ARCH}
+ enable_winemenubuilder=${enable_winemenubuilder:-$HOST_ARCH}
+ enable_wuauserv=${enable_wuauserv:-$HOST_ARCH}
+ 
++dnl winedbg needs a backend_cpu implementation; only enable it for supported CPUs
++enable_winedbg=${enable_winedbg:-i386,x86_64,arm,aarch64}
++
+ dnl Explicitly enable some programs for arm64ec
+ enable_cmd=${enable_cmd:-yes}
+ enable_dllhost=${enable_dllhost:-yes}
+diff --git a/dlls/crtdll/Makefile.in b/dlls/crtdll/Makefile.in
+index 40b12eb..94d45a0 100644
+--- a/dlls/crtdll/Makefile.in
++++ b/dlls/crtdll/Makefile.in
+@@ -17,6 +17,7 @@ SOURCES = \
+ 	except_arm64.c \
+ 	except_arm64ec.c \
+ 	except_i386.c \
++	except_loongarch64.c \
+ 	except_x86_64.c \
+ 	exception_ptr.c \
+ 	exit.c \
+diff --git a/dlls/dbghelp/Makefile.in b/dlls/dbghelp/Makefile.in
+index 63d2cce..cca4d74 100644
+--- a/dlls/dbghelp/Makefile.in
++++ b/dlls/dbghelp/Makefile.in
+@@ -12,6 +12,7 @@ SOURCES = \
+ 	cpu_arm.c \
+ 	cpu_arm64.c \
+ 	cpu_i386.c \
++	cpu_loongarch64.c \
+ 	cpu_x86_64.c \
+ 	dbghelp.c \
+ 	dwarf.c \
+diff --git a/dlls/dbghelp/cpu_loongarch64.c b/dlls/dbghelp/cpu_loongarch64.c
+new file mode 100644
+index 0000000..d143d5d
+--- /dev/null
++++ b/dlls/dbghelp/cpu_loongarch64.c
+@@ -0,0 +1,212 @@
++/*
++ * File cpu_loongarch64.c
++ *
++ * Copyright (C) 2009 Eric Pouech
++ * Copyright (C) 2010-2013 André Hentschel
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#include <assert.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "dbghelp_private.h"
++#include "winternl.h"
++#include "wine/debug.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(dbghelp);
++
++#define LA64_SP  3   /* $sp */
++#define LA64_FP  22  /* $fp */
++#define LA64_RA  1   /* $ra */
++
++static BOOL loongarch64_get_addr(HANDLE hThread, const CONTEXT* ctx,
++                                 enum cpu_addr ca, ADDRESS64* addr)
++{
++    addr->Mode    = AddrModeFlat;
++    addr->Segment = 0; /* don't need segment */
++    switch (ca)
++    {
++#ifdef __loongarch__
++    case cpu_addr_pc:    addr->Offset = ctx->Pc; return TRUE;
++    case cpu_addr_stack: addr->Offset = ctx->Gpr[LA64_SP]; return TRUE;
++    case cpu_addr_frame: addr->Offset = ctx->Gpr[LA64_FP]; return TRUE;
++#endif
++    default: addr->Mode = -1;
++        return FALSE;
++    }
++}
++
++#ifdef __loongarch__
++enum st_mode {stm_start, stm_loongarch64, stm_done};
++
++/* indexes in Reserved array */
++#define __CurrentModeCount      0
++
++#define curr_mode   (frame->Reserved[__CurrentModeCount] & 0x0F)
++#define curr_count  (frame->Reserved[__CurrentModeCount] >> 4)
++
++#define set_curr_mode(m) {frame->Reserved[__CurrentModeCount] &= ~0x0F; frame->Reserved[__CurrentModeCount] |= (m & 0x0F);}
++#define inc_curr_count() (frame->Reserved[__CurrentModeCount] += 0x10)
++
++/* fetch_next_frame()
++ *
++ * modify (at least) context.Pc using unwind information
++ * either out of debug info (dwarf), or simple Ra trace
++ */
++static BOOL fetch_next_frame(struct cpu_stack_walk* csw, union ctx *pcontext,
++    DWORD_PTR curr_pc)
++{
++    DWORD64 xframe;
++    CONTEXT *context = &pcontext->ctx;
++    DWORD_PTR oldReturn = context->Gpr[LA64_RA];
++
++    if (dwarf2_virtual_unwind(csw, curr_pc, pcontext, &xframe))
++    {
++        context->Gpr[LA64_SP] = xframe;
++        context->Pc = oldReturn;
++        return TRUE;
++    }
++
++    if (context->Pc == oldReturn) return FALSE;
++    context->Pc = oldReturn;
++
++    return TRUE;
++}
++
++static BOOL loongarch64_stack_walk(struct cpu_stack_walk *csw, STACKFRAME64 *frame,
++    union ctx *context)
++{
++    unsigned deltapc = curr_count <= 1 ? 0 : 4;
++
++    /* sanity check */
++    if (curr_mode >= stm_done) return FALSE;
++
++    TRACE("Enter: PC=%s Frame=%s Return=%s Stack=%s Mode=%s Count=%I64u\n",
++          wine_dbgstr_addr(&frame->AddrPC),
++          wine_dbgstr_addr(&frame->AddrFrame),
++          wine_dbgstr_addr(&frame->AddrReturn),
++          wine_dbgstr_addr(&frame->AddrStack),
++          curr_mode == stm_start ? "start" : "LoongArch64",
++          curr_count);
++
++    if (curr_mode == stm_start)
++    {
++        /* Init done */
++        set_curr_mode(stm_loongarch64);
++        frame->AddrReturn.Mode = frame->AddrStack.Mode = AddrModeFlat;
++        /* don't set up AddrStack on first call. Either the caller has set it up, or
++         * we will get it in the next frame
++         */
++        memset(&frame->AddrBStore, 0, sizeof(frame->AddrBStore));
++    }
++    else
++    {
++        if (context->ctx.Gpr[LA64_SP] != frame->AddrStack.Offset) FIXME("inconsistent Stack Pointer\n");
++        if (context->ctx.Pc != frame->AddrPC.Offset) FIXME("inconsistent Program Counter\n");
++
++        if (frame->AddrReturn.Offset == 0) goto done_err;
++        if (!fetch_next_frame(csw, context, frame->AddrPC.Offset - deltapc))
++            goto done_err;
++    }
++
++    memset(&frame->Params, 0, sizeof(frame->Params));
++
++    /* set frame information */
++    frame->AddrStack.Offset = context->ctx.Gpr[LA64_SP];
++    frame->AddrReturn.Offset = context->ctx.Gpr[LA64_RA];
++    frame->AddrFrame.Offset = context->ctx.Gpr[LA64_FP];
++    frame->AddrPC.Offset = context->ctx.Pc;
++
++    frame->Far = TRUE;
++    frame->Virtual = TRUE;
++    inc_curr_count();
++
++    TRACE("Leave: PC=%s Frame=%s Return=%s Stack=%s Mode=%s Count=%I64u FuncTable=%p\n",
++          wine_dbgstr_addr(&frame->AddrPC),
++          wine_dbgstr_addr(&frame->AddrFrame),
++          wine_dbgstr_addr(&frame->AddrReturn),
++          wine_dbgstr_addr(&frame->AddrStack),
++          curr_mode == stm_start ? "start" : "LoongArch64",
++          curr_count,
++          frame->FuncTableEntry);
++
++    return TRUE;
++done_err:
++    set_curr_mode(stm_done);
++    return FALSE;
++}
++#else
++static BOOL loongarch64_stack_walk(struct cpu_stack_walk* csw, STACKFRAME64 *frame,
++    union ctx *ctx)
++{
++    return FALSE;
++}
++#endif
++
++static unsigned loongarch64_map_dwarf_register(unsigned regno, const struct module* module, BOOL eh_frame)
++{
++    FIXME("Don't know how to map register %d\n", regno);
++    return 0;
++}
++
++static void *loongarch64_fetch_context_reg(union ctx *pctx, unsigned regno, unsigned *size)
++{
++    FIXME("Unknown register %x\n", regno);
++    return NULL;
++}
++
++static const char* loongarch64_fetch_regname(unsigned regno)
++{
++    FIXME("Unknown register %x\n", regno);
++    return NULL;
++}
++
++static BOOL loongarch64_fetch_minidump_thread(struct dump_context* dc, unsigned index, unsigned flags, const CONTEXT* ctx)
++{
++    if (ctx->ContextFlags && (flags & ThreadWriteInstructionWindow))
++    {
++        /* FIXME: crop values across module boundaries, */
++#ifdef __loongarch__
++        ULONG64 base = ctx->Pc <= 0x80 ? 0 : ctx->Pc - 0x80;
++        minidump_add_memory_block(dc, base, ctx->Pc + 0x80 - base, 0);
++#endif
++    }
++
++    return TRUE;
++}
++
++static BOOL loongarch64_fetch_minidump_module(struct dump_context* dc, unsigned index, unsigned flags)
++{
++    /* FIXME: actually, we should probably take care of FPO data, unless it's stored in
++     * function table minidump stream
++     */
++    return FALSE;
++}
++
++struct cpu cpu_loongarch64 = {
++    IMAGE_FILE_MACHINE_LOONGARCH64,
++    8,
++    LA64_FP,
++    loongarch64_get_addr,
++    loongarch64_stack_walk,
++    NULL,
++    loongarch64_map_dwarf_register,
++    loongarch64_fetch_context_reg,
++    loongarch64_fetch_regname,
++    loongarch64_fetch_minidump_thread,
++    loongarch64_fetch_minidump_module,
++};
+diff --git a/dlls/dbghelp/dbghelp.c b/dlls/dbghelp/dbghelp.c
+index 911daec..ae08da7 100644
+--- a/dlls/dbghelp/dbghelp.c
++++ b/dlls/dbghelp/dbghelp.c
+@@ -150,9 +150,9 @@ const char* wine_dbgstr_addr(const ADDRESS64* addr)
+     }
+ }
+ 
+-extern struct cpu       cpu_i386, cpu_x86_64, cpu_arm, cpu_arm64;
++extern struct cpu       cpu_i386, cpu_x86_64, cpu_arm, cpu_arm64, cpu_loongarch64;
+ 
+-static struct cpu*      dbghelp_cpus[] = {&cpu_i386, &cpu_x86_64, &cpu_arm, &cpu_arm64, NULL};
++static struct cpu*      dbghelp_cpus[] = {&cpu_i386, &cpu_x86_64, &cpu_arm, &cpu_arm64, &cpu_loongarch64, NULL};
+ struct cpu*             dbghelp_current_cpu =
+ #if defined(__i386__)
+     &cpu_i386
+@@ -162,6 +162,8 @@ struct cpu*             dbghelp_current_cpu =
+     &cpu_arm
+ #elif defined(__aarch64__)
+     &cpu_arm64
++#elif defined(__loongarch__)
++    &cpu_loongarch64
+ #else
+ #error define support for your CPU
+ #endif
+diff --git a/dlls/gdi32/dc.c b/dlls/gdi32/dc.c
+index adfcd51..45f18cd 100644
+--- a/dlls/gdi32/dc.c
++++ b/dlls/gdi32/dc.c
+@@ -204,6 +204,8 @@ static const WCHAR printer_env[] = L"x64";
+ static const WCHAR printer_env[] = L"arm";
+ #elif defined __aarch64__
+ static const WCHAR printer_env[] = L"arm64";
++#elif defined __loongarch__
++static const WCHAR printer_env[] = L"loongarch64";
+ #else
+ #error not defined for this cpu
+ #endif
+diff --git a/dlls/localspl/provider.c b/dlls/localspl/provider.c
+index e318736..43922e4 100644
+--- a/dlls/localspl/provider.c
++++ b/dlls/localspl/provider.c
+@@ -316,10 +316,13 @@ static const printenv_t env_arm =   {L"Windows ARM", L"arm", 3,
+ static const printenv_t env_arm64 = {L"Windows ARM64", L"arm64", 3,
+                                      L"\\Version-3", L"\\3"};
+ 
++static const printenv_t env_loongarch64 = {L"Windows LoongArch64", L"loongarch64", 3,
++                                     L"\\Version-3", L"\\3"};
++
+ static const printenv_t env_win40 = {L"Windows 4.0", L"win40", 0,
+                                      L"\\Version-0", L"\\0"};
+ 
+-static const printenv_t * const all_printenv[] = {&env_x86, &env_x64, &env_ia64, &env_arm, &env_arm64, &env_win40};
++static const printenv_t * const all_printenv[] = {&env_x86, &env_x64, &env_ia64, &env_arm, &env_arm64, &env_loongarch64, &env_win40};
+ 
+ #ifdef __i386__
+ #define env_arch env_x86
+@@ -329,6 +332,8 @@ static const printenv_t * const all_printenv[] = {&env_x86, &env_x64, &env_ia64,
+ #define env_arch env_arm
+ #elif defined __aarch64__
+ #define env_arch env_arm64
++#elif defined __loongarch__
++#define env_arch env_loongarch64
+ #else
+ #error not defined for this cpu
+ #endif
+diff --git a/dlls/msvcr100/Makefile.in b/dlls/msvcr100/Makefile.in
+index 7a9d76f..cce2945 100644
+--- a/dlls/msvcr100/Makefile.in
++++ b/dlls/msvcr100/Makefile.in
+@@ -27,6 +27,7 @@ SOURCES = \
+ 	except_arm64.c \
+ 	except_arm64ec.c \
+ 	except_i386.c \
++	except_loongarch64.c \
+ 	except_x86_64.c \
+ 	exception_ptr.c \
+ 	exit.c \
+diff --git a/dlls/msvcr110/Makefile.in b/dlls/msvcr110/Makefile.in
+index e679842..3341b52 100644
+--- a/dlls/msvcr110/Makefile.in
++++ b/dlls/msvcr110/Makefile.in
+@@ -24,6 +24,7 @@ SOURCES = \
+ 	except_arm64.c \
+ 	except_arm64ec.c \
+ 	except_i386.c \
++	except_loongarch64.c \
+ 	except_x86_64.c \
+ 	exception_ptr.c \
+ 	exit.c \
+diff --git a/dlls/msvcr120/Makefile.in b/dlls/msvcr120/Makefile.in
+index 142ed2c..c9924ca 100644
+--- a/dlls/msvcr120/Makefile.in
++++ b/dlls/msvcr120/Makefile.in
+@@ -27,6 +27,7 @@ SOURCES = \
+ 	except_arm64.c \
+ 	except_arm64ec.c \
+ 	except_i386.c \
++	except_loongarch64.c \
+ 	except_x86_64.c \
+ 	exception_ptr.c \
+ 	exit.c \
+diff --git a/dlls/msvcr70/Makefile.in b/dlls/msvcr70/Makefile.in
+index 9413738..8938e6a 100644
+--- a/dlls/msvcr70/Makefile.in
++++ b/dlls/msvcr70/Makefile.in
+@@ -23,6 +23,7 @@ SOURCES = \
+ 	except_arm64.c \
+ 	except_arm64ec.c \
+ 	except_i386.c \
++	except_loongarch64.c \
+ 	except_x86_64.c \
+ 	exception_ptr.c \
+ 	exit.c \
+diff --git a/dlls/msvcr71/Makefile.in b/dlls/msvcr71/Makefile.in
+index 6e0b855..8d0c442 100644
+--- a/dlls/msvcr71/Makefile.in
++++ b/dlls/msvcr71/Makefile.in
+@@ -23,6 +23,7 @@ SOURCES = \
+ 	except_arm64.c \
+ 	except_arm64ec.c \
+ 	except_i386.c \
++	except_loongarch64.c \
+ 	except_x86_64.c \
+ 	exception_ptr.c \
+ 	exit.c \
+diff --git a/dlls/msvcr80/Makefile.in b/dlls/msvcr80/Makefile.in
+index 2a84383..9ec3f1c 100644
+--- a/dlls/msvcr80/Makefile.in
++++ b/dlls/msvcr80/Makefile.in
+@@ -23,6 +23,7 @@ SOURCES = \
+ 	except_arm64.c \
+ 	except_arm64ec.c \
+ 	except_i386.c \
++	except_loongarch64.c \
+ 	except_x86_64.c \
+ 	exception_ptr.c \
+ 	exit.c \
+diff --git a/dlls/msvcr90/Makefile.in b/dlls/msvcr90/Makefile.in
+index d476d2e..5d5c541 100644
+--- a/dlls/msvcr90/Makefile.in
++++ b/dlls/msvcr90/Makefile.in
+@@ -23,6 +23,7 @@ SOURCES = \
+ 	except_arm64.c \
+ 	except_arm64ec.c \
+ 	except_i386.c \
++	except_loongarch64.c \
+ 	except_x86_64.c \
+ 	exception_ptr.c \
+ 	exit.c \
+diff --git a/dlls/msvcrtd/Makefile.in b/dlls/msvcrtd/Makefile.in
+index a06a244..583ce18 100644
+--- a/dlls/msvcrtd/Makefile.in
++++ b/dlls/msvcrtd/Makefile.in
+@@ -19,6 +19,7 @@ SOURCES = \
+ 	except_arm64.c \
+ 	except_arm64ec.c \
+ 	except_i386.c \
++	except_loongarch64.c \
+ 	except_x86_64.c \
+ 	exception_ptr.c \
+ 	exit.c \
+diff --git a/dlls/ntdll/sync.c b/dlls/ntdll/sync.c
+index ca6dd4a..be8cd72 100644
+--- a/dlls/ntdll/sync.c
++++ b/dlls/ntdll/sync.c
+@@ -1004,6 +1004,32 @@ void WINAPI RtlWakeAddressSingle( const void *addr )
+     if (tid) NtAlertThreadByThreadId( (HANDLE)(DWORD_PTR)tid );
+ }
+ 
++#if defined(__loongarch__)
++/* LoongArch 没有 128 位原子指令，clang 会把 __int128 的原子比较交换改写成对
++ * __atomic_compare_exchange_16 的库调用，而当前交叉工具链不提供 libatomic。
++ * 这里用自旋锁实现；参数必须与 clang AtomicExpandPass 生成的 ABI 一致：
++ *   bool __atomic_compare_exchange_16(i128 *ptr, i128 *expected, i128 desired,
++ *                                     int success_memorder, int failure_memorder)
++ * 注意 desired 按值传递，而不是 libatomic 的指针形式。 */
++static LONG atomic16_lock;
++
++BOOL __atomic_compare_exchange_16( unsigned __int128 *ptr, unsigned __int128 *expected,
++                                   unsigned __int128 desired, int success_memorder,
++                                   int failure_memorder )
++{
++    unsigned __int128 old;
++    BOOL ret;
++
++    spin_lock( &atomic16_lock );
++    old = *ptr;
++    ret = (old == *expected);
++    if (ret) *ptr = desired;
++    else *expected = old;
++    spin_unlock( &atomic16_lock );
++    return ret;
++}
++#endif
++
+ /*************************************************************************
+  *           RtlInitializeSListHead (NTDLL.@)
+  */
+diff --git a/dlls/ntdll/unix/signal_loongarch64.c b/dlls/ntdll/unix/signal_loongarch64.c
+index 87c4275..9f03207 100644
+--- a/dlls/ntdll/unix/signal_loongarch64.c
++++ b/dlls/ntdll/unix/signal_loongarch64.c
+@@ -25,16 +25,21 @@
+ 
+ #ifdef HAVE_SYS_UCONTEXT_H
+ # include <sys/ucontext.h>
+-# include <asm/sigcontext.h>
+ #endif
+ 
++/* Loongnix 4.19 的 <asm/sigcontext.h> 与 glibc 的 bits/sigcontext.h 对
++ * struct sigcontext 有重复定义，不能同时包含；这里沿用 glibc 提供的定义，
++ * 只把用到的内核标志位抄过来（见 arch/loongarch/include/uapi/asm/sigcontext.h）。 */
++#define USED_FP     (1 << 0)    /* 该次信号使用了浮点单元 */
++#define ADRERR_RD   (1 << 30)   /* 地址错误由读访问触发 */
++#define ADRERR_WR   (1 << 31)   /* 地址错误由写访问触发 */
++
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+ #include "windef.h"
++#include "winnt.h"
+ #include "winternl.h"
+-#include "ddk/wdm.h"
+-#include "wine/exception.h"
+-#include "ntdll_misc.h"
++#include "wine/asm.h"
+ #include "unix_private.h"
+ #include "wine/debug.h"
+ 
+@@ -55,27 +60,9 @@ WINE_DEFAULT_DEBUG_CHANNEL(seh);
+ #define FP_sig(context)       REGn_sig(22, context)             /* 帧指针 */
+ #define RA_sig(context)       REGn_sig(1, context)              /* 返回地址 */
+ 
+-static void *get_extended_sigcontext( const ucontext_t *sigcontext, unsigned int magic )
+-{
+-    struct sctx_info *info;
+-    unsigned int i;
+-
+-    /* 只有实际使用过浮点单元时内核才会写出扩展上下文 */
+-    if (!(SIGCONTEXT(sigcontext)->sc_flags & SC_USED_FP)) return NULL;
+-
+-    info = (struct sctx_info *)((char *)SIGCONTEXT(sigcontext) +
+-                                offsetof( struct sigcontext, sc_extcontext ));
+-
+-    /* 最多遍历 32 项，防止 size 损坏时越界 */
+-    for (i = 0; i < 32; i++)
+-    {
+-        if (!info->magic || !info->size) break;
+-        /* sctx_info 之后紧跟着实际的上下文数据 */
+-        if (info->magic == magic) return info + 1;
+-        info = (struct sctx_info *)((char *)info + info->size);
+-    }
+-    return NULL;
+-}
++/* Loongnix 4.19 的 sigcontext 没有扩展上下文链，浮点寄存器直接内联在
++ * sc_fpregs/sc_fcc/sc_fcsr 中（见 <asm/sigcontext.h>），因此不再需要
++ * 遍历 sctx_info 链。 */
+ 
+ /***********************************************************************
+  *           syscall_frame
+@@ -216,17 +203,16 @@ static void syscall_frame_fixup_for_fastpath( struct syscall_frame *frame )
+  */
+ static void save_fpu( CONTEXT *context, const ucontext_t *sigcontext )
+ {
+-    struct fpu_context *fpu;
+     unsigned int i;
+ 
+-    if (!(SIGCONTEXT(sigcontext)->sc_flags & SC_USED_FP)) return;
+-    if (!(fpu = (struct fpu_context *)get_extended_sigcontext( sigcontext, FPU_CTX_MAGIC ))) return;
++    if (!(SIGCONTEXT(sigcontext)->sc_flags & USED_FP)) return;
+ 
+     context->ContextFlags |= CONTEXT_FLOATING_POINT;
+-    for (i = 0; i < 32; i++) context->Fpr[i] = fpu->regs[i];
+-    /* 内核把 8 个 FCC 各占一个字节保存在 fcc 中 */
+-    for (i = 0; i < 8; i++) context->Fcc[i] = (fpu->fcc >> (i * 8)) & 1;
+-    context->Fcsr = fpu->fcsr;
++    /* 内核按 256 位保存每个 FP 寄存器，标量 double 位于低 64 位 */
++    for (i = 0; i < 32; i++) context->Fpr[i] = SIGCONTEXT(sigcontext)->sc_fpregs[i].val64[0];
++    /* 内核把 8 个 FCC 各占一个字节保存在 sc_fcc 中 */
++    for (i = 0; i < 8; i++) context->Fcc[i] = (SIGCONTEXT(sigcontext)->sc_fcc >> (i * 8)) & 1;
++    context->Fcsr = SIGCONTEXT(sigcontext)->sc_fcsr;
+ }
+ 
+ 
+@@ -237,17 +223,15 @@ static void save_fpu( CONTEXT *context, const ucontext_t *sigcontext )
+  */
+ static void restore_fpu( const CONTEXT *context, ucontext_t *sigcontext )
+ {
+-    struct fpu_context *fpu;
+     ULONG64 fcc = 0;
+     unsigned int i;
+ 
+-    if (!(SIGCONTEXT(sigcontext)->sc_flags & SC_USED_FP)) return;
+-    if (!(fpu = (struct fpu_context *)get_extended_sigcontext( sigcontext, FPU_CTX_MAGIC ))) return;
++    if (!(SIGCONTEXT(sigcontext)->sc_flags & USED_FP)) return;
+ 
+-    for (i = 0; i < 32; i++) fpu->regs[i] = context->Fpr[i];
++    for (i = 0; i < 32; i++) SIGCONTEXT(sigcontext)->sc_fpregs[i].val64[0] = context->Fpr[i];
+     for (i = 0; i < 8; i++) fcc |= (ULONG64)(context->Fcc[i] & 1) << (i * 8);
+-    fpu->fcc = fcc;
+-    fpu->fcsr = context->Fcsr;
++    SIGCONTEXT(sigcontext)->sc_fcc = fcc;
++    SIGCONTEXT(sigcontext)->sc_fcsr = context->Fcsr;
+ }
+ 
+ 
+@@ -526,7 +510,9 @@ NTSTATUS call_user_exception_dispatcher( struct thread_data *data, EXCEPTION_REC
+ {
+     struct syscall_frame *frame = get_syscall_frame( data );
+     struct exc_stack_layout *stack;
+-    NTSTATUS status = NtSetContextThread( GetCurrentThread(), context );
++    NTSTATUS status;
++
++    status = NtSetContextThread( GetCurrentThread(), context );
+ 
+     if (status) return status;
+     stack = (struct exc_stack_layout *)(context->Gpr[3] & ~15) - 1;
+@@ -765,9 +751,9 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+     DWORD flags = SIGCONTEXT(context)->sc_flags;
+ 
+     rec.NumberParameters = 2;
+-    if (flags & SC_ADDRERR_WR)
++    if (flags & ADRERR_WR)
+         rec.ExceptionInformation[0] = EXCEPTION_WRITE_FAULT;
+-    else if (flags & SC_ADDRERR_RD)
++    else if (flags & ADRERR_RD)
+         rec.ExceptionInformation[0] = EXCEPTION_READ_FAULT;
+     else
+         rec.ExceptionInformation[0] = EXCEPTION_EXECUTE_FAULT;
+@@ -1000,7 +986,6 @@ static void usr2_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+ {
+     struct syscall_frame *frame = get_syscall_frame( get_thread_data() );
+     ucontext_t *context = sigcontext;
+-    struct fpu_context *fpu;
+     ULONG64 fcc = 0;
+     unsigned int i;
+ 
+@@ -1009,13 +994,12 @@ static void usr2_handler( int signal, siginfo_t *siginfo, void *sigcontext )
+     PC_sig(context) = frame->pc;
+     for (i = 0; i < 32; i++) REGn_sig( i, context ) = frame->gpr[i];
+ 
+-    if (!(SIGCONTEXT(context)->sc_flags & SC_USED_FP)) return;
+-    if (!(fpu = (struct fpu_context *)get_extended_sigcontext( context, FPU_CTX_MAGIC ))) return;
++    if (!(SIGCONTEXT(context)->sc_flags & USED_FP)) return;
+ 
+-    for (i = 0; i < 32; i++) fpu->regs[i] = frame->fpr[i];
++    for (i = 0; i < 32; i++) SIGCONTEXT(context)->sc_fpregs[i].val64[0] = frame->fpr[i];
+     for (i = 0; i < 8; i++) fcc |= (ULONG64)(frame->fcc[i] & 1) << (i * 8);
+-    fpu->fcc = fcc;
+-    fpu->fcsr = frame->fcsr;
++    SIGCONTEXT(context)->sc_fcc = fcc;
++    SIGCONTEXT(context)->sc_fcsr = frame->fcsr;
+ }
+ 
+ 
+@@ -1120,6 +1104,12 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, TEB *teb )
+     struct thread_data *data = get_thread_data();
+     struct syscall_frame *frame = get_syscall_frame( data );
+     CONTEXT *ctx, context = { CONTEXT_ALL };
++    ULONG64 tp;
++
++    /* $tp is the unix-side thread pointer, unused by PE code. It must be
++     * preserved in the syscall frame, otherwise when PE code re-enters unix
++     * code (e.g. pthread_mutex_lock inside a syscall) TLS access crashes. */
++    __asm__( "move %0, $tp" : "=r" (tp) );
+ 
+     context.Gpr[4]  = (ULONG64)entry;
+     context.Gpr[5]  = (ULONG64)arg;
+@@ -1138,6 +1128,7 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, TEB *teb )
+     ctx->ContextFlags = CONTEXT_FULL;
+     signal_set_full_context( ctx );
+ 
++    frame->gpr[2]  = tp;
+     frame->gpr[3]  = (ULONG64)ctx;
+     frame->pc      = (ULONG64)pLdrInitializeThunk;
+     frame->gpr[4]  = (ULONG64)ctx;
+@@ -1189,6 +1180,11 @@ __ASM_GLOBAL_FUNC( signal_start_thread,
+  */
+ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                    "ld.d $t0, $r21, 0x378\n\t"     /* thread_data->syscall_frame */
++                   /* restore_flags 是一次性的：只有本次系统调用（如
++                    * NtSetContextThread）设置的标志才应在返回时生效，
++                    * 必须在入口清零，否则初始化时设置的 CONTEXT_INTEGER
++                    * 会让之后每个系统调用都走慢速路径并丢弃返回值。 */
++                   "st.w $zero, $t0, 0x234\n\t"    /* frame->restore_flags */
+                    /* 保存通用寄存器；gpr[12]/gpr[13] 是快速路径哨兵，不能保存 */
+                    "st.d $ra,  $t0, 0x108\n\t"     /* frame->pc */
+                    "st.d $t7,  $t0, 0x10\n\t"      /* frame->gpr[1] */
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index d6038c4..3fc2968 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -173,7 +173,7 @@ static const UINT page_shift = 12;
+ static const UINT_PTR page_mask = 0xfff;
+ static const UINT_PTR granularity_mask = 0xffff;
+ 
+-#ifdef __aarch64__
++#if defined(__aarch64__) || defined(__loongarch__)
+ static UINT_PTR host_page_size;
+ static UINT_PTR host_page_mask;
+ #else
+@@ -3670,7 +3670,7 @@ void virtual_init(void)
+     pthread_mutex_init( &virtual_mutex, &attr );
+     pthread_mutexattr_destroy( &attr );
+ 
+-#ifdef __aarch64__
++#if defined(__aarch64__) || defined(__loongarch__)
+     host_page_size = sysconf( _SC_PAGESIZE );
+     host_page_mask = host_page_size - 1;
+     TRACE( "host page size: %uk\n", (UINT)host_page_size / 1024 );
+diff --git a/dlls/rpcrt4/ndr_typelib.c b/dlls/rpcrt4/ndr_typelib.c
+index 1006bf1..6ee6113 100644
+--- a/dlls/rpcrt4/ndr_typelib.c
++++ b/dlls/rpcrt4/ndr_typelib.c
+@@ -1115,7 +1115,7 @@ static HRESULT write_param_fs(ITypeInfo *typeinfo, unsigned char *type,
+     return hr;
+ }
+ 
+-#if defined __arm__ || defined __aarch64__
++#if defined __arm__ || defined __aarch64__ || defined __loongarch__
+ 
+ /* replace consecutive params code by a repeat sequence: 0x9d code<1> repeat_count<2> */
+ static unsigned int compress_params_array( unsigned char *params, unsigned int count )
+@@ -1158,7 +1158,7 @@ static unsigned int fill_params_array( ITypeInfo *typeinfo, FUNCDESC *desc,
+         offset = ROUND_SIZE( offset, align );
+         pos = offset / pointer_size;
+ 
+-#ifdef __aarch64__
++#if defined __aarch64__ || defined __loongarch__
+         switch (basetype)
+         {
+         case FC_FLOAT:
+@@ -1179,7 +1179,7 @@ static unsigned int fill_params_array( ITypeInfo *typeinfo, FUNCDESC *desc,
+             }
+             continue;
+         }
+-        (void)float_count; /* unused on arm64 */
++        (void)float_count; /* unused on arm64/loongarch64 */
+ #else
+         switch (basetype)
+         {
+@@ -1231,7 +1231,7 @@ static unsigned int fill_params_array( ITypeInfo *typeinfo, FUNCDESC *desc,
+     return count;
+ }
+ 
+-#endif  /* __arm__ || __aarch64__ */
++#endif  /* __arm__ || __aarch64__ || __loongarch__ */
+ 
+ static void write_proc_func_header(ITypeInfo *typeinfo, FUNCDESC *desc,
+         WORD proc_idx, unsigned char *proc, size_t *proclen)
+diff --git a/dlls/rpcrt4/thunks.c b/dlls/rpcrt4/thunks.c
+index 6e830fc..c8f4888 100644
+--- a/dlls/rpcrt4/thunks.c
++++ b/dlls/rpcrt4/thunks.c
+@@ -229,6 +229,45 @@ __ASM_GLOBAL_FUNC( call_stubless_func,
+     "b.w call_stubless_func\n" \
+     "1:\t.long "#num"\n\t"
+ 
++#elif defined __loongarch__
++
++/* a0-a7 保存在 sp+0x50，紧随其后正好是调用者的栈参数区；
++ * f0-f7（fa0-fa7）保存在 sp+0x08，与 ndr_stubless_client_call 的
++ * args/fpu_regs 约定一致。 */
++__ASM_GLOBAL_FUNC( call_stubless_func,
++                   "addi.d $sp, $sp, -0x90\n\t"
++                   "st.d $ra, $sp, 0\n\t"
++                   "fst.d $f0, $sp, 0x08\n\t"
++                   "fst.d $f1, $sp, 0x10\n\t"
++                   "fst.d $f2, $sp, 0x18\n\t"
++                   "fst.d $f3, $sp, 0x20\n\t"
++                   "fst.d $f4, $sp, 0x28\n\t"
++                   "fst.d $f5, $sp, 0x30\n\t"
++                   "fst.d $f6, $sp, 0x38\n\t"
++                   "fst.d $f7, $sp, 0x40\n\t"
++                   "st.d $a0, $sp, 0x50\n\t"
++                   "st.d $a1, $sp, 0x58\n\t"
++                   "st.d $a2, $sp, 0x60\n\t"
++                   "st.d $a3, $sp, 0x68\n\t"
++                   "st.d $a4, $sp, 0x70\n\t"
++                   "st.d $a5, $sp, 0x78\n\t"
++                   "st.d $a6, $sp, 0x80\n\t"
++                   "st.d $a7, $sp, 0x88\n\t"
++                   "move $a0, $t8\n\t"         /* index */
++                   "addi.d $a1, $sp, 0x50\n\t" /* args */
++                   "addi.d $a2, $sp, 0x08\n\t" /* fpu_regs */
++                   "bl ndr_stubless_client_call\n\t"
++                   "ld.d $ra, $sp, 0\n\t"
++                   "addi.d $sp, $sp, 0x90\n\t"
++                   "jr $ra" )
++
++#define T(num) \
++    ".balign 4\n\t" \
++    ".globl ObjectStublessClient" #num "\n" \
++    "ObjectStublessClient" #num ":\n\t" \
++    "li.d $t8, " #num "\n\t" \
++    "b call_stubless_func\n\t"
++
+ #endif  /* __i386__ */
+ 
+ __ASM_GLOBAL_FUNC( stubless_thunks, ALL_THUNK_ENTRIES )
+@@ -286,6 +325,20 @@ __ASM_GLOBAL_FUNC( stubless_thunks, ALL_THUNK_ENTRIES )
+     "ldr ip, [r0]\n\t" \
+     "ldr pc, [ip, #(4*"#num")]\n\t"
+ 
++#elif defined __loongarch__
++
++#define T(num) \
++    ".balign 4\n\t" \
++    ".globl NdrProxyForwardingFunction" #num "\n" \
++    "NdrProxyForwardingFunction" #num ":\n\t" \
++    "ld.d $a0, $a0, 0x20\n\t" \
++    "ld.d $t0, $a0, 0\n\t" \
++    "li.d $t1, " #num "\n\t" \
++    "slli.d $t1, $t1, 3\n\t" \
++    "add.d $t1, $t0, $t1\n\t" \
++    "ld.d $t0, $t1, 0\n\t" \
++    "jr $t0\n\t"
++
+ #endif  /* __i386__ */
+ 
+ __ASM_GLOBAL_FUNC( vtbl_thunks, ALL_THUNK_ENTRIES )
+@@ -323,7 +376,7 @@ const struct delegating_vtbl delegating_vtbl =
+ };
+ 
+ 
+-#if defined(__aarch64__) || defined(__arm__)
++#if defined(__aarch64__) || defined(__arm__) || defined(__loongarch__)
+ static void __attribute__((used)) args_stack_to_regs( void **args, void **regs, void **stack,
+                                                       const NDR_PROC_PARTIAL_OIF_HEADER *header )
+ {
+@@ -513,4 +566,44 @@ __ASM_GLOBAL_FUNC( call_server_func,
+                    "ldp x19, x20, [sp, #0x10]\n\t"
+                    "ldp x29, x30, [sp], #0x20\n\t"
+                    "ret" )
++#elif defined __loongarch__
++__ASM_GLOBAL_FUNC( call_server_func,
++                   "addi.d $sp, $sp, -0x20\n\t"
++                   "st.d $ra, $sp, 0\n\t"
++                   "st.d $s0, $sp, 0x08\n\t"
++                   "st.d $s1, $sp, 0x10\n\t"
++                   "move $s1, $sp\n\t"                /* 帧基址 */
++                   "addi.d $t0, $a2, 128+15\n\t"       /* 16 个寄存器槽 + 栈参数 */
++                   "srli.d $t0, $t0, 4\n\t"
++                   "slli.d $t0, $t0, 4\n\t"
++                   "sub.d $sp, $sp, $t0\n\t"
++                   "move $s0, $a0\n\t"                /* func */
++                   "move $a0, $a1\n\t"                /* args */
++                   "move $a1, $sp\n\t"                /* regs */
++                   "addi.d $a2, $sp, 128\n\t"         /* stack */
++                   "bl args_stack_to_regs\n\t"
++                   "ld.d $a0, $sp, 0\n\t"
++                   "ld.d $a1, $sp, 0x08\n\t"
++                   "ld.d $a2, $sp, 0x10\n\t"
++                   "ld.d $a3, $sp, 0x18\n\t"
++                   "ld.d $a4, $sp, 0x20\n\t"
++                   "ld.d $a5, $sp, 0x28\n\t"
++                   "ld.d $a6, $sp, 0x30\n\t"
++                   "ld.d $a7, $sp, 0x38\n\t"
++                   "fld.d $f0, $sp, 0x40\n\t"
++                   "fld.d $f1, $sp, 0x48\n\t"
++                   "fld.d $f2, $sp, 0x50\n\t"
++                   "fld.d $f3, $sp, 0x58\n\t"
++                   "fld.d $f4, $sp, 0x60\n\t"
++                   "fld.d $f5, $sp, 0x68\n\t"
++                   "fld.d $f6, $sp, 0x70\n\t"
++                   "fld.d $f7, $sp, 0x78\n\t"
++                   "addi.d $sp, $sp, 128\n\t"         /* 栈参数区 */
++                   "jirl $ra, $s0, 0\n\t"
++                   "move $sp, $s1\n\t"
++                   "ld.d $ra, $sp, 0\n\t"
++                   "ld.d $s0, $sp, 0x08\n\t"
++                   "ld.d $s1, $sp, 0x10\n\t"
++                   "addi.d $sp, $sp, 0x20\n\t"
++                   "jr $ra" )
+ #endif
+diff --git a/dlls/setupapi/devinst.c b/dlls/setupapi/devinst.c
+index 121dda9..aeb01a6 100644
+--- a/dlls/setupapi/devinst.c
++++ b/dlls/setupapi/devinst.c
+@@ -58,6 +58,8 @@ static const WCHAR NtPlatformExtension[] = L".NTx86";
+ static const WCHAR NtPlatformExtension[] = L".NTamd64";
+ #elif defined(__arm__)
+ static const WCHAR NtPlatformExtension[] = L".NTarm";
++#elif defined(__loongarch__)
++static const WCHAR NtPlatformExtension[] = L".NTloongarch64";
+ #elif defined(__aarch64__)
+ static const WCHAR NtPlatformExtension[] = L".NTarm64";
+ #endif
+diff --git a/dlls/setupapi/dirid.c b/dlls/setupapi/dirid.c
+index 1de0c5f..2952d50 100644
+--- a/dlls/setupapi/dirid.c
++++ b/dlls/setupapi/dirid.c
+@@ -53,6 +53,8 @@ static const WCHAR printer_env[] = L"x64";
+ static const WCHAR printer_env[] = L"arm";
+ #elif defined __aarch64__
+ static const WCHAR printer_env[] = L"arm64";
++#elif defined __loongarch__
++static const WCHAR printer_env[] = L"loongarch64";
+ #else
+ #error not defined for this cpu
+ #endif
+diff --git a/dlls/vcomp/fork.c b/dlls/vcomp/fork.c
+index c754a30..8747330 100644
+--- a/dlls/vcomp/fork.c
++++ b/dlls/vcomp/fork.c
+@@ -160,9 +160,49 @@ __ASM_GLOBAL_FUNC( _vcomp_fork_call_wrapper,
+                    "ldp x2, x3, [sp], #16\n\t"
+                    "ldp x4, x5, [sp], #16\n\t"
+                    "ldp x6, x7, [sp], #16\n"
+-                   "4:\tblr x9\n\t"
++                   "4:\ttblr x9\n\t"
+                    "mov SP, x29\n\t"
+                    "ldp x29, x30, [SP], #16\n\t"
+                    "ret" )
+ 
++#elif defined __loongarch__
++
++/* $a0 = wrapper, $a1 = nargs, $a2 = args；参数先整体复制到栈上，
++ * 前 8 个再从栈装入 $a0-$a7，其余保持在 $sp+64 起的栈参数区。 */
++__ASM_GLOBAL_FUNC( _vcomp_fork_call_wrapper,
++                   "addi.d $sp, $sp, -16\n\t"
++                   "st.d $fp, $sp, 0\n\t"
++                   "st.d $ra, $sp, 8\n\t"
++                   "move $fp, $sp\n\t"
++                   "move $t0, $a0\n\t"
++                   "beqz $a1, 4f\n\t"
++                   "slli.d $t1, $a1, 3\n\t"
++                   "li.d $t2, 64\n\t"
++                   "bge $t1, $t2, 2f\n\t"
++                   "move $t1, $t2\n"
++                   "2:\tsrli.d $t1, $t1, 4\n\t"
++                   "slli.d $t1, $t1, 4\n\t"
++                   "sub.d $sp, $sp, $t1\n\t"
++                   "move $t3, $sp\n"
++                   "3:\tld.d $t4, $a2, 0\n\t"
++                   "st.d $t4, $t3, 0\n\t"
++                   "addi.d $a2, $a2, 8\n\t"
++                   "addi.d $t3, $t3, 8\n\t"
++                   "addi.d $a1, $a1, -1\n\t"
++                   "bnez $a1, 3b\n\t"
++                   "ld.d $a0, $sp, 0\n\t"
++                   "ld.d $a1, $sp, 8\n\t"
++                   "ld.d $a2, $sp, 16\n\t"
++                   "ld.d $a3, $sp, 24\n\t"
++                   "ld.d $a4, $sp, 32\n\t"
++                   "ld.d $a5, $sp, 40\n\t"
++                   "ld.d $a6, $sp, 48\n\t"
++                   "ld.d $a7, $sp, 56\n"
++                   "4:\tjirl $ra, $t0, 0\n\t"
++                   "move $sp, $fp\n\t"
++                   "ld.d $fp, $sp, 0\n\t"
++                   "ld.d $ra, $sp, 8\n\t"
++                   "addi.d $sp, $sp, 16\n\t"
++                   "jr $ra" )
++
+ #endif
+diff --git a/dlls/winspool.drv/info.c b/dlls/winspool.drv/info.c
+index 6170dc7..9ffdb8d 100644
+--- a/dlls/winspool.drv/info.c
++++ b/dlls/winspool.drv/info.c
+@@ -130,9 +130,10 @@ static const printenv_t env_x64 = { L"Windows x64", L"x64", 3, L"\\Version-3", L
+ static const printenv_t env_x86 = { L"Windows NT x86", L"w32x86", 3, L"\\Version-3", L"\\3" };
+ static const printenv_t env_arm = { L"Windows ARM", L"arm", 3, L"\\Version-3", L"\\3" };
+ static const printenv_t env_arm64 = { L"Windows ARM64", L"arm64", 3, L"\\Version-3", L"\\3" };
++static const printenv_t env_loongarch64 = { L"Windows LoongArch64", L"loongarch64", 3, L"\\Version-3", L"\\3" };
+ static const printenv_t env_win40 = { L"Windows 4.0", L"win40", 0, L"\\Version-0", L"\\0" };
+ 
+-static const printenv_t * const all_printenv[] = { &env_x86, &env_x64, &env_arm, &env_arm64, &env_win40 };
++static const printenv_t * const all_printenv[] = { &env_x86, &env_x64, &env_arm, &env_arm64, &env_loongarch64, &env_win40 };
+ 
+ #ifdef __i386__
+ #define env_arch env_x86
+@@ -142,6 +143,8 @@ static const printenv_t * const all_printenv[] = { &env_x86, &env_x64, &env_arm,
+ #define env_arch env_arm
+ #elif defined __aarch64__
+ #define env_arch env_arm64
++#elif defined __loongarch__
++#define env_arch env_loongarch64
+ #else
+ #error not defined for this cpu
+ #endif
+diff --git a/include/wine/asm.h b/include/wine/asm.h
+index e831f41..e683876 100644
+--- a/include/wine/asm.h
++++ b/include/wine/asm.h
+@@ -309,12 +309,11 @@
+     __ASM_GLOBAL_FUNC( name, \
+                        "li.d $t8, (" #id ")\n\t" \
+                        "move $t7, $ra\n\t" \
+-                       "pcalau12i $t6, %pc_hi20(" __ASM_LOCAL_LABEL("syscall_dispatcher_ptr") ")\n\t" \
+-                       "addi.d $t6, $t6, %pc_lo12(" __ASM_LOCAL_LABEL("syscall_dispatcher_ptr") ")\n\t" \
++                       "pcalau12i $t6, %pc_hi20(" __ASM_NAME("__wine_syscall_dispatcher") ")\n\t" \
++                       "addi.d $t6, $t6, %pc_lo12(" __ASM_NAME("__wine_syscall_dispatcher") ")\n\t" \
+                        "ld.d $t6, $t6, 0\n\t" \
+                        "jirl $ra, $t6, 0\n\t" \
+-                       "jr $ra\n" \
+-                       __ASM_LOCAL_LABEL("syscall_dispatcher_ptr") ":\t.quad " __ASM_NAME("__wine_syscall_dispatcher") )
++                       "jr $ra" )
+ #elif defined __arm__
+ # define __ASM_SYSCALL_FUNC(id,name,args) \
+     __ASM_GLOBAL_FUNC( name, \
+diff --git a/libs/png/Makefile.in b/libs/png/Makefile.in
+index 7aeff28..6dd480e 100644
+--- a/libs/png/Makefile.in
++++ b/libs/png/Makefile.in
+@@ -1,6 +1,6 @@
+ STATICLIB = libpng.a
+ EXTRAINCL = $(ZLIB_PE_CFLAGS)
+-EXTRADEFS = -DPNG_ARM_NEON_OPT=0
++EXTRADEFS = -DPNG_ARM_NEON_OPT=0 -DPNG_LOONGARCH_LSX_OPT=0
+ 
+ SOURCES = \
+ 	png.c \
+diff --git a/server/object.h b/server/object.h
+index 3c19d15..8ce51db 100644
+--- a/server/object.h
++++ b/server/object.h
+@@ -299,7 +299,8 @@ static inline int is_machine_32bit( unsigned short machine )
+ }
+ static inline int is_machine_64bit( unsigned short machine )
+ {
+-    return machine == IMAGE_FILE_MACHINE_AMD64 || machine == IMAGE_FILE_MACHINE_ARM64;
++    return machine == IMAGE_FILE_MACHINE_AMD64 || machine == IMAGE_FILE_MACHINE_ARM64 ||
++           machine == IMAGE_FILE_MACHINE_LOONGARCH64;
+ }
+ static inline int is_machine_supported( unsigned short machine )
+ {
+diff --git a/server/registry.c b/server/registry.c
+index e71d023..fa0a80d 100644
+--- a/server/registry.c
++++ b/server/registry.c
+@@ -1818,6 +1818,8 @@ static void init_supported_machines(void)
+         if (supports_aarch32()) supported_machines[count++] = IMAGE_FILE_MACHINE_ARMNT;
+         supported_machines[count++] = IMAGE_FILE_MACHINE_AMD64;
+     }
++#elif defined(__loongarch__)
++    if (prefix_type == PREFIX_64BIT) supported_machines[count++] = IMAGE_FILE_MACHINE_LOONGARCH64;
+ #else
+ #error Unsupported machine
+ #endif
+diff --git a/tools/winebuild/build.h b/tools/winebuild/build.h
+index 3a6ecf5..a319e81 100644
+--- a/tools/winebuild/build.h
++++ b/tools/winebuild/build.h
+@@ -278,6 +278,7 @@ extern const char *arm64_name( const char *func );
+ extern const char *asm_globl( const char *func );
+ extern const char *get_asm_ptr_keyword(void);
+ extern const char *get_asm_string_keyword(void);
++extern const char *get_asm_local_label( const char *name );
+ extern const char *get_asm_export_section(void);
+ extern const char *get_asm_rodata_section(void);
+ extern const char *get_asm_rsrc_section(void);
+diff --git a/tools/winebuild/import.c b/tools/winebuild/import.c
+index 4290072..afd12e0 100644
+--- a/tools/winebuild/import.c
++++ b/tools/winebuild/import.c
+@@ -1026,7 +1026,7 @@ static void output_external_link_imports( DLLSPEC *spec )
+ void output_stubs( DLLSPEC *spec )
+ {
+     struct exports *exports = &spec->exports;
+-    const char *name, *exp_name;
++    const char *name, *exp_name, *label;
+     int i;
+ 
+     if (!has_stubs( exports )) return;
+@@ -1133,12 +1133,13 @@ void output_stubs( DLLSPEC *spec )
+             output( "\t.seh_endproc\n" );
+             break;
+         case CPU_LOONGARCH64:
+-            output( "\tpcalau12i $a0, %%pc_hi20(.L__wine_spec_file_name)\n" );
+-            output( "\taddi.d $a0, $a0, %%pc_lo12(.L__wine_spec_file_name)\n" );
++            output( "\tpcalau12i $a0, %%pc_hi20(%s)\n", get_asm_local_label( "__wine_spec_file_name" ));
++            output( "\taddi.d $a0, $a0, %%pc_lo12(%s)\n", get_asm_local_label( "__wine_spec_file_name" ));
+             if (exp_name)
+             {
+-                output( "\tpcalau12i $a1, %%pc_hi20(.L%s_string)\n", name );
+-                output( "\taddi.d $a1, $a1, %%pc_lo12(.L%s_string)\n", name );
++                label = get_asm_local_label( strmake( "%s_string", name ));
++                output( "\tpcalau12i $a1, %%pc_hi20(%s)\n", label );
++                output( "\taddi.d $a1, $a1, %%pc_lo12(%s)\n", label );
+             }
+             else output( "\tli.d $a1, %u\n", odp->ordinal );
+             output( "\tb %s\n", asm_name("__wine_spec_unimplemented_stub") );
+@@ -1148,7 +1149,7 @@ void output_stubs( DLLSPEC *spec )
+     }
+ 
+     output( "\t%s\n", get_asm_string_section() );
+-    output( ".L__wine_spec_file_name:\n" );
++    output( "%s:\n", get_asm_local_label( "__wine_spec_file_name" ));
+     output( "\t%s \"%s\"\n", get_asm_string_keyword(), spec->file_name );
+     for (i = 0; i < exports->nb_entry_points; i++)
+     {
+@@ -1159,7 +1160,7 @@ void output_stubs( DLLSPEC *spec )
+         if (exp_name)
+         {
+             name = get_link_name( odp );
+-            output( ".L%s_string:\n", name );
++            output( "%s:\n", get_asm_local_label( strmake( "%s_string", name )));
+             output( "\t%s \"%s\"\n", get_asm_string_keyword(), exp_name );
+         }
+     }
+@@ -1606,7 +1607,8 @@ static void build_windows_import_lib( const char *lib_name, DLLSPEC *spec, struc
+                 output( "\tjr $t8\n" );
+                 if (is_delay)
+                 {
+-                    output( "\n\t.section .text$1\n" );
++                    /* 显式指定代码节标志：clang 集成汇编器不会像 GNU as 那样按节名推断属性 */
++                    output( "\n\t.section .text$1,\"x\"\n" );
+                     output( ".L__wine_delay_import:\n" );
+                     output( "\tpcalau12i $t8, %%pc_hi20(%s)\n", asm_name( imp_name ) );
+                     output( "\taddi.d $t8, $t8, %%pc_lo12(%s)\n", asm_name( imp_name ) );
+diff --git a/tools/winebuild/spec32.c b/tools/winebuild/spec32.c
+index 189a23d..311f6a4 100644
+--- a/tools/winebuild/spec32.c
++++ b/tools/winebuild/spec32.c
+@@ -405,8 +405,8 @@ static void output_relay_debug( struct exports *exports )
+             output( "\tst.d $a7, $sp, 72\n" );
+             output( "\taddi.d $a2, $sp, 16\n" );
+             output( "\tli.d $a1, %u\n", (odp->u.func.args_str_offset << 16) | (i - exports->base) );
+-            output( "\tpcalau12i $a0, %%pc_hi20(.L__wine_spec_relay_descr)\n" );
+-            output( "\taddi.d $a0, $a0, %%pc_lo12(.L__wine_spec_relay_descr)\n" );
++            output( "\tpcalau12i $a0, %%pc_hi20(%s)\n", get_asm_local_label( "__wine_spec_relay_descr" ) );
++            output( "\taddi.d $a0, $a0, %%pc_lo12(%s)\n", get_asm_local_label( "__wine_spec_relay_descr" ) );
+             output( "\tld.d $a3, $a0, 8\n" );
+             output( "\tjirl $ra, $a3, 0\n" );
+             output( "\tld.d $ra, $sp, 0\n" );
+@@ -549,7 +549,7 @@ void output_exports( DLLSPEC *spec )
+     if (needs_relay)
+     {
+         output( "\t.long 0xdeb90002\n" );  /* magic */
+-        if (is_pe()) output_rva( ".L__wine_spec_relay_descr" );
++        if (is_pe()) output_rva( "%s", get_asm_local_label( "__wine_spec_relay_descr" ) );
+         else output( "\t.long 0\n" );
+     }
+ 
+@@ -589,7 +589,7 @@ void output_exports( DLLSPEC *spec )
+             output( ".L__wine_spec_exports_end:\n" );
+         }
+ 
+-        output( ".L__wine_spec_relay_descr:\n" );
++        output( "%s:\n", get_asm_local_label( "__wine_spec_relay_descr" ) );
+         output( "\t%s 0xdeb90002\n", get_asm_ptr_keyword() );  /* magic */
+         output( "\t%s 0\n", get_asm_ptr_keyword() );           /* relay func */
+         output( "\t%s 0\n", get_asm_ptr_keyword() );           /* private data */
+diff --git a/tools/winebuild/utils.c b/tools/winebuild/utils.c
+index 2b580e5..231a249 100644
+--- a/tools/winebuild/utils.c
++++ b/tools/winebuild/utils.c
+@@ -947,6 +947,21 @@ const char *get_asm_string_keyword(void)
+     }
+ }
+ 
++/*******************************************************************
++ *           get_asm_local_label
++ *
++ * Return the name of an internal label in generated asm code.
++ *
++ * LoongArch COFF relocations have no addend field, and lld computes
++ * PC-relative fixups from the symbol address only, so temporary ".L"
++ * labels lose their section offset. Use a regular local label there.
++ */
++const char *get_asm_local_label( const char *name )
++{
++    if (target.cpu == CPU_LOONGARCH64) return strmake( ".%s", name );
++    return strmake( ".L%s", name );
++}
++
+ const char *get_asm_export_section(void)
+ {
+     switch (target.platform)
+-- 
+2.47.3
+

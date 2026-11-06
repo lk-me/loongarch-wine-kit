@@ -1,0 +1,339 @@
+From 7c96e2ee6607bc10a1b429a5da2d4216074db896 Mon Sep 17 00:00:00 2001
+From: ChenghaoLiu <linkmecry@gmail.com>
+Date: Tue, 3 Nov 2026 16:16:41 +0800
+Subject: [PATCH 08/13] [LoongArch] Emit and encode PE unwind codes
+
+Describe the prologue of non-leaf functions in the LoongArch UNWIND_INFO:
+each saved register and the stack allocation becomes a 4-byte code word
+recorded in prologue order, to be replayed in reverse when unwinding.
+
+Saved registers are taken from the callee-saved info rather than parsed
+out of the instruction stream, since PEI-inserted stores carry no
+FrameSetup flag, and the recorded offset is the real $sp-relative
+immediate.
+
+Disable linker relaxation for COFF: R_LARCH_ALIGN fixups have no symbol
+and crash the COFF writer, and relaxable branches prevent folding the
+.pdata End - Begin difference. Also give the MC-side MCRegisterInfo the
+SEH register numbers used by emitWinCFISaveReg.
+---
+ llvm/include/llvm/MC/MCRegisterInfo.h         |   2 +-
+ llvm/lib/MC/MCWin64EH.cpp                     |  65 ++++++++---
+ .../Target/LoongArch/LoongArchAsmPrinter.cpp  | 106 +++++++++++++++++-
+ .../Target/LoongArch/LoongArchSubtarget.cpp   |  12 ++
+ .../MCTargetDesc/LoongArchAsmBackend.cpp      |   6 +
+ .../MCTargetDesc/LoongArchMCTargetDesc.cpp    |  24 +++-
+ 6 files changed, 192 insertions(+), 23 deletions(-)
+
+diff --git a/llvm/include/llvm/MC/MCRegisterInfo.h b/llvm/include/llvm/MC/MCRegisterInfo.h
+index a79620dc4..b5e7f0aa4 100644
+--- a/llvm/include/llvm/MC/MCRegisterInfo.h
++++ b/llvm/include/llvm/MC/MCRegisterInfo.h
+@@ -598,7 +598,7 @@ public:
+ 
+   /// Map a target register to an equivalent SEH register
+   /// number.  Returns LLVM register number if there is no equivalent value.
+-  int getSEHRegNum(MCRegister Reg) const;
++  virtual int getSEHRegNum(MCRegister Reg) const;
+ 
+   /// Map a target register to an equivalent CodeView register
+   /// number.
+diff --git a/llvm/lib/MC/MCWin64EH.cpp b/llvm/lib/MC/MCWin64EH.cpp
+index 509aff9f5..2dabb0b81 100644
+--- a/llvm/lib/MC/MCWin64EH.cpp
++++ b/llvm/lib/MC/MCWin64EH.cpp
+@@ -3598,29 +3598,42 @@ void llvm::Win64EH::ARMUnwindEmitter::EmitUnwindInfo(MCStreamer &Streamer,
+ //===----------------------------------------------------------------------===//
+ // LoongArch UNWIND_INFO Emission
+ //
+-// LoongArch 没有官方 Windows ABI，这里定义的 UNWIND_INFO 头紧凑排布为：
+-//   byte 0: version:3 | flags:5
+-//   byte 1: count（unwind code 数量）
+-//   byte 2: frame_reg
+-//   byte 3: frame_offset
+-// 与 dlls/ntdll/unwind.c 的 struct loongarch_unwind_info 一致。当前只发射
+-// 无帧叶子函数（count == 0、frame_reg == 0），出现 unwind code 时报错。
++// LoongArch 没有官方 Windows ABI，这里自定义紧凑布局：
++//   byte 0: version:3 | flags:5（固定 1/0）
++//   byte 1: count（展开码的字数）
++//   byte 2: frame_reg（保留，固定 0）
++//   byte 3: frame_offset（保留，固定 0）
++// 之后是 count 个 4 字节展开码，按 prologue 执行顺序排列，展开时逆序执行：
++//   bits[7:0]   opcode：0 = 分配栈空间，1 = 保存通用寄存器
++//   bits[12:8]  保存的通用寄存器编号（0..31，仅 opcode 1）
++//   bits[31:13] 分配大小 / 保存偏移（字节）
++// 该布局与 dlls/ntdll/unwind.c 的 struct loongarch_unwind_info 及
++// RtlVirtualUnwind2 的解码逻辑一一对应。
+ //===----------------------------------------------------------------------===//
+ 
++namespace {
++enum LoongArchUnwindOpcode {
++  LOA_UWOP_ALLOC = 0,
++  LOA_UWOP_SAVE_REG = 1,
++};
++
++/// 把 MCStreamer 使用的 SEH 寄存器编号还原成 LoongArch 通用寄存器号。
++/// 编号定义见 LoongArchMCRegisterInfo::getSEHRegNum：1=$ra，2=$fp，3..11=$s0..$s8。
++unsigned loongArchSEHRegToGPR(unsigned Reg) {
++  if (Reg == 1)
++    return 1;  // $ra
++  if (Reg == 2)
++    return 22;  // $fp
++  return Reg + 20;  // 3..11 -> $s0..$s8 (r23..r31)
++}
++} // namespace
++
+ static void LoongArchEmitUnwindInfo(MCStreamer &Streamer,
+                                     WinEH::FrameInfo *Info) {
+   // 已经发射过（.seh_handlerdata 早期触发）则跳过。
+   if (Info->Symbol)
+     return;
+ 
+-  if (!Info->Instructions.empty()) {
+-    Streamer.getContext().reportError(
+-        Info->FunctionLoc,
+-        "LoongArch unwind codes are not implemented yet in " +
+-            Info->Function->getName());
+-    return;
+-  }
+-
+   MCContext &Context = Streamer.getContext();
+   Streamer.emitValueToAlignment(Align(4));
+   MCSymbol *Label = Context.createTempSymbol();
+@@ -3628,9 +3641,29 @@ static void LoongArchEmitUnwindInfo(MCStreamer &Streamer,
+   Info->Symbol = Label;
+ 
+   Streamer.emitInt8(1); // version = 1, flags = 0
+-  Streamer.emitInt8(0); // count
++  Streamer.emitInt8(Info->Instructions.size());
+   Streamer.emitInt8(0); // frame_reg
+   Streamer.emitInt8(0); // frame_offset
++
++  for (const WinEH::Instruction &Inst : Info->Instructions) {
++    uint32_t Code;
++    switch (Inst.Operation) {
++    case Win64EH::UOP_AllocSmall:
++    case Win64EH::UOP_AllocLarge:
++      Code = uint32_t(Inst.Offset) << 8;
++      break;
++    case Win64EH::UOP_SaveNonVol:
++    case Win64EH::UOP_SaveNonVolBig:
++      Code = (loongArchSEHRegToGPR(Inst.Register) << 8) |
++             (uint32_t(Inst.Offset) << 13) | LOA_UWOP_SAVE_REG;
++      break;
++    default:
++      Context.reportError(Info->FunctionLoc,
++                          "unsupported LoongArch unwind code");
++      return;
++    }
++    Streamer.emitInt32(Code);
++  }
+ }
+ 
+ void llvm::Win64EH::LoongArchUnwindEmitter::Emit(MCStreamer &Streamer) const {
+diff --git a/llvm/lib/Target/LoongArch/LoongArchAsmPrinter.cpp b/llvm/lib/Target/LoongArch/LoongArchAsmPrinter.cpp
+index 48e351b44..219a3c664 100644
+--- a/llvm/lib/Target/LoongArch/LoongArchAsmPrinter.cpp
++++ b/llvm/lib/Target/LoongArch/LoongArchAsmPrinter.cpp
+@@ -57,6 +57,85 @@ void LoongArchAsmPrinter::emitStartOfAsmFile(Module &M) {
+   }
+ }
+ 
++namespace {
++
++/// LoongArch 展开码：按 prologue 的真实顺序记录，解码时逆序执行。
++struct LoongArchUnwindOp {
++  bool IsAlloc;    // true: $sp 调整；false: 保存寄存器
++  unsigned Reg;    // 保存的寄存器（IsAlloc 时无意义）
++  uint64_t Imm;    // alloc 大小，或 st 指令的立即数偏移
++};
++
++} // namespace
++
++/// 从 prologue 推导展开码。
++///
++/// $sp 的调整量从入口块开头的 addi.d/addi.w 读取（只支持“单条指令一次分配”，
++/// 遇到分块分配、栈探测或栈重对齐返回 false）。被保存的寄存器则直接取自
++/// MachineFrameInfo 的被调用者保存信息：PEI 插入的 st.d 并不带 FrameSetup
++/// 标志，靠指令流解析无法可靠区分它们与函数体内普通栈槽的写内存操作。
++static bool collectLoongArchUnwindOps(const MachineFunction &MF,
++                                      SmallVectorImpl<LoongArchUnwindOp> &Ops) {
++  const MachineFrameInfo &MFI = MF.getFrameInfo();
++  uint64_t StackSize = MFI.getStackSize();
++
++  // 1) 解析 $sp 的分配（正常情况下是 prologue 的第一条指令）。
++  bool SawAlloc = false;
++  uint64_t AllocSize = 0;
++  for (const MachineInstr &MI : MF.front()) {
++    if (MI.isMetaInstruction())  // 跳过 .cfi_* 等不产生指令的伪指令
++      continue;
++    unsigned Opc = MI.getOpcode();
++    if (Opc != LoongArch::ADDI_D && Opc != LoongArch::ADDI_W)
++      break;
++    if (MI.getNumOperands() != 3 || !MI.getOperand(0).isReg() ||
++        !MI.getOperand(1).isReg() || !MI.getOperand(2).isImm())
++      return false;
++    Register Dst = MI.getOperand(0).getReg();
++    Register Src = MI.getOperand(1).getReg();
++    int64_t Imm = MI.getOperand(2).getImm();
++    if (Dst == LoongArch::R3 && Src == LoongArch::R3) {
++      // $sp = $sp - N，只允许一次且必须是 8 的倍数。
++      if (SawAlloc || Imm >= 0 || (Imm & 7))
++        return false;
++      SawAlloc = true;
++      AllocSize = uint64_t(-Imm);
++      continue;
++    }
++    // $fp = $sp + N 之类的初始化不影响 $sp，忽略。
++    if (Src == LoongArch::R3)
++      continue;
++    return false;
++  }
++
++  if (AllocSize != StackSize)
++    return false;
++
++  // 2) 被调用者保存的寄存器：偏移是相对“分配后”的 $sp，解码时用当时的
++  //    $sp 直接读即可，因此按 PEI 的保存顺序记录。
++  for (const CalleeSavedInfo &CS : MFI.getCalleeSavedInfo()) {
++    if (CS.isSpilledToReg())
++      return false;
++    Register Reg = CS.getReg();
++    if (!Reg.isPhysical())
++      return false;
++    // getObjectOffset 是相对调用者 CFA 的负偏移，而 prologue 的 st.d 用的是
++    // 分配完栈之后的 $sp，因此实际立即数 = StackSize + ObjectOffset。
++    int64_t Off = int64_t(StackSize) + MFI.getObjectOffset(CS.getFrameIdx());
++    if (Off < 0 || (Off & 7) || Off >= int64_t(StackSize))
++      return false;
++    Ops.push_back({false, Reg, uint64_t(Off)});
++  }
++
++  if (AllocSize == 0 && Ops.empty())
++    return false;  // 真正的叶子函数不生成展开条目
++
++  if (AllocSize)
++    Ops.insert(Ops.begin(), {true, 0, AllocSize});
++
++  return true;
++}
++
+ void LoongArchAsmPrinter::emitFunctionBodyStart() {
+   WinCFIActive = false;
+   if (!TM.getTargetTriple().isOSBinFormatCOFF())
+@@ -64,14 +143,31 @@ void LoongArchAsmPrinter::emitFunctionBodyStart() {
+   if (MF->getFunction().getCallingConv() == CallingConv::GHC)
+     return;
+ 
+-  // 目前只为“无帧叶子函数”生成 .pdata/.xdata：prologue 为空，$ra 没有被
+-  // 写回栈，因此按叶子规则展开（Pc = $ra，Sp 不变）是正确的。其余函数在
+-  // 补齐带栈帧的 unwind code 之前不生成条目。
+-  const MachineFrameInfo &MFI = MF->getFrameInfo();
+-  if (MFI.getStackSize() != 0 || MFI.adjustsStack())
++  // 只排除真正无法静态描述的栈形态。adjustsStack() 仅仅表示函数体内有
++  // 调用帧调整（ADJCALLSTACKDOWN/UP），不影响 prologue 的展开描述，故不检查。
++  if (MF->getFrameInfo().hasVarSizedObjects())
+     return;
+ 
++  SmallVector<LoongArchUnwindOp, 8> Ops;
++  if (!collectLoongArchUnwindOps(*MF, Ops))
++    return;
++
++  // SEH 寄存器编号是自定义的 1..11 空间，必须先确认能编码，避免在
++  // MCStreamer 里报错。
++  for (const auto &Op : Ops) {
++    if (Op.IsAlloc)
++      continue;
++    if (TM.getMCRegisterInfo().getSEHRegNum(Op.Reg) < 0)
++      return;
++  }
++
+   OutStreamer->emitWinCFIStartProc(CurrentFnSym);
++  for (const auto &Op : Ops) {
++    if (Op.IsAlloc)
++      OutStreamer->emitWinCFIAllocStack(Op.Imm);
++    else
++      OutStreamer->emitWinCFISaveReg(Op.Reg, Op.Imm);
++  }
+   OutStreamer->emitWinCFIEndProlog();
+   WinCFIActive = true;
+ }
+diff --git a/llvm/lib/Target/LoongArch/LoongArchSubtarget.cpp b/llvm/lib/Target/LoongArch/LoongArchSubtarget.cpp
+index 6293cbef2..d4ec1c2cf 100644
+--- a/llvm/lib/Target/LoongArch/LoongArchSubtarget.cpp
++++ b/llvm/lib/Target/LoongArch/LoongArchSubtarget.cpp
+@@ -43,6 +43,18 @@ LoongArchSubtarget &LoongArchSubtarget::initializeSubtargetDependencies(
+     TuneCPU = CPU;
+ 
+   ParseSubtargetFeatures(CPU, TuneCPU, FS);
++
++  // 链接器松弛（R_LARCH_RELAX / R_LARCH_ALIGN）是 ELF 专有机制，COFF 目标没有
++  // 对应的重定位类型。一旦跳转 fixup 被标记为 linker-relaxable，整个 .text 就
++  // 被视为可松弛，函数内两个标签之差的折叠会被禁止，导致 .pdata 的
++  // (End - Begin) 在汇编期求不出来；对齐松弛还会生成不带符号的 fixup 让
++  // WinCOFFObjectWriter 崩溃。因此 COFF 目标强制关闭 relax。
++  if (TT.isOSBinFormatCOFF()) {
++    FeatureBitset Bits = getFeatureBits();
++    Bits.reset(LoongArch::FeatureRelax);
++    setFeatureBits(Bits);
++  }
++
+   initializeProperties(TuneCPU);
+   if (Is64Bit) {
+     GRLenVT = MVT::i64;
+diff --git a/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchAsmBackend.cpp b/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchAsmBackend.cpp
+index c2935f4f4..2d2d52819 100644
+--- a/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchAsmBackend.cpp
++++ b/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchAsmBackend.cpp
+@@ -224,6 +224,12 @@ bool LoongArchAsmBackend::shouldRelaxAlign(const MCFragment &F) {
+ // size, the fixup encodes MaxBytesToEmit in the higher bits and references a
+ // per-section marker symbol.
+ bool LoongArchAsmBackend::relaxAlign(MCFragment &F, unsigned &Size) {
++  // 链接器松弛生成的 R_LARCH_ALIGN 重定位是 ELF 专有概念：它不带符号、只有
++  // addend，COFF 下会走到 WinCOFFWriter::recordRelocation 并解引用空的
++  // AddSym 而崩溃，因此 COFF 目标直接不做对齐松弛。
++  if (STI.getTargetTriple().isOSBinFormatCOFF())
++    return false;
++
+   if (!shouldRelaxAlign(F))
+     return false;
+ 
+diff --git a/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchMCTargetDesc.cpp b/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchMCTargetDesc.cpp
+index 28397060c..62bb3bd49 100644
+--- a/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchMCTargetDesc.cpp
++++ b/llvm/lib/Target/LoongArch/MCTargetDesc/LoongArchMCTargetDesc.cpp
+@@ -41,8 +41,30 @@
+ 
+ using namespace llvm;
+ 
++namespace {
++
++/// LoongArch PE 自定义的 SEH 寄存器编号（0..15，只需覆盖展开码会保存的
++/// 非易失寄存器）：1=$ra(r1)，2=$fp(r22)，3..11=$s0..$s8(r23..r31)。
++/// 返回 -1 表示无法编码。注意 MC 侧使用的是这个 MCRegisterInfo 实例，
++/// 而不是代码生成用的 LoongArchRegisterInfo。
++class LoongArchMCRegisterInfo : public MCRegisterInfo {
++public:
++  int getSEHRegNum(MCRegister Reg) const override {
++    unsigned Enc = getEncodingValue(Reg);
++    if (Enc == 1)
++      return 1;  // $ra
++    if (Enc == 22)
++      return 2;  // $fp
++    if (Enc >= 23 && Enc <= 31)
++      return 3 + (Enc - 23);  // $s0..$s8
++    return -1;
++  }
++};
++
++} // namespace
++
+ static MCRegisterInfo *createLoongArchMCRegisterInfo(const Triple &TT) {
+-  MCRegisterInfo *X = new MCRegisterInfo();
++  MCRegisterInfo *X = new LoongArchMCRegisterInfo();
+   InitLoongArchMCRegisterInfo(X, LoongArch::R1);
+   return X;
+ }
+-- 
+2.47.3
+

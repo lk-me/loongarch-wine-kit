@@ -1,0 +1,219 @@
+From 5ef37fb8f4c8166d1076987340621336ef9905ac Mon Sep 17 00:00:00 2001
+From: ChenghaoLiu <linkmecry@gmail.com>
+Date: Tue, 3 Nov 2026 16:51:48 +0800
+Subject: [PATCH 09/13] [LoongArch] Emit PE epilogue ranges and chained unwind
+ info
+
+Record the code ranges where $sp is already back to the caller state, so
+an exception inside an epilogue is unwound from the right stack position.
+Also set UNW_ChainInfo and append the parent RUNTIME_FUNCTION when the
+frame is splitchained.
+---
+ llvm/lib/MC/MCWin64EH.cpp                     | 35 ++++++++--
+ .../Target/LoongArch/LoongArchAsmPrinter.cpp  | 66 +++++++++++++++++++
+ .../Target/LoongArch/LoongArchAsmPrinter.h    |  9 +++
+ 3 files changed, 104 insertions(+), 6 deletions(-)
+
+diff --git a/llvm/lib/MC/MCWin64EH.cpp b/llvm/lib/MC/MCWin64EH.cpp
+index 2dabb0b81..0f0c36914 100644
+--- a/llvm/lib/MC/MCWin64EH.cpp
++++ b/llvm/lib/MC/MCWin64EH.cpp
+@@ -3599,14 +3599,17 @@ void llvm::Win64EH::ARMUnwindEmitter::EmitUnwindInfo(MCStreamer &Streamer,
+ // LoongArch UNWIND_INFO Emission
+ //
+ // LoongArch 没有官方 Windows ABI，这里自定义紧凑布局：
+-//   byte 0: version:3 | flags:5（固定 1/0）
++//   byte 0: version:3 | flags:5（version 固定 1；flags 的 bit2 = CHAININFO）
+ //   byte 1: count（展开码的字数）
+-//   byte 2: frame_reg（保留，固定 0）
+-//   byte 3: frame_offset（保留，固定 0）
++//   byte 2: epilog_count（epilogue 区间个数）
++//   byte 3: 保留（固定 0）
+ // 之后是 count 个 4 字节展开码，按 prologue 执行顺序排列，展开时逆序执行：
+ //   bits[7:0]   opcode：0 = 分配栈空间，1 = 保存通用寄存器
+ //   bits[12:8]  保存的通用寄存器编号（0..31，仅 opcode 1）
+ //   bits[31:13] 分配大小 / 保存偏移（字节）
++// 再之后是 epilog_count 个 8 字节 epilogue 区间（起始/结束 RVA，左闭右开），
++// 描述“$sp 已经恢复为调用者状态”的代码范围。
++// 若设置了 CHAININFO，末尾再跟一个 RUNTIME_FUNCTION 指向父展开信息。
+ // 该布局与 dlls/ntdll/unwind.c 的 struct loongarch_unwind_info 及
+ // RtlVirtualUnwind2 的解码逻辑一一对应。
+ //===----------------------------------------------------------------------===//
+@@ -3640,10 +3643,17 @@ static void LoongArchEmitUnwindInfo(MCStreamer &Streamer,
+   Streamer.emitLabel(Label);
+   Info->Symbol = Label;
+ 
+-  Streamer.emitInt8(1); // version = 1, flags = 0
++  // 只有起止符号齐备的 epilogue 区间才能编码。
++  SmallVector<const WinEH::FrameInfo::Epilog *, 4> Epilogs;
++  for (const auto &E : Info->EpilogMap)
++    if (E.second.Start && E.second.End)
++      Epilogs.push_back(&E.second);
++
++  uint8_t Flags = Info->ChainedParent ? Win64EH::UNW_ChainInfo : 0;
++  Streamer.emitInt8((Flags << 3) | 1); // version = 1
+   Streamer.emitInt8(Info->Instructions.size());
+-  Streamer.emitInt8(0); // frame_reg
+-  Streamer.emitInt8(0); // frame_offset
++  Streamer.emitInt8(Epilogs.size());
++  Streamer.emitInt8(0); // 保留
+ 
+   for (const WinEH::Instruction &Inst : Info->Instructions) {
+     uint32_t Code;
+@@ -3664,6 +3674,19 @@ static void LoongArchEmitUnwindInfo(MCStreamer &Streamer,
+     }
+     Streamer.emitInt32(Code);
+   }
++
++  // epilogue 区间 [start, end)：该范围内 $sp 已经回到调用者状态。
++  for (const WinEH::FrameInfo::Epilog *Epi : Epilogs) {
++    for (const MCSymbol *S : {Epi->Start, Epi->End})
++      Streamer.emitValue(
++          MCSymbolRefExpr::create(S, MCSymbolRefExpr::VK_COFF_IMGREL32,
++                                  Context),
++          4);
++  }
++
++  // 链式展开信息：紧跟在展开码与 epilogue 区间之后。
++  if (Info->ChainedParent)
++    EmitRuntimeFunction(Streamer, Info->ChainedParent);
+ }
+ 
+ void llvm::Win64EH::LoongArchUnwindEmitter::Emit(MCStreamer &Streamer) const {
+diff --git a/llvm/lib/Target/LoongArch/LoongArchAsmPrinter.cpp b/llvm/lib/Target/LoongArch/LoongArchAsmPrinter.cpp
+index 219a3c664..a2fc1dc99 100644
+--- a/llvm/lib/Target/LoongArch/LoongArchAsmPrinter.cpp
++++ b/llvm/lib/Target/LoongArch/LoongArchAsmPrinter.cpp
+@@ -136,8 +136,29 @@ static bool collectLoongArchUnwindOps(const MachineFunction &MF,
+   return true;
+ }
+ 
++/// 识别 "$sp = $sp + Imm"（Imm > 0）形式的栈回收指令，返回其立即数。
++/// 不是这种形态时返回 0。
++static int64_t getPositiveStackAdjust(const MachineInstr &MI) {
++  if (MI.isMetaInstruction())
++    return 0;
++  unsigned Opc = MI.getOpcode();
++  if (Opc != LoongArch::ADDI_D && Opc != LoongArch::ADDI_W)
++    return 0;
++  if (MI.getNumOperands() != 3 || !MI.getOperand(0).isReg() ||
++      !MI.getOperand(1).isReg() || !MI.getOperand(2).isImm())
++    return 0;
++  if (MI.getOperand(0).getReg() != LoongArch::R3 ||
++      MI.getOperand(1).getReg() != LoongArch::R3)
++    return 0;
++  int64_t Imm = MI.getOperand(2).getImm();
++  return Imm > 0 ? Imm : 0;
++}
++
+ void LoongArchAsmPrinter::emitFunctionBodyStart() {
+   WinCFIActive = false;
++  EpilogInstrs.clear();
++  WinEpilogPending = false;
++  WinEpilogOpen = false;
+   if (!TM.getTargetTriple().isOSBinFormatCOFF())
+     return;
+   if (MF->getFunction().getCallingConv() == CallingConv::GHC)
+@@ -161,6 +182,30 @@ void LoongArchAsmPrinter::emitFunctionBodyStart() {
+       return;
+   }
+ 
++  uint64_t TotalAlloc = 0;
++  for (const LoongArchUnwindOp &Op : Ops)
++    if (Op.IsAlloc)
++      TotalAlloc += Op.Imm;
++
++  // 找出“$sp 已恢复到调用者状态”的 epilogue 区间：块内正向 $sp 恢复总量
++  // 与 prologue 的分配量相等时成立。区间从块内最后一条回收指令之后开始，
++  // 这样展开器在区间内会先把分配量减回去，再按 prologue 逆序解码。
++  if (TotalAlloc) {
++    for (const MachineBasicBlock &MBB : *MF) {
++      const MachineInstr *Last = nullptr;
++      uint64_t Restored = 0;
++      for (const MachineInstr &MI : MBB) {
++        int64_t Imm = getPositiveStackAdjust(MI);
++        if (!Imm)
++          continue;
++        Restored += uint64_t(Imm);
++        Last = &MI;
++      }
++      if (Last && Restored == TotalAlloc)
++        EpilogInstrs.insert(Last);
++    }
++  }
++
+   OutStreamer->emitWinCFIStartProc(CurrentFnSym);
+   for (const auto &Op : Ops) {
+     if (Op.IsAlloc)
+@@ -172,6 +217,15 @@ void LoongArchAsmPrinter::emitFunctionBodyStart() {
+   WinCFIActive = true;
+ }
+ 
++void LoongArchAsmPrinter::emitBasicBlockEnd(const MachineBasicBlock &MBB) {
++  AsmPrinter::emitBasicBlockEnd(MBB);
++  if (WinEpilogOpen) {
++    OutStreamer->emitWinCFIEndEpilogue();
++    WinEpilogOpen = false;
++  }
++  WinEpilogPending = false;
++}
++
+ void LoongArchAsmPrinter::emitFunctionBodyEnd() {
+   if (!WinCFIActive)
+     return;
+@@ -183,6 +237,18 @@ void LoongArchAsmPrinter::emitInstruction(const MachineInstr *MI) {
+   LoongArch_MC::verifyInstructionPredicates(
+       MI->getOpcode(), getSubtargetInfo().getFeatureBits());
+ 
++  // epilogue 区间从最后一条 $sp 回收指令之后开始，到所在基本块结束为止。
++  // 标签必须在回收指令发射之后、下一条指令之前落位，因此这里用待定标志。
++  if (WinCFIActive) {
++    if (WinEpilogPending) {
++      OutStreamer->emitWinCFIBeginEpilogue();
++      WinEpilogOpen = true;
++      WinEpilogPending = false;
++    }
++    if (EpilogInstrs.count(MI))
++      WinEpilogPending = true;
++  }
++
+   // Do any auto-generated pseudo lowerings.
+   if (MCInst OutInst; lowerPseudoInstExpansion(MI, OutInst)) {
+     EmitToStreamer(*OutStreamer, OutInst);
+diff --git a/llvm/lib/Target/LoongArch/LoongArchAsmPrinter.h b/llvm/lib/Target/LoongArch/LoongArchAsmPrinter.h
+index 22b2890ee..c9805b140 100644
+--- a/llvm/lib/Target/LoongArch/LoongArchAsmPrinter.h
++++ b/llvm/lib/Target/LoongArch/LoongArchAsmPrinter.h
+@@ -15,6 +15,7 @@
+ 
+ #include "LoongArchSubtarget.h"
+ #include "MCTargetDesc/LoongArchTargetStreamer.h"
++#include "llvm/ADT/SmallPtrSet.h"
+ #include "llvm/CodeGen/AsmPrinter.h"
+ #include "llvm/CodeGen/StackMaps.h"
+ #include "llvm/MC/MCStreamer.h"
+@@ -31,6 +32,13 @@ private:
+   /// 当前函数是否已开启 PE 展开信息（.seh_proc/.seh_endproc）记录。
+   bool WinCFIActive = false;
+ 
++  /// epilogue 中最后一条 $sp 恢复指令；展开信息只描述它之后的区间。
++  SmallPtrSet<const MachineInstr *, 8> EpilogInstrs;
++  /// 已发射 $sp 恢复指令、等下一指令开始 epilogue 区间。
++  bool WinEpilogPending = false;
++  /// 当前已开始记录一个 epilogue 区间，需在块结束时关闭。
++  bool WinEpilogOpen = false;
++
+   LoongArchTargetStreamer &getTargetStreamer() const;
+ 
+ public:
+@@ -49,6 +57,7 @@ public:
+ 
+   void emitFunctionBodyStart() override;
+   void emitFunctionBodyEnd() override;
++  void emitBasicBlockEnd(const MachineBasicBlock &MBB) override;
+ 
+   void emitInstruction(const MachineInstr *MI) override;
+ 
+-- 
+2.47.3
+

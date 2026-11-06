@@ -1,0 +1,287 @@
+From a4ab1096af2c1c81295a67b638374582a417a0a5 Mon Sep 17 00:00:00 2001
+From: ChenghaoLiu <linkmecry@gmail.com>
+Date: Tue, 3 Nov 2026 17:08:12 +0800
+Subject: [PATCH 08/11] [LoongArch] Implement __C_specific_handler and
+ handle_fpieee_flt
+
+The scope table walk now runs for LoongArch, with a 4-byte pc rewind when
+the control pc has already been unwound. handle_fpieee_flt decodes the
+faulting scalar floating point instruction, fills a _FPIEEE_RECORD from
+the context and the FCSR, and applies a handler-supplied result by
+skipping the instruction.
+---
+ dlls/msvcrt/except_loongarch64.c | 180 ++++++++++++++++++++++++++++++-
+ dlls/ntdll/unwind.c              |  62 ++++++++++-
+ 2 files changed, 239 insertions(+), 3 deletions(-)
+
+diff --git a/dlls/msvcrt/except_loongarch64.c b/dlls/msvcrt/except_loongarch64.c
+index 93aa23e..b58a3a1 100644
+--- a/dlls/msvcrt/except_loongarch64.c
++++ b/dlls/msvcrt/except_loongarch64.c
+@@ -117,12 +117,188 @@ __ASM_GLOBAL_FUNC( _setjmp, "b _setjmpex" );
+ 
+ /*********************************************************************
+  *              handle_fpieee_flt
++ *
++ * 把 LoongArch 的浮点异常状态翻译成 _FPIEEE_RECORD，调用应用提供的
++ * handler；handler 返回 EXCEPTION_CONTINUE_EXECUTION 时把结果写回浮点
++ * 寄存器并跳过故障指令，否则交回上层继续搜索。
+  */
++
++/* FCSR 位段：cause 与 enable 均为 V/Z/O/U/I 五个标志。 */
++#define FCSR_CAUSE_SHIFT  2
++#define FCSR_ENABLE_SHIFT 16
++
++struct fp_insn_op
++{
++    unsigned int opcode;
++    unsigned int shift;           /* 15 = 3R 格式，10 = 2R 格式 */
++    unsigned int nops;            /* 源操作数个数 */
++    unsigned int operand_format;  /* _FPIEEE_FORMAT */
++    unsigned int result_format;
++    unsigned int operation;       /* _FpCode* */
++};
++
++/* 覆盖标量浮点算术、开方、取绝对值/取负、格式转换与取整；
++ * 其余形态（含 fmadd 家族）只上报异常标志，不解析操作数。 */
++static const struct fp_insn_op fp_insn_table[] =
++{
++    { 0x201, 15, 2, _FpFormatFp32, _FpFormatFp32, _FpCodeAdd },         /* fadd.s */
++    { 0x202, 15, 2, _FpFormatFp64, _FpFormatFp64, _FpCodeAdd },         /* fadd.d */
++    { 0x205, 15, 2, _FpFormatFp32, _FpFormatFp32, _FpCodeSubtract },    /* fsub.s */
++    { 0x206, 15, 2, _FpFormatFp64, _FpFormatFp64, _FpCodeSubtract },    /* fsub.d */
++    { 0x209, 15, 2, _FpFormatFp32, _FpFormatFp32, _FpCodeMultiply },    /* fmul.s */
++    { 0x20a, 15, 2, _FpFormatFp64, _FpFormatFp64, _FpCodeMultiply },    /* fmul.d */
++    { 0x20d, 15, 2, _FpFormatFp32, _FpFormatFp32, _FpCodeDivide },      /* fdiv.s */
++    { 0x20e, 15, 2, _FpFormatFp64, _FpFormatFp64, _FpCodeDivide },      /* fdiv.d */
++    { 0x211, 15, 2, _FpFormatFp32, _FpFormatFp32, _FpCodeFmax },        /* fmax.s */
++    { 0x212, 15, 2, _FpFormatFp64, _FpFormatFp64, _FpCodeFmax },        /* fmax.d */
++    { 0x215, 15, 2, _FpFormatFp32, _FpFormatFp32, _FpCodeFmin },        /* fmin.s */
++    { 0x216, 15, 2, _FpFormatFp64, _FpFormatFp64, _FpCodeFmin },        /* fmin.d */
++    { 0x4501, 10, 1, _FpFormatFp32, _FpFormatFp32, _FpCodeFabs },       /* fabs.s */
++    { 0x4502, 10, 1, _FpFormatFp64, _FpFormatFp64, _FpCodeFabs },       /* fabs.d */
++    { 0x4505, 10, 1, _FpFormatFp32, _FpFormatFp32, _FpCodeNegate },     /* fneg.s */
++    { 0x4506, 10, 1, _FpFormatFp64, _FpFormatFp64, _FpCodeNegate },     /* fneg.d */
++    { 0x4511, 10, 1, _FpFormatFp32, _FpFormatFp32, _FpCodeSquareRoot }, /* fsqrt.s */
++    { 0x4512, 10, 1, _FpFormatFp64, _FpFormatFp64, _FpCodeSquareRoot }, /* fsqrt.d */
++    { 0x4646, 10, 1, _FpFormatFp64, _FpFormatFp32, _FpCodeConvert },    /* fcvt.s.d */
++    { 0x4649, 10, 1, _FpFormatFp32, _FpFormatFp64, _FpCodeConvert },    /* fcvt.d.s */
++    { 0x46a1, 10, 1, _FpFormatFp32, _FpFormatI32, _FpCodeConvertTrunc },/* ftintrz.w.s */
++    { 0x46a2, 10, 1, _FpFormatFp64, _FpFormatI32, _FpCodeConvertTrunc },/* ftintrz.w.d */
++    { 0x46aa, 10, 1, _FpFormatFp64, _FpFormatI64, _FpCodeConvertTrunc },/* ftintrz.l.d */
++    { 0x4744, 10, 1, _FpFormatI32, _FpFormatFp32, _FpCodeConvert },    /* ffint.s.w */
++    { 0x4748, 10, 1, _FpFormatI32, _FpFormatFp64, _FpCodeConvert },    /* ffint.d.w */
++};
++
++static const struct fp_insn_op *find_fp_insn( unsigned int insn )
++{
++    unsigned int i;
++
++    for (i = 0; i < ARRAY_SIZE(fp_insn_table); i++)
++        if ((insn >> fp_insn_table[i].shift) == fp_insn_table[i].opcode)
++            return &fp_insn_table[i];
++    return NULL;
++}
++
++static void set_fp_flags( _FPIEEE_EXCEPTION_FLAGS *flags, unsigned int bits )
++{
++    flags->InvalidOperation = (bits >> 0) & 1;
++    flags->ZeroDivide       = (bits >> 1) & 1;
++    flags->Overflow         = (bits >> 2) & 1;
++    flags->Underflow        = (bits >> 3) & 1;
++    flags->Inexact          = (bits >> 4) & 1;
++}
++
++static void set_fp_value( _FPIEEE_VALUE *value, unsigned int format, ULONG64 raw )
++{
++    union { ULONG64 u64; double d; float f; int i; } val;
++
++    val.u64 = raw;
++    value->OperandValid = 1;
++    value->Format = format;
++    switch (format)
++    {
++    case _FpFormatFp32: value->Value.Fp32Value = val.f; break;
++    case _FpFormatFp64: value->Value.Fp64Value = val.d; break;
++    case _FpFormatI32:  value->Value.I32Value = val.i; break;
++    case _FpFormatI64:  value->Value.I64Value.W[0] = raw; break;
++    }
++}
++
++static void store_fp_result( ULONG64 *fpr, unsigned int format, const _FPIEEE_VALUE *value )
++{
++    union { ULONG64 u64; double d; float f; } val;
++
++    switch (format)
++    {
++    case _FpFormatFp32:
++        val.f = value->Value.Fp32Value;
++        *fpr = (*fpr & ~(ULONG64)0xffffffff) | (ULONG32)val.u64;
++        break;
++    case _FpFormatFp64:
++        val.d = value->Value.Fp64Value;
++        *fpr = val.u64;
++        break;
++    case _FpFormatI32:
++        *fpr = (*fpr & ~(ULONG64)0xffffffff) | (ULONG32)value->Value.I32Value;
++        break;
++    case _FpFormatI64:
++        *fpr = value->Value.I64Value.W[0];
++        break;
++    }
++}
++
+ int handle_fpieee_flt( __msvcrt_ulong exception_code, EXCEPTION_POINTERS *ep,
+                        int (__cdecl *handler)(_FPIEEE_RECORD*) )
+ {
+-    FIXME("(%lx %p %p)\n", exception_code, ep, handler);
+-    return EXCEPTION_CONTINUE_SEARCH;
++    CONTEXT *ctx = ep->ContextRecord;
++    const struct fp_insn_op *op;
++    _FPIEEE_RECORD rec;
++    unsigned int insn, cause, dest_is_fpr = 0;
++    int ret;
++
++    /* LoongArch 舍入模式：0=RNE、1=RZ、2=RP、3=RN；
++     * Windows 舍入模式：0=最近、1=-inf、2=+inf、3=零。 */
++    static const BYTE rounding_mode[4] = { 0, 3, 2, 1 };
++
++    memset( &rec, 0, sizeof(rec) );
++    rec.Operation = _FpCodeUnspecified;
++
++    insn = *(unsigned int *)ctx->Pc;
++    op = find_fp_insn( insn );
++
++    if (op)
++    {
++        rec.Precision = (op->operand_format == _FpFormatFp32) ? _FpPrecision24 : _FpPrecision53;
++        rec.Operation = op->operation;
++        set_fp_value( &rec.Operand1, op->operand_format, ctx->Fpr[(insn >> 5) & 0x1f] );
++        if (op->nops > 1)
++            set_fp_value( &rec.Operand2, op->operand_format, ctx->Fpr[(insn >> 10) & 0x1f] );
++        rec.Result.Format = op->result_format;
++        dest_is_fpr = 1;
++    }
++    else if ((insn >> 26) == 3)  /* fcmp.cond.s/d，结果写到 $fcc */
++    {
++        unsigned int format = (insn & (1u << 20)) ? _FpFormatFp32 : _FpFormatFp64;
++
++        rec.Precision = (format == _FpFormatFp32) ? _FpPrecision24 : _FpPrecision53;
++        rec.Operation = _FpCodeCompare;
++        set_fp_value( &rec.Operand1, format, ctx->Fpr[(insn >> 5) & 0x1f] );
++        set_fp_value( &rec.Operand2, format, ctx->Fpr[(insn >> 10) & 0x1f] );
++        rec.Result.Format = _FpFormatCompare;
++    }
++
++    rec.RoundingMode = rounding_mode[ctx->Fcsr & 3];
++    cause = (ctx->Fcsr >> FCSR_CAUSE_SHIFT) & 0x1f;
++    set_fp_flags( &rec.Status, cause );
++    set_fp_flags( &rec.Enable, (ctx->Fcsr >> FCSR_ENABLE_SHIFT) & 0x1f );
++    rec.Cause.InvalidOperation = rec.Enable.InvalidOperation & rec.Status.InvalidOperation;
++    rec.Cause.ZeroDivide       = rec.Enable.ZeroDivide & rec.Status.ZeroDivide;
++    rec.Cause.Overflow         = rec.Enable.Overflow & rec.Status.Overflow;
++    rec.Cause.Underflow        = rec.Enable.Underflow & rec.Status.Underflow;
++    rec.Cause.Inexact          = rec.Enable.Inexact & rec.Status.Inexact;
++
++    TRACE( "code %lx handler %p insn %08x op %u\n", exception_code, handler, insn, rec.Operation );
++
++    ret = handler( &rec );
++
++    if (ret == EXCEPTION_CONTINUE_EXECUTION)
++    {
++        unsigned int handled = 0;
++
++        if (rec.Cause.InvalidOperation) handled |= 0x01;
++        if (rec.Cause.ZeroDivide)       handled |= 0x02;
++        if (rec.Cause.Overflow)         handled |= 0x04;
++        if (rec.Cause.Underflow)        handled |= 0x08;
++        if (rec.Cause.Inexact)          handled |= 0x10;
++        ctx->Fcsr &= ~(handled << FCSR_CAUSE_SHIFT);
++
++        if (dest_is_fpr)
++        {
++            if (rec.Result.OperandValid)
++                store_fp_result( &ctx->Fpr[insn & 0x1f], rec.Result.Format, &rec.Result );
++            ctx->Pc += 4;  /* 结果已给出，跳过故障指令，避免重复陷入 */
++        }
++    }
++    return ret;
+ }
+ 
+ #endif  /* __loongarch__ */
+diff --git a/dlls/ntdll/unwind.c b/dlls/ntdll/unwind.c
+index 520ca4a..63b2ba7 100644
+--- a/dlls/ntdll/unwind.c
++++ b/dlls/ntdll/unwind.c
+@@ -1855,7 +1855,67 @@ PEXCEPTION_ROUTINE WINAPI RtlVirtualUnwind( ULONG type, ULONG_PTR base, ULONG_PT
+ EXCEPTION_DISPOSITION WINAPI __C_specific_handler( EXCEPTION_RECORD *rec, void *frame,
+                                                    CONTEXT *context, DISPATCHER_CONTEXT *dispatch )
+ {
+-    FIXME( "not implemented\n" );
++    const SCOPE_TABLE *table = dispatch->HandlerData;
++    ULONG_PTR base = dispatch->ImageBase;
++    ULONG_PTR pc = dispatch->ControlPc;
++    unsigned int i;
++    void *handler;
++
++    TRACE( "%p %p %p %p pc %Ix\n", rec, frame, context, dispatch, pc );
++    if (TRACE_ON(unwind)) DUMP_SCOPE_TABLE( base, table );
++
++    if (dispatch->ControlPcIsUnwound) pc -= 4;
++
++    if (rec->ExceptionFlags & (EXCEPTION_UNWINDING | EXCEPTION_EXIT_UNWIND))
++    {
++        for (i = dispatch->ScopeIndex; i < table->Count; i++)
++        {
++            if (pc < base + table->ScopeRecord[i].BeginAddress) continue;
++            if (pc >= base + table->ScopeRecord[i].EndAddress) continue;
++            if (table->ScopeRecord[i].JumpTarget) continue;
++
++            if (rec->ExceptionFlags & EXCEPTION_TARGET_UNWIND &&
++                dispatch->TargetPc >= base + table->ScopeRecord[i].BeginAddress &&
++                dispatch->TargetPc < base + table->ScopeRecord[i].EndAddress)
++            {
++                break;
++            }
++            handler = (void *)(base + table->ScopeRecord[i].HandlerAddress);
++            dispatch->ScopeIndex = i + 1;
++            TRACE( "scope %u calling __finally %p frame %p\n", i, handler, frame );
++            __C_ExecuteExceptionFilter( ULongToPtr(TRUE), frame, handler, dispatch->NonVolatileRegisters );
++        }
++    }
++    else
++    {
++        for (i = dispatch->ScopeIndex; i < table->Count; i++)
++        {
++            if (pc < base + table->ScopeRecord[i].BeginAddress) continue;
++            if (pc >= base + table->ScopeRecord[i].EndAddress) continue;
++            if (!table->ScopeRecord[i].JumpTarget) continue;
++
++            if (table->ScopeRecord[i].HandlerAddress != EXCEPTION_EXECUTE_HANDLER)
++            {
++                EXCEPTION_POINTERS ptrs = { rec, context };
++
++                handler = (void *)(base + table->ScopeRecord[i].HandlerAddress);
++                TRACE( "scope %u calling filter %p ptrs %p frame %p\n", i, handler, &ptrs, frame );
++                switch (__C_ExecuteExceptionFilter( &ptrs, frame, handler, dispatch->NonVolatileRegisters ))
++                {
++                case EXCEPTION_EXECUTE_HANDLER:
++                    break;
++                case EXCEPTION_CONTINUE_SEARCH:
++                    continue;
++                case EXCEPTION_CONTINUE_EXECUTION:
++                    return ExceptionContinueExecution;
++                }
++            }
++            TRACE( "unwinding to target %lx\n", base + table->ScopeRecord[i].JumpTarget );
++            RtlUnwindEx( frame, (char *)base + table->ScopeRecord[i].JumpTarget,
++                         rec, ULongToPtr(rec->ExceptionCode), (CONTEXT *)dispatch->ContextRecord,
++                         dispatch->HistoryTable );
++        }
++    }
+     return ExceptionContinueSearch;
+ }
+ 
+-- 
+2.47.3
+

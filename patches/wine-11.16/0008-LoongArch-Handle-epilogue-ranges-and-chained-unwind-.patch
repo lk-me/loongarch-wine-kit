@@ -1,0 +1,162 @@
+From ee228044e72d58824f3bc2e34d835d7953d43b36 Mon Sep 17 00:00:00 2001
+From: ChenghaoLiu <linkmecry@gmail.com>
+Date: Fri, 6 Nov 2026 17:24:44 +0800
+Subject: [PATCH 08/20] [LoongArch] Handle epilogue ranges and chained unwind
+ info
+
+---
+ dlls/ntdll/unwind.c | 106 +++++++++++++++++++++++++++++++-------------
+ 1 file changed, 76 insertions(+), 30 deletions(-)
+
+diff --git a/dlls/ntdll/unwind.c b/dlls/ntdll/unwind.c
+index 68944aa..6d62b32 100644
+--- a/dlls/ntdll/unwind.c
++++ b/dlls/ntdll/unwind.c
+@@ -1670,25 +1670,32 @@ BOOLEAN CDECL RtlAddFunctionTable( RUNTIME_FUNCTION *table, DWORD count, ULONG_P
+  * LoongArch64 support
+  *
+  * 展开信息由 LLVM 的 LoongArchUnwindEmitter 生成：4 字节头 + count 个 4 字节
+- * 展开码。展开码按 prologue 的真实执行顺序排列，解码时逆序执行：
++ * 展开码 + epilog_count 个 8 字节 epilogue 区间，必要时再跟一个链式
++ * RUNTIME_FUNCTION。头布局：version:3 | flags:5（bit2 = CHAININFO）、count、
++ * epilog_count、保留（必须为 0）。
++ * 展开码按 prologue 的真实执行顺序排列，解码时逆序执行：
+  *   bits[7:0]   opcode：0 = 分配栈空间，1 = 保存通用寄存器
+  *   bits[12:8]  通用寄存器号（仅 opcode 1 有意义，存的是真实 GPR 号）
+  *   bits[31:13] 分配大小 / 保存偏移（字节）
+  * 保存偏移相对“分配完栈之后”的 $sp，也就是异常发生时的 $sp，因此逆序解码
+  * 时可以直接用当前 $sp 读取，最后再把撤销的分配量加回去。
++ * epilogue 区间是“$sp 已恢复到调用者状态”的 [起始 RVA, 结束 RVA)：异常发生在
++ * 该区间内时要先把分配量减回去，否则会按错误的栈位置解码。
+  */
+ #ifdef __loongarch__
+ 
+-#define LOA_UWOP_ALLOC    0
+-#define LOA_UWOP_SAVE_REG 1
++#define LOA_UWOP_ALLOC         0
++#define LOA_UWOP_SAVE_REG      1
++#define LOA_UNW_FLAG_CHAININFO 0x04
++#define LOA_MAX_CHAIN          8
+ 
+ struct loongarch_unwind_info
+ {
+     BYTE version : 3;
+     BYTE flags : 5;
+-    BYTE count;
+-    BYTE frame_reg;
+-    BYTE frame_offset;
++    BYTE count;         /* 展开码字数 */
++    BYTE epilog_count;  /* epilogue 区间个数 */
++    BYTE reserved;      /* 保留，必须为 0 */
+ };
+ 
+ /* 记录非易失寄存器在 context 中的位置，供 handler 判断是否需要回填。 */
+@@ -1759,42 +1766,81 @@ NTSTATUS WINAPI RtlVirtualUnwind2( ULONG type, ULONG_PTR base, ULONG_PTR pc,
+ 
+     if (func)
+     {
+-        info = (struct loongarch_unwind_info *)(base + func->UnwindInfoAddress);
+-        if (info->version != 1)
+-        {
+-            FIXME( "unknown unwind info version %u at %p\n", info->version, info );
+-            return STATUS_BAD_FUNCTION_TABLE;
+-        }
+-        if (info->frame_reg)
+-        {
+-            FIXME( "frame register %u not supported\n", info->frame_reg );
+-            return STATUS_BAD_FUNCTION_TABLE;
+-        }
++        ULONG_PTR pc_offset = pc - base;
++        unsigned int chain = 0;
+ 
+         sp = context->Gpr[3];
+-        for (int i = info->count - 1; i >= 0; i--)  /* 逆序执行 prologue */
++        for (;;)
+         {
+-            ULONG code = ((ULONG *)info)[1 + i];
+-            unsigned int op = code & 0xff;
+-            unsigned int reg = (code >> 8) & 0x1f;
+-            ULONG_PTR offset = code >> 13;
++            ULONG *codes;
++            unsigned int i;
+ 
+-            if (op == LOA_UWOP_ALLOC)
++            info = (struct loongarch_unwind_info *)(base + func->UnwindInfoAddress);
++            if (info->version != 1)
+             {
+-                sp += code >> 8;
++                FIXME( "unknown unwind info version %u at %p\n", info->version, info );
++                return STATUS_BAD_FUNCTION_TABLE;
+             }
+-            else if (op == LOA_UWOP_SAVE_REG && (reg == 1 || (reg >= 22 && reg <= 31)))
++            if (info->reserved)
+             {
+-                ULONG64 *val = (ULONG64 *)(sp + offset);
++                FIXME( "unsupported reserved field 0x%x at %p\n", info->reserved, info );
++                return STATUS_BAD_FUNCTION_TABLE;
++            }
++            codes = (ULONG *)info + 1;
+ 
+-                if (reg == 1) context->Gpr[1] = *val;  /* $ra */
+-                else set_loongarch_int_reg( context, ctx_ptr, reg, val );
++            /* 异常落在 “$sp 已恢复” 的 epilogue 区间时，先把分配量减回去，
++               使后面仍然按 prologue 状态解码。链式记录只描述各自的代码范围，
++               因此只对属于当前 pc 的第一条记录做这个判断。 */
++            if (!chain)
++            {
++                for (i = 0; i < info->epilog_count; i++)
++                {
++                    ULONG *range = codes + info->count + 2 * i;
++                    unsigned int j;
++
++                    if (pc_offset < range[0] || pc_offset >= range[1])
++                        continue;
++                    for (j = 0; j < info->count; j++)
++                        if ((codes[j] & 0xff) == LOA_UWOP_ALLOC)
++                            sp -= codes[j] >> 8;
++                    break;
++                }
+             }
+-            else
++
++            for (int k = info->count - 1; k >= 0; k--)  /* 逆序执行 prologue */
++            {
++                ULONG code = codes[k];
++                unsigned int op = code & 0xff;
++                unsigned int reg = (code >> 8) & 0x1f;
++                ULONG_PTR offset = code >> 13;
++
++                if (op == LOA_UWOP_ALLOC)
++                {
++                    sp += code >> 8;
++                }
++                else if (op == LOA_UWOP_SAVE_REG && (reg == 1 || (reg >= 22 && reg <= 31)))
++                {
++                    ULONG64 *val = (ULONG64 *)(sp + offset);
++
++                    if (reg == 1) context->Gpr[1] = *val;  /* $ra */
++                    else set_loongarch_int_reg( context, ctx_ptr, reg, val );
++                }
++                else
++                {
++                    ERR( "invalid unwind code %08lx at %p\n", code, info );
++                    return STATUS_BAD_FUNCTION_TABLE;
++                }
++            }
++
++            /* 链式展开信息：先应用本条记录，再继续应用父记录的展开码。 */
++            if (!(info->flags & LOA_UNW_FLAG_CHAININFO))
++                break;
++            if (++chain >= LOA_MAX_CHAIN)
+             {
+-                ERR( "invalid unwind code %08lx at %p\n", code, info );
++                ERR( "too many chained unwind records at %p\n", info );
+                 return STATUS_BAD_FUNCTION_TABLE;
+             }
++            func = (RUNTIME_FUNCTION *)(codes + info->count + 2 * info->epilog_count);
+         }
+         context->Gpr[3] = sp;
+     }
+-- 
+2.47.3
+

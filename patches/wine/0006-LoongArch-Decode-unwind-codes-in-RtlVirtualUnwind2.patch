@@ -1,0 +1,135 @@
+From b62f012846d8f4f569b199347ab96150449737fa Mon Sep 17 00:00:00 2001
+From: ChenghaoLiu <linkmecry@gmail.com>
+Date: Tue, 3 Nov 2026 16:16:45 +0800
+Subject: [PATCH 06/11] [LoongArch] Decode unwind codes in RtlVirtualUnwind2
+
+Replay the recorded prologue in reverse: restore saved registers from
+their $sp-relative slots, then undo the stack allocation. Report the
+non-volatile register slots through KNONVOLATILE_CONTEXT_POINTERS and
+reject unknown opcodes with STATUS_BAD_FUNCTION_TABLE.
+---
+ dlls/ntdll/unwind.c | 69 +++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 63 insertions(+), 6 deletions(-)
+
+diff --git a/dlls/ntdll/unwind.c b/dlls/ntdll/unwind.c
+index b8e58e8..4a97c37 100644
+--- a/dlls/ntdll/unwind.c
++++ b/dlls/ntdll/unwind.c
+@@ -1650,12 +1650,19 @@ BOOLEAN CDECL RtlAddFunctionTable( RUNTIME_FUNCTION *table, DWORD count, ULONG_P
+ /***********************************************************************
+  * LoongArch64 support
+  *
+- * Minimal implementation: only leaf functions without a frame and with no
+- * unwind codes are handled so far, i.e. the return address is still live in
+- * $ra and the stack pointer is unchanged at the point of the exception.
++ * 展开信息由 LLVM 的 LoongArchUnwindEmitter 生成：4 字节头 + count 个 4 字节
++ * 展开码。展开码按 prologue 的真实执行顺序排列，解码时逆序执行：
++ *   bits[7:0]   opcode：0 = 分配栈空间，1 = 保存通用寄存器
++ *   bits[12:8]  通用寄存器号（仅 opcode 1 有意义，存的是真实 GPR 号）
++ *   bits[31:13] 分配大小 / 保存偏移（字节）
++ * 保存偏移相对“分配完栈之后”的 $sp，也就是异常发生时的 $sp，因此逆序解码
++ * 时可以直接用当前 $sp 读取，最后再把撤销的分配量加回去。
+  */
+ #ifdef __loongarch__
+ 
++#define LOA_UWOP_ALLOC    0
++#define LOA_UWOP_SAVE_REG 1
++
+ struct loongarch_unwind_info
+ {
+     BYTE version : 3;
+@@ -1665,6 +1672,28 @@ struct loongarch_unwind_info
+     BYTE frame_offset;
+ };
+ 
++/* 记录非易失寄存器在 context 中的位置，供 handler 判断是否需要回填。 */
++static void set_loongarch_int_reg( CONTEXT *context, KNONVOLATILE_CONTEXT_POINTERS *ctx_ptr,
++                                   unsigned int reg, ULONG64 *val )
++{
++    context->Gpr[reg] = *val;
++    if (!ctx_ptr) return;
++
++    switch (reg)
++    {
++    case 22: ctx_ptr->R22 = val; break;
++    case 23: ctx_ptr->R23 = val; break;
++    case 24: ctx_ptr->R24 = val; break;
++    case 25: ctx_ptr->R25 = val; break;
++    case 26: ctx_ptr->R26 = val; break;
++    case 27: ctx_ptr->R27 = val; break;
++    case 28: ctx_ptr->R28 = val; break;
++    case 29: ctx_ptr->R29 = val; break;
++    case 30: ctx_ptr->R30 = val; break;
++    case 31: ctx_ptr->R31 = val; break;
++    }
++}
++
+ static RUNTIME_FUNCTION *find_loongarch_function( ULONG_PTR pc, ULONG_PTR base,
+                                                   RUNTIME_FUNCTION *func, ULONG count )
+ {
+@@ -1700,6 +1729,7 @@ NTSTATUS WINAPI RtlVirtualUnwind2( ULONG type, ULONG_PTR base, ULONG_PTR pc,
+                                    PEXCEPTION_ROUTINE *handler_ret, ULONG flags )
+ {
+     struct loongarch_unwind_info *info;
++    ULONG_PTR sp;
+ 
+     TRACE( "type %lx base %Ix pc %Ix sp %Ix\n", type, base, pc, context->Gpr[3] );
+     if (limit_low || limit_high) FIXME( "limits not supported\n" );
+@@ -1707,7 +1737,6 @@ NTSTATUS WINAPI RtlVirtualUnwind2( ULONG type, ULONG_PTR base, ULONG_PTR pc,
+     if (mach_frame_unwound) *mach_frame_unwound = TRUE;
+     *handler_data = NULL;
+     *handler_ret = NULL;
+-    *frame_ret = context->Gpr[3];
+ 
+     if (func)
+     {
+@@ -1717,16 +1746,44 @@ NTSTATUS WINAPI RtlVirtualUnwind2( ULONG type, ULONG_PTR base, ULONG_PTR pc,
+             FIXME( "unknown unwind info version %u at %p\n", info->version, info );
+             return STATUS_BAD_FUNCTION_TABLE;
+         }
+-        if (info->count || info->frame_reg)
++        if (info->frame_reg)
+         {
+-            FIXME( "unwind codes not supported yet (count %u frame %u)\n", info->count, info->frame_reg );
++            FIXME( "frame register %u not supported\n", info->frame_reg );
+             return STATUS_BAD_FUNCTION_TABLE;
+         }
++
++        sp = context->Gpr[3];
++        for (int i = info->count - 1; i >= 0; i--)  /* 逆序执行 prologue */
++        {
++            ULONG code = ((ULONG *)info)[1 + i];
++            unsigned int op = code & 0xff;
++            unsigned int reg = (code >> 8) & 0x1f;
++            ULONG_PTR offset = code >> 13;
++
++            if (op == LOA_UWOP_ALLOC)
++            {
++                sp += code >> 8;
++            }
++            else if (op == LOA_UWOP_SAVE_REG && (reg == 1 || (reg >= 22 && reg <= 31)))
++            {
++                ULONG64 *val = (ULONG64 *)(sp + offset);
++
++                if (reg == 1) context->Gpr[1] = *val;  /* $ra */
++                else set_loongarch_int_reg( context, ctx_ptr, reg, val );
++            }
++            else
++            {
++                ERR( "invalid unwind code %08lx at %p\n", code, info );
++                return STATUS_BAD_FUNCTION_TABLE;
++            }
++        }
++        context->Gpr[3] = sp;
+     }
+ 
+     if (!context->Gpr[1]) return STATUS_BAD_FUNCTION_TABLE;  /* invalid leaf function */
+     context->Pc = context->Gpr[1];
+     context->ContextFlags |= CONTEXT_LOONGARCH64_UNWOUND_TO_CALL;
++    *frame_ret = context->Gpr[3];
+     return STATUS_SUCCESS;
+ }
+ 
+-- 
+2.47.3
+

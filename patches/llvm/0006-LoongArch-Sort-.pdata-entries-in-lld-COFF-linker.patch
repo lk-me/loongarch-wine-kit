@@ -1,0 +1,26 @@
+From f63098fb50f3ea9a2f77e44ac080cc370fb4d035 Mon Sep 17 00:00:00 2001
+From: ChenghaoLiu <linkmecry@gmail.com>
+Date: Tue, 3 Nov 2026 14:30:05 +0800
+Subject: [PATCH 06/13] [LoongArch] Sort .pdata entries in lld COFF linker
+
+Reuse the x64 exception table sorting and packing for loongarch64 so
+that .pdata entries are emitted in ascending BeginAddress order.
+---
+ lld/COFF/Writer.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/lld/COFF/Writer.cpp b/lld/COFF/Writer.cpp
+index 3cab426df..0f7cb1f78 100644
+--- a/lld/COFF/Writer.cpp
++++ b/lld/COFF/Writer.cpp
+@@ -2753,6 +2753,7 @@ void Writer::sortExceptionTables() {
+ 
+   switch (ctx.config.machine) {
+   case AMD64:
++  case LOONGARCH64:
+     sortExceptionTable<EntryX64>(pdata);
+     break;
+   case ARM64EC:
+-- 
+2.47.3
+

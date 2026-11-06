@@ -1,0 +1,34 @@
+From b282ca07102782ef8c074d9d8af922aae8910845 Mon Sep 17 00:00:00 2001
+From: k <k@l>
+Date: Fri, 6 Nov 2026 19:56:21 +0800
+Subject: [PATCH 19/20] [LoongArch] Drop duplicate NtSetLdtEntries
+
+---
+ dlls/ntdll/unix/signal_loongarch64.c | 11 -----------
+ 1 file changed, 11 deletions(-)
+
+diff --git a/dlls/ntdll/unix/signal_loongarch64.c b/dlls/ntdll/unix/signal_loongarch64.c
+index c26c431..2326b7f 100644
+--- a/dlls/ntdll/unix/signal_loongarch64.c
++++ b/dlls/ntdll/unix/signal_loongarch64.c
+@@ -1012,17 +1012,6 @@ NTSTATUS get_thread_ldt_entry( HANDLE handle, THREAD_DESCRIPTOR_INFORMATION *inf
+ }
+ 
+ 
+-/******************************************************************************
+- *           NtSetLdtEntries   (NTDLL.@)
+- *           ZwSetLdtEntries   (NTDLL.@)
+- */
+-NTSTATUS WINAPI NtSetLdtEntries( ULONG sel1, ULONG entry1_low, ULONG entry1_high,
+-                                 ULONG sel2, ULONG entry2_low, ULONG entry2_high )
+-{
+-    return STATUS_NOT_IMPLEMENTED;
+-}
+-
+-
+ /**********************************************************************
+  *             signal_init_threading
+  */
+-- 
+2.47.3
+
