@@ -1,5 +1,10 @@
 # 本次工作的资源消耗说明
 
+> **Abstract (EN)** — Platform billing data is not accessible from the workspace, so
+> this document separates *verifiable effort* (commits, build cycles, test runs,
+> document size) from a *token-level estimate* (3–5 M input, 0.2–0.3 M output,
+> ±50 %). Convert to credits with your own plan rates.
+
 ## 0. 先说清楚计量口径
 
 工程内无法读取平台的计费数据（积分/账单在 Trae 客户端「用量」里），

@@ -1,178 +1,203 @@
 # loongarch-wine-kit
 
-把一台 loongarch64 Linux 机器变成“能编译、能运行 **LoongArch64 原生 Wine**”的可复现工程。
+**English** | [简体中文](README.zh-CN.md)
 
-产出：`loongarch64-windows` 的 PE（`clang --target=loongarch64-windows` + `lld-link`），
-由原生 Wine 直接加载，**不经过任何 x86 指令翻译**。
+Reproducible toolchain and build workflow for running Wine natively on
+**LoongArch64 Linux** — no x86 emulation or binary translation involved.
 
-已验证版本：Wine 10.14、Wine 11.16（`notepad`、`winecfg` 均能映射真实窗口）。
+The kit turns a plain loongarch64 machine into a host that can compile
+`loongarch64-windows` PE binaries and run them under a native LoongArch build
+of Wine.
+
+| Item | Value |
+| --- | --- |
+| Target triple | `loongarch64-windows` (`IMAGE_FILE_MACHINE_LOONGARCH64`, `0x6264`) |
+| Toolchain | LLVM/Clang + LLD, cross-targeted to LoongArch PE |
+| Wine versions | 10.14, 11.16 |
+| Verified on | Loongson-3A5000, 4 cores / 16 GB, Debian 10, kernel 4.19 (16 KB pages) |
+| Verification | `wineboot`, `wine cmd /c ver`, `winecfg`, `notepad` |
 
 ---
 
-## 1. 前置条件
+## 1. Why a kit is needed
 
-| 项 | 要求 |
+Upstream LLVM cannot emit Windows PE for LoongArch, and upstream Wine has no
+LoongArch backend. Three layers had to be added:
+
+| Layer | Content |
 | --- | --- |
-| 机器 | **loongarch64 Linux**（Wine 的 unix 侧需本机链接，x86 上编不出来） |
-| 实测环境 | Loongson-3A5000，4 核 / 16 GB / 35 GB 可用空间，Debian 10（kernel 4.19、16K 页） |
-| 依赖 | `gcc g++ make ninja-build flex bison pkg-config python3 git`，X11 开发库（`libx11-dev libxext-dev libxrender-dev`） |
-| CMake | ≥ 3.20（系统若只有 3.13，见 1.1 源码引导） |
-| 磁盘 | LLVM 源码 + 构建约 25–30 GB，Wine 构建约 6 GB |
-| 运行期 | Xorg（`DISPLAY=:0`）用于验证窗口 |
+| LLVM (13 commits) | MC-layer COFF writer, LLD COFF support, import thunks, `.pdata` sorting, PE unwind encoding, Windows target info |
+| mingw CRT | Minimal `mainCRTStartup` that preserves `$ra` and carries `.seh_*` unwind metadata |
+| Wine (11 / 20 commits) | Build system, signal/context handling, stack unwinding + `__C_specific_handler`, PE loading and runtime fixes |
 
-### 1.1 系统 CMake 太老时
+Details per commit: [MODIFICATIONS.md](MODIFICATIONS.md).
 
-LLVM 主线的 `cmake_minimum_required` 要求 ≥ 3.20，而 Debian 10 自带 3.13.4：
+---
+
+## 2. Requirements
+
+| Item | Requirement |
+| --- | --- |
+| Build host | **loongarch64 Linux** (Wine links native unix-side objects; it cannot be cross-built on x86) |
+| Packages | `gcc g++ make ninja-build flex bison pkg-config python3 git`, X11 dev headers (`libx11-dev libxext-dev libxrender-dev`) |
+| CMake | ≥ 3.20 (see §2.1 if the distro ships 3.13) |
+| Disk | 25–30 GB for LLVM sources + build, ~6 GB for Wine |
+| Display | Xorg on `DISPLAY=:0` for the GUI verification step |
+
+### 2.1 Bootstrapping a newer CMake
+
+Debian 10 ships CMake 3.13.4, which is below LLVM's minimum:
 
 ```bash
-BASE=$HOME/cmake-boot && mkdir -p $BASE && cd $BASE
-curl -sLO https://cmake.org/files/v3.28/cmake-3.28.6.tar.gz   # GitHub Release 在国内常不可达
+BASE=$HOME/cmake-boot && mkdir -p "$BASE" && cd "$BASE"
+curl -sLO https://cmake.org/files/v3.28/cmake-3.28.6.tar.gz
 tar xf cmake-3.28.6.tar.gz && cd cmake-3.28.6
-./bootstrap --parallel=4 --prefix=$BASE/install > bootstrap.log 2>&1
-make -j4 >> bootstrap.log 2>&1 && make install >> bootstrap.log 2>&1
-$BASE/install/bin/cmake --version
+./bootstrap --parallel=4 --prefix="$BASE/install" > bootstrap.log 2>&1
+make -j4 >> bootstrap.log 2>&1
+make install >> bootstrap.log 2>&1
+export PATH="$BASE/install/bin:$PATH"
 ```
 
-4 核约 15–30 分钟。之后把 `$BASE/install/bin` 放进 `PATH`，或直接改 `env.sh` 的 `CMAKE`。
+15–30 minutes on four cores.
 
 ---
 
-## 2. 目录结构
+## 3. Repository layout
 
 ```text
 loongarch-wine-kit/
-├── env.sh                  # 所有路径/参数集中在这里（换机器只改这里）
-├── README.md
-├── MODIFICATIONS.md        # LLVM 13 个提交 + Wine 10.14/11.16 补丁逐项说明
-├── CREDITS.md              # 本次工作的资源/积分消耗口径
+├── env.sh                     # single place for all paths and knobs
+├── README.md                  # this file
+├── README.zh-CN.md            # Chinese version
+├── MODIFICATIONS.md           # per-commit description of every change
+├── CREDITS.md                 # effort / resource accounting
 ├── crt/
-│   ├── crt0.S              # PE 入口 mainCRTStartup（保存/恢复 $ra + .seh_*）
-│   └── empty.S             # crtbegin/crtend 占位对象
+│   ├── crt0.S                 # PE entry point: saves $ra, carries .seh_* metadata
+│   └── empty.S                # placeholder for crtbegin.o / crtend.o
 ├── patches/
-│   ├── llvm/               # 13 个，git am 可直接应用
-│   ├── wine/               # wine-10.14 基线（11 个）
-│   └── wine-11.16/         # wine-11.16 基线（20 个，已验证）
+│   ├── llvm/                  # 13 patches for llvm-project
+│   ├── wine/                  # 11 patches for wine-10.14
+│   └── wine-11.16/            # 20 patches for wine-11.16
 └── scripts/
-    ├── 01-build-llvm.sh    # 构建 LLVM/clang/lld，生成 cross 驱动包装
-    ├── 02-install-crt.sh   # 生成最小 sysroot（CRT + 空壳导入库）
-    ├── 03-deploy-toolchain.sh  # 多机时才需要，单机自动跳过
-    ├── 04-build-wine.sh    # configure + make
-    └── 05-verify.sh        # 冒烟验证（退出码 / printf / 窗口）
+    ├── 01-build-llvm.sh
+    ├── 02-install-crt.sh
+    ├── 03-deploy-toolchain.sh
+    ├── 04-build-wine.sh
+    └── 05-verify.sh
 ```
 
-源码与构建目录默认在 `$WORK=$HOME/loongarch-wine`：
+Working tree defaults to `$WORK=$HOME/loongarch-wine`:
 
 ```text
 $WORK/
 ├── llvm-project/
-├── wine-11.16/            # 或 wine-10.14
+├── wine-11.16/            # or wine-10.14
 ├── build-llvm/
-├── toolchain/             # clang/lld + sysroot/loongarch64-w64-mingw32
+├── toolchain/             # clang, lld, sysroot/loongarch64-w64-mingw32
 └── build-wine/
 ```
 
 ---
 
-## 3. 快速开始（单机，5 步）
+## 4. Quick start (single machine)
 
 ```bash
-KIT=<本仓库路径>
-export WORK=$HOME/loongarch-wine
-mkdir -p $WORK
+KIT=/path/to/loongarch-wine-kit
+export WORK=$HOME/loongarch-wine && mkdir -p "$WORK"
 
-# 0) 准备源码
-git clone --depth 1 https://github.com/llvm/llvm-project.git $WORK/llvm-project
-git clone https://github.com/wine-mirror/wine.git $WORK/wine-11.16
-git -C $WORK/wine-11.16 checkout wine-11.16
+# 1. Sources
+git clone --depth 1 https://github.com/llvm/llvm-project.git "$WORK/llvm-project"
+git clone https://github.com/wine-mirror/wine.git "$WORK/wine-11.16"
+git -C "$WORK/wine-11.16" checkout wine-11.16
 
-# 1) 应用补丁
-git -C $WORK/llvm-project am $KIT/patches/llvm/*.patch
-git -C $WORK/wine-11.16   am $KIT/patches/wine-11.16/*.patch
+# 2. Patches
+git -C "$WORK/llvm-project" am "$KIT"/patches/llvm/*.patch
+git -C "$WORK/wine-11.16"   am "$KIT"/patches/wine-11.16/*.patch
 
-# 2) 依次执行脚本
-$KIT/scripts/01-build-llvm.sh        # 数小时，务必后台跑
-$KIT/scripts/02-install-crt.sh       # 秒级
-$KIT/scripts/03-deploy-toolchain.sh  # TARGET_HOST 为空 -> 自动跳过
-$KIT/scripts/04-build-wine.sh        # 1~2 小时
-DISPLAY=:0 $KIT/scripts/05-verify.sh
+# 3. Build (step 01 takes hours — run it under nohup/screen)
+"$KIT"/scripts/01-build-llvm.sh
+"$KIT"/scripts/02-install-crt.sh
+"$KIT"/scripts/03-deploy-toolchain.sh    # no-op when TARGET_HOST is empty
+"$KIT"/scripts/04-build-wine.sh
+DISPLAY=:0 "$KIT"/scripts/05-verify.sh
 ```
 
-Wine 10.14 同理，把第 0/1 步换成 `wine-10.14` 与 `patches/wine/`。
+For Wine 10.14 use `patches/wine/` and `WINE_SRC=$WORK/wine-10.14` instead.
 
-### 3.1 各步骤在做什么
+### 4.1 What each step does
 
-| 步骤 | 内容 | 关键点 |
+| Step | Action | Notes |
 | --- | --- | --- |
-| 01 | `cmake` 配置 + `ninja` 构建 `clang;lld`，只开 LoongArch 目标 | 生成 `$TOOLCHAIN/bin/loongarch64-w64-mingw32-clang` 包装，把 `--target` 与 `--sysroot` 固化进去 |
-| 02 | 编译 `crt/crt0.S` → `crt2.o`；`empty.S` → `crtbegin.o`/`crtend.o`；生成 8 字节空壳 `lib*.a` | 空壳库只解决“文件找不到”，符号解析要用 Wine 构建产物 |
-| 03 | `rsync` 工具链到目标机 | 仅当构建机 ≠ 运行机；两者同架构时单机即可 |
-| 04 | `configure` + `make` | `configure` 靠名字找交叉编译器，必须把 `$TOOLCHAIN/bin` 放进 `PATH` |
-| 05 | 跑 `t_exit`/`t_printf`，起 `winecfg`/`notepad` 并查窗口 | 任一项超时即判定失败（历史上对应两类卡死） |
+| 01 | Configure and build `clang;lld` with only the LoongArch target | Installs a `loongarch64-w64-mingw32-clang` wrapper that bakes in `--target` and `--sysroot` |
+| 02 | Compile `crt0.S` → `crt2.o`, `empty.S` → `crtbegin.o`/`crtend.o`; generate stub import libraries | Stubs are 8-byte archives; real symbols come from the Wine build tree |
+| 03 | rsync the toolchain to a remote host | Only needed when the build host differs from the run host |
+| 04 | `configure` + `make` | `$TOOLCHAIN/bin` must be on `PATH`; `configure` finds the cross compiler by name |
+| 05 | Exit-code and stdio tests, then `winecfg`/`notepad` window checks | Failures correspond to the two historical hangs |
 
 ---
 
-## 4. 验证基线
+## 5. Verification baseline
 
-| 用例 | 通过标准 |
+| Case | Pass criterion |
 | --- | --- |
-| `t_exit` | 5 秒内退出，`rc=0` |
-| `t_printf` | 5 秒内输出 `A B S C`，`rc=0` |
-| `wineboot --init` | 正常结束，前缀目录生成 |
-| `wine cmd /c ver` | 输出 `Microsoft Windows 10.0.x` |
-| `winecfg` | 8 秒内出现 X 顶层窗口（标题含 `Wine`） |
-| `notepad` | 同上 |
+| `t_exit` | exits within 5 s, `rc=0` |
+| `t_printf` | prints `A B S C` within 5 s, `rc=0` |
+| `wineboot --init` | completes, prefix directory created |
+| `wine cmd /c ver` | prints `Microsoft Windows 10.0.x` |
+| `winecfg` | X top-level window appears within 8 s |
+| `notepad` | same as above |
 
-实测结果（Loongson-3A5000，Wine 11.16）：`wineboot` 返回 0，
-`wine cfg` 输出 `Microsoft Windows 10.0.19045`，`notepad` 窗口 721x512，
-`winecfg` 窗口 `Wine 设置` 477x608。
+Measured on Loongson-3A5000 with Wine 11.16: `wineboot` returns 0,
+`wine cmd /c ver` prints `Microsoft Windows 10.0.19045`,
+`notepad` maps a 721×512 window and `winecfg` maps `Wine 设置` at 477×608.
 
-故障对照：`t_exit` 超时且 CPU 100% → CRT 的 `$ra` 没保存；
-`t_printf` 超时 → 编译时漏了 `-D_UCRT`；
-`wineboot` 报 `double free or corruption` → `loader.c` 路径缓冲区长度不足（已修）。
+### 5.1 Symptom → cause
 
----
-
-## 5. 新机器上最容易踩的 6 个坑
-
-1. **sysroot 的 `lib*.a` 是 8 字节空壳**：真实导入库在 `$WINE_BUILD/dlls/*/lib*.a`，
-   手工链接外部程序必须显式给全路径，否则一堆 `undefined symbol: __imp_xxx`。
-2. **`COMPILER_RT_PE_LIBS` 为空** → `programs/xcopy` 报 `-lcompiler-rt`。
-   源码层已修（`configure.ac`/`configure` 的 `*-mingw32` 分支），若仍为空说明
-   `configure` 不是补丁后的版本；手工赋值**结尾不能有空格**，否则 makedep 匹配失败。
-3. **CRT 入口必须保存/恢复 `$ra` 并带 `.seh_*`**，否则退出自旋、异常展开死循环。
-4. **用 ucrtbase 的程序必须加 `-D_UCRT`**，否则 `FILE` 布局不匹配 →
-   `STATUS_INVALID_HANDLE (c0000008)`。
-5. **`.pdata` 必须按 RVA 排序**（lld 已补），否则异常分发查表失败。
-6. **Wine 必须在 loongarch64 上构建**；x86 只能产出编译器工具链，产不出可运行的 Wine。
+| Symptom | Likely cause |
+| --- | --- |
+| `t_exit` hangs at 100 % CPU | `mainCRTStartup` did not preserve `$ra` (self-referencing return) |
+| `t_printf` hangs | Program built without `-D_UCRT`; `FILE` layout mismatch |
+| `wineboot` aborts with `double free or corruption` | `ntdll/unix/loader.c` path buffer sized from `/aarch64-windows` |
+| `undefined symbol: __imp_*` when linking | Stub `lib*.a` used instead of `$WINE_BUILD/dlls/*/lib*.a` |
+| `unable to find library -lcompiler-rt` | `COMPILER_RT_PE_LIBS` empty; `configure` not the patched one |
 
 ---
 
-## 6. 版本与补丁矩阵
+## 6. Supported versions
 
-| Wine 基线 | 补丁目录 | 提交数 | 状态 |
+| Wine baseline | Patch set | Commits | Status |
 | --- | --- | --- | --- |
-| `wine-10.14` | `patches/wine/` | 11 | 已验证（winecfg/notepad、性能基准） |
-| `wine-11.16` | `patches/wine-11.16/` | 20 | 已验证（构建、安装、winecfg/notepad） |
+| `wine-10.14` | `patches/wine/` | 11 | verified: windows, console tests, benchmarks |
+| `wine-11.16` | `patches/wine-11.16/` | 20 | verified: build, install, `winecfg`/`notepad` |
 
-11.16 相比 10.14 需要额外处理：`get_thread_ldt_entry` 原型变更、
-`NtSetLdtEntries` 迁到 `virtual.c`、新增 `libs/symcrypt`、C++ 模块（`vcruntime140`/
-`msvcp140`/`concrt140`）在 loongarch64 下禁用、`sqlite3` 的 `__int128` 判断、
-128 位 `long double` 内建函数、`loader.c` 路径缓冲区长度。
-详见 `MODIFICATIONS.md` 第 8 节。
-
----
-
-## 7. 已知限制（未完成）
-
-- 后台服务忙等：`services`/`winedevice`/`rpcss`/`plugplay` 空闲时各占满一个核；
-- `dlls/rsaenh` 链接 `libtomcrypt.a` 报重定位错误；
-- C++ 异常（`-fexceptions`）与 MSVC C++ ABI 不可用（相关模块已禁用）；
-- 32 位 / WoW64 链路未开始。
+Wine 11.16 additionally required: updated LDT prototypes, removal of the
+duplicated `NtSetLdtEntries`, a generic SymCrypt path, disabling the C++ ABI
+modules (`vcruntime140`, `msvcp140`, `concrt140`), the `__int128` branch in
+`sqlite3`, quad-precision compiler-rt builtins, and the `loader.c` buffer fix.
+See [MODIFICATIONS.md](MODIFICATIONS.md) §8.
 
 ---
 
-## 8. 参考
+## 7. Current limitations
 
-- 完整问题记录：`../wine-loongarch编译问题记录.md`
-- 改动明细：`MODIFICATIONS.md`
-- 资源消耗口径：`CREDITS.md`
+- Background services busy-wait: `services`, `winedevice`, `rpcss`, `plugplay`
+  each saturate a core while idle.
+- `dlls/rsaenh` fails to link against `libtomcrypt.a` (relocation errors).
+- C++ exceptions and the MSVC C++ ABI are unsupported; the related modules are
+  disabled on loongarch64.
+- 32-bit / WoW64 support has not been started.
+
+---
+
+## 8. References
+
+- Full engineering log (Chinese): `../wine-loongarch编译问题记录.md`
+- Per-commit change list: [MODIFICATIONS.md](MODIFICATIONS.md)
+- Effort accounting: [CREDITS.md](CREDITS.md)
+
+## 9. License
+
+Scripts and documentation in this repository are provided under the MIT
+License. Patches under `patches/` are derivative works of Wine (LGPL-2.1-or-later)
+and LLVM (Apache-2.0 WITH LLVM-exception) and remain under their respective
+upstream licenses.

@@ -1,11 +1,19 @@
 # 改动清单（相对上游）
 
+> **Abstract (EN)** — Every change required to run Wine natively on LoongArch64 is
+> confined to three trees: `llvm-project` (13 commits: COFF/PE codegen, LLD COFF
+> backend, driver and Windows target info), `wine` (11 commits on the 10.14
+> baseline, 20 on the 11.16 baseline: build system, signal/context, unwinding,
+> PE loading and runtime fixes), and a hand-written mingw CRT entry point.
+> See §8 for the Wine 11.16 delta.
+
 本工程把 LoongArch64 原生 Wine 所需的全部改动收敛到三个仓库：
 
 | 仓库 | 基线 | 提交数 | 规模 | 补丁目录 |
 | --- | --- | --- | --- | --- |
 | `llvm-project` | `4497566c7`（libc 上游提交） | 13 | 后端 + lld + 驱动 | `patches/llvm/` |
 | `wine-10.14` | `8448e6d`（Baseline: Wine 10.14 upstream source） | 11 | 66 文件，+4268/−54 | `patches/wine/` |
+| `wine-11.16` | `5e99426`（Wine 11.16 upstream） | 20 | 构建 + 运行期修复 | `patches/wine-11.16/` |
 | `mingw64-loongarch64` | 无上游 | — | `crt/crt0.S`、`crt/empty.S` | 源码随工程保存 |
 
 应用方式：
