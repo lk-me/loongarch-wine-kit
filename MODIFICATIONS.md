@@ -3,7 +3,7 @@
 > **Abstract (EN)** — Every change required to run Wine natively on LoongArch64 is
 > confined to three trees: `llvm-project` (13 commits: COFF/PE codegen, LLD COFF
 > backend, driver and Windows target info), `wine` (11 commits on the 10.14
-> baseline, 20 on the 11.16 baseline: build system, signal/context, unwinding,
+> baseline, 21 on the 11.16 baseline: build system, signal/context, unwinding,
 > PE loading and runtime fixes), and a hand-written mingw CRT entry point.
 > See §8 for the Wine 11.16 delta.
 
@@ -13,7 +13,7 @@
 | --- | --- | --- | --- | --- |
 | `llvm-project` | `4497566c7`（libc 上游提交） | 13 | 后端 + lld + 驱动 | `patches/llvm/` |
 | `wine-10.14` | `8448e6d`（Baseline: Wine 10.14 upstream source） | 11 | 66 文件，+4268/−54 | `patches/wine/` |
-| `wine-11.16` | `5e99426`（Wine 11.16 upstream） | 20 | 构建 + 运行期修复 | `patches/wine-11.16/` |
+| `wine-11.16` | `5e99426`（Wine 11.16 upstream） | 21 | 构建 + 运行期修复 | `patches/wine-11.16/` |
 | `mingw64-loongarch64` | 无上游 | — | `crt/crt0.S`、`crt/empty.S` | 源码随工程保存 |
 
 应用方式：
@@ -122,7 +122,6 @@ git -C wine-10.14     am patches/wine/*.patch
 
 ## 7. 已知遗留
 
-- 原生链路 `services.exe` / `winedevice.exe` / `rpcss.exe` / `plugplay.exe` 空闲时各占满一个核（忙等），见文档 4.9.5。
 - `dlls/rsaenh` 链接 `libtomcrypt.a` 报重定位错误，尚未修。
 - C++ 异常（`-fexceptions`）在 LoongArch COFF 上仍不可用。
 - 32 位（`win32` / WoW64）链路未开始。
@@ -130,7 +129,7 @@ git -C wine-10.14     am patches/wine/*.patch
 ## 8. Wine 11.16 升级（2026-11-06）
 
 基线 `wine-11.16`（上游 `5e99426`），重放 10.14 的 LoongArch 补丁并适配 11.x API，
-共 20 个提交，补丁在 `patches/wine-11.16/`。构建、安装、窗口验证均在龙芯机上完成。
+共 21 个提交，补丁在 `patches/wine-11.16/`。构建、安装、窗口验证均在龙芯机上完成。
 
 | 问题 | 修复 |
 | --- | --- |
@@ -140,6 +139,7 @@ git -C wine-10.14     am patches/wine/*.patch
 | `sqlite3.c` 使用 ARM64 的 `__umulh` | `SQLITE_USE_UINT128` 判断加入 `__loongarch__` |
 | 链接缺 `__floatunsitf`/`__multf3`/`__addtf3` | 引入 18 个 `tf` 内建源文件与依赖头到 `libs/compiler-rt` |
 | `wineboot` 报 `double free or corruption` | `loader.c` 路径缓冲区按 `sizeof("/aarch64-windows")` 估算，`loongarch64-windows` 更长导致越界，改为实际长度 |
+| 后台服务空闲时各占满一个核（`services`/`rpcss`/`plugplay`/`winedevice`/`explorer`） | glibc 的 `pthread_exit()` 用 DWARF 强制展开，而 PE 帧没有 `.eh_frame`，展开不前进形成死循环。改为在 pthread 入口 `setjmp`、退出时 `longjmp` 回入口正常返回（`unix_private.h`/`server.c`/`thread.c`，`#ifdef __loongarch__`） |
 
 验证：`make`/`make install` 成功；`wineboot --init` 正常；`wine cmd /c ver` 输出
 `Microsoft Windows 10.0.19045`；`notepad`（721x512）与 `winecfg`（`Wine 设置` 477x608）

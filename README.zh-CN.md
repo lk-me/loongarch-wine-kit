@@ -26,7 +26,7 @@
 | --- | --- |
 | LLVM（13 个提交） | MC 层 COFF 写出、LLD COFF 链接、导入 thunk、`.pdata` 排序、PE unwind 编码、Windows 目标信息 |
 | mingw CRT | 最小 `mainCRTStartup`，保存/恢复 `$ra` 并携带 `.seh_*` 展开信息 |
-| Wine（11 / 20 个提交） | 构建系统、信号与上下文、栈展开与 `__C_specific_handler`、PE 运行期修复 |
+| Wine（11 / 21 个提交） | 构建系统、信号与上下文、栈展开与 `__C_specific_handler`、PE 运行期修复 |
 
 逐提交说明见 [MODIFICATIONS.md](MODIFICATIONS.md)。
 
@@ -166,7 +166,7 @@ DISPLAY=:0 "$KIT"/scripts/05-verify.sh
 | Wine 基线 | 补丁目录 | 提交数 | 状态 |
 | --- | --- | --- | --- |
 | `wine-10.14` | `patches/wine/` | 11 | 已验证：窗口、控制台用例、性能基准 |
-| `wine-11.16` | `patches/wine-11.16/` | 20 | 已验证：构建、安装、`winecfg`/`notepad` |
+| `wine-11.16` | `patches/wine-11.16/` | 21 | 已验证：构建、安装、`winecfg`/`notepad` |
 
 11.16 的额外改动：LDT 原型更新、删除重复的 `NtSetLdtEntries`、SymCrypt 通用路径、
 loongarch64 下禁用 C++ ABI 模块（`vcruntime140`、`msvcp140`、`concrt140`）、
@@ -177,7 +177,9 @@ loongarch64 下禁用 C++ ABI 模块（`vcruntime140`、`msvcp140`、`concrt140`
 
 ## 7. 当前限制
 
-- 后台服务忙等：`services`、`winedevice`、`rpcss`、`plugplay` 空闲时各占满一个核；
+- 后台服务忙等：`services`、`winedevice`、`rpcss`、`plugplay` 空闲时各占满一个核。
+  已在第 21 个提交中修复（`pthread_exit` 改用 `setjmp`/`longjmp` 返回线程入口）；
+  正解是让 PE 模块产出 `.eh_frame` 并向 libgcc 注册；
 - `dlls/rsaenh` 链接 `libtomcrypt.a` 报重定位错误；
 - 不支持 C++ 异常与 MSVC C++ ABI，相关模块在 loongarch64 下已禁用；
 - 32 位 / WoW64 链路尚未开始。

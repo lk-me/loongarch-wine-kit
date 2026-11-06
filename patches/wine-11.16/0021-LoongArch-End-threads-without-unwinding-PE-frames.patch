@@ -1,0 +1,84 @@
+From f748f977018066ec17da08550ca334b9b89a31c1 Mon Sep 17 00:00:00 2001
+From: ChenghaoLiu <linkmecry@gmail.com>
+Date: Fri, 6 Nov 2026 20:39:28 +0800
+Subject: [PATCH] [LoongArch] End threads without unwinding PE frames
+
+pthread_exit() unwinds the stack with DWARF, but the PE frames on
+loongarch64 carry no unwind info, so the forced unwind never finished and
+each exiting thread spun at 100% CPU. jump back to the pthread entry point
+and return normally instead.
+---
+ dlls/ntdll/unix/server.c       | 12 ++++++++++++
+ dlls/ntdll/unix/thread.c       |  9 +++++++++
+ dlls/ntdll/unix/unix_private.h |  5 +++++
+ 3 files changed, 26 insertions(+)
+
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+index 1629ee6..aeda097 100644
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -1787,6 +1787,18 @@ void server_init_thread( struct thread_data *data )
+     int reply_pipe;
+     TEB64 *teb64 = get_teb64( data->teb );
+ 
++#ifdef __loongarch__
++    /* pthread_exit() unwinds the stack with DWARF, but the frames of the PE
++     * side have no unwind info, so jump back here and return from the thread
++     * entry point instead. */
++    if (setjmp( data->exit_jmp ))
++    {
++        data->exit_jmp_valid = 0;
++        return;
++    }
++    data->exit_jmp_valid = 1;
++#endif
++
+     data->pthread_id = pthread_self();
+     pthread_setspecific( thread_data_key, data );
+ 
+diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
+index 55e52af..e95940d 100644
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -1120,6 +1120,15 @@ static DECLSPEC_NORETURN void pthread_exit_wrapper( int status )
+     close( data->wait_fd[1] );
+     close( data->reply_fd );
+     close( data->request_fd );
++#ifdef __loongarch__
++    /* The forced unwind in pthread_exit() cannot walk the PE frames, so go
++     * back to the thread entry point and let the thread return normally. */
++    if (data->exit_jmp_valid)
++    {
++        data->exit_jmp_valid = 0;
++        longjmp( data->exit_jmp, 1 );
++    }
++#endif
+     pthread_exit( UIntToPtr(status) );
+ }
+ 
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index 1223e0a..de60545 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -22,6 +22,7 @@
+ #define __NTDLL_UNIX_PRIVATE_H
+ 
+ #include <pthread.h>
++#include <setjmp.h>
+ #include <signal.h>
+ #include "unixlib.h"
+ #include "wine/unixlib.h"
+@@ -115,6 +116,10 @@ struct thread_data
+     BOOL         suspend;           /* suspend on startup */
+     pthread_t    pthread_id;        /* pthread thread id */
+     void        *jmp_buf;           /* setjmp buffer for exception handling */
++#ifdef __loongarch__
++    jmp_buf      exit_jmp;          /* setjmp buffer used to end the thread */
++    int          exit_jmp_valid;    /* exit_jmp can be used */
++#endif
+     void        *start;             /* thread entry point */
+     void        *param;             /* thread entry point parameter */
+     struct list  entry;             /* entry in TEB list */
+-- 
+2.47.3
+

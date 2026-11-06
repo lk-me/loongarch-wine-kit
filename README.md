@@ -28,7 +28,7 @@ LoongArch backend. Three layers had to be added:
 | --- | --- |
 | LLVM (13 commits) | MC-layer COFF writer, LLD COFF support, import thunks, `.pdata` sorting, PE unwind encoding, Windows target info |
 | mingw CRT | Minimal `mainCRTStartup` that preserves `$ra` and carries `.seh_*` unwind metadata |
-| Wine (11 / 20 commits) | Build system, signal/context handling, stack unwinding + `__C_specific_handler`, PE loading and runtime fixes |
+| Wine (11 / 21 commits) | Build system, signal/context handling, stack unwinding + `__C_specific_handler`, PE loading and runtime fixes |
 
 Details per commit: [MODIFICATIONS.md](MODIFICATIONS.md).
 
@@ -168,7 +168,7 @@ Measured on Loongson-3A5000 with Wine 11.16: `wineboot` returns 0,
 | Wine baseline | Patch set | Commits | Status |
 | --- | --- | --- | --- |
 | `wine-10.14` | `patches/wine/` | 11 | verified: windows, console tests, benchmarks |
-| `wine-11.16` | `patches/wine-11.16/` | 20 | verified: build, install, `winecfg`/`notepad` |
+| `wine-11.16` | `patches/wine-11.16/` | 21 | verified: build, install, `winecfg`/`notepad` |
 
 Wine 11.16 additionally required: updated LDT prototypes, removal of the
 duplicated `NtSetLdtEntries`, a generic SymCrypt path, disabling the C++ ABI
@@ -181,7 +181,9 @@ See [MODIFICATIONS.md](MODIFICATIONS.md) §8.
 ## 7. Current limitations
 
 - Background services busy-wait: `services`, `winedevice`, `rpcss`, `plugplay`
-  each saturate a core while idle.
+  each saturate a core while idle. **Fixed** in commit 21 (`setjmp`/`longjmp`
+  around `pthread_exit`); the proper fix is emitting `.eh_frame` for PE modules
+  and registering it with libgcc.
 - `dlls/rsaenh` fails to link against `libtomcrypt.a` (relocation errors).
 - C++ exceptions and the MSVC C++ ABI are unsupported; the related modules are
   disabled on loongarch64.
